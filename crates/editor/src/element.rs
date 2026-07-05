@@ -10719,7 +10719,15 @@ mod tests {
         Hitbox {
             id: HitboxId::placeholder(),
             bounds: zero_bounds,
-            content_mask: ContentMask::new(zero_bounds),
+            content_mask: ContentMask {
+                bounds: zero_bounds,
+                corner_radii: Corners {
+                    top_left: Pixels::ZERO,
+                    top_right: Pixels::ZERO,
+                    bottom_right: Pixels::ZERO,
+                    bottom_left: Pixels::ZERO,
+                },
+            },
             behavior: HitboxBehavior::Normal,
         }
     }
