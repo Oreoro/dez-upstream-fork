@@ -1409,7 +1409,7 @@ impl TerminalView {
     pub fn add_paths_to_terminal(&self, paths: &[PathBuf], window: &mut Window, cx: &mut App) {
         let mut text = paths
             .iter()
-            .map(|path| format!(" {path:?}"))
+            .filter_map(|path| Some(format!(" {}", shlex::try_quote(path.to_str()?).ok()?)))
             .collect::<String>();
         text.push(' ');
         window.focus(&self.focus_handle(cx), cx);
@@ -1593,6 +1593,7 @@ fn subscribe_for_terminal_events(
                 }
                 Event::Wakeup => {
                     cx.notify();
+                    window.invalidate_character_coordinates();
                     cx.emit(Event::Wakeup);
                     cx.emit(ItemEvent::UpdateTab);
                     cx.emit(SearchEvent::MatchesInvalidated);
@@ -2555,7 +2556,7 @@ mod tests {
         let mut text = String::new();
         for path in paths {
             text.push(' ');
-            text.push_str(&format!("{path:?}"));
+            text.push_str(&shlex::try_quote(path.to_str().unwrap()).unwrap());
         }
         text.push(' ');
         text

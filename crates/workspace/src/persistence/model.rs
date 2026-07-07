@@ -13,7 +13,9 @@ use db::sqlez::{
 use gpui::{AsyncWindowContext, Entity, WeakEntity, WindowId};
 
 use language::{Toolchain, ToolchainScope};
-use project::{Project, bookmark_store::SerializedBookmark, debugger::breakpoint_store::SourceBreakpoint};
+use project::{
+    Project, bookmark_store::SerializedBookmark, debugger::breakpoint_store::SourceBreakpoint,
+};
 use remote::RemoteConnectionOptions;
 use serde::{Deserialize, Serialize};
 use std::{

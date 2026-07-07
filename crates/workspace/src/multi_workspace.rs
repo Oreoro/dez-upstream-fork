@@ -1108,7 +1108,9 @@ impl MultiWorkspace {
                 let app_state = this.workspace().read(cx).app_state().clone();
                 let project = app_state
                     .shared_project_store
-                    .update(cx, |shared_project_store, cx| shared_project_store.new_workspace_project(cx));
+                    .update(cx, |shared_project_store, cx| {
+                        shared_project_store.new_workspace_project(cx)
+                    });
                 let new_workspace =
                     cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
                 Task::ready(Ok(new_workspace))
@@ -1241,7 +1243,9 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
-        if let Some(workspace) = self.workspace_for_paths(&paths, host.as_ref(), cx) {
+        if let Some(workspace) =
+            self.workspace_for_paths_excluding(&paths, host.as_ref(), excluding, cx)
+        {
             self.activate(workspace.clone(), source_workspace, window, cx);
             return Task::ready(Ok(workspace));
         }
@@ -1570,7 +1574,9 @@ impl MultiWorkspace {
         let app_state = self.workspace().read(cx).app_state().clone();
         let project = app_state
             .shared_project_store
-            .update(cx, |shared_project_store, cx| shared_project_store.new_workspace_project(cx));
+            .update(cx, |shared_project_store, cx| {
+                shared_project_store.new_workspace_project(cx)
+            });
         let workspace = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
         self.activate(workspace.clone(), None, window, cx);
         self.ensure_workspace_persisted(&workspace, window, cx);
@@ -1968,7 +1974,9 @@ impl MultiWorkspace {
         let app_state = self.workspace().read(cx).app_state().clone();
         let project = app_state
             .shared_project_store
-            .update(cx, |shared_project_store, cx| shared_project_store.new_workspace_project(cx));
+            .update(cx, |shared_project_store, cx| {
+                shared_project_store.new_workspace_project(cx)
+            });
         let new_workspace = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
         self.activate(new_workspace, None, window, cx);
 
@@ -2316,13 +2324,13 @@ impl Render for MultiWorkspace {
                             sidebar.cycle_thread(true, window, cx);
                         }
                     }))
-                    .on_action(
-                        cx.listener(|this: &mut Self, _: &PreviousThread, window, cx| {
+                    .on_action(cx.listener(
+                        |this: &mut Self, _: &PreviousThread, window, cx| {
                             if let Some(sidebar) = &this.sidebar {
                                 sidebar.cycle_thread(false, window, cx);
                             }
-                        }),
-                    )
+                        },
+                    ))
                 })
                 .when(
                     self.sidebar_open() && self.multi_workspace_enabled(cx),

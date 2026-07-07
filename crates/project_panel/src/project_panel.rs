@@ -24,10 +24,10 @@ use gpui::{
     ClipboardItem, Context, CursorStyle, DismissEvent, Div, DragMoveEvent, Entity, EventEmitter,
     ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
     ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, ParentElement, PathPromptOptions, Pixels, Point, PromptLevel,
-    Render, ScrollStrategy, Stateful, Styled, Subscription, Task, UniformListScrollHandle,
-    WeakEntity, Window, actions, anchored, deferred, div, hsla, linear_color_stop, linear_gradient,
-    point, px, size, transparent_white, uniform_list,
+    MouseButton, MouseDownEvent, MouseExitEvent, ParentElement, PathPromptOptions, Pixels, Point,
+    PromptLevel, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
+    UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, div, hsla,
+    linear_color_stop, linear_gradient, point, px, size, transparent_white, uniform_list,
 };
 use language::DiagnosticSeverity;
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
@@ -641,6 +641,16 @@ fn get_item_color(is_sticky: bool, cx: &App) -> ItemColors {
     }
 }
 
+enum DeleteEntryOutcome {
+    /// Entry was successfully trashed, returning the `Change` that can be
+    /// recorded to the undo stack.
+    Trashed(Change),
+    /// Entry was successfully deleted, or there was nothing to delete.
+    Deleted,
+    /// Deleting or trashing the entry failed at the OS level.
+    Failed,
+}
+
 impl ProjectPanel {
     fn new(
         workspace: &mut Workspace,
@@ -658,7 +668,9 @@ impl ProjectPanel {
                 .map(|worktree| worktree.read(cx).id())
                 .collect::<HashSet<_>>()
         } else {
-            presentation_worktree_ids.into_iter().collect::<HashSet<_>>()
+            presentation_worktree_ids
+                .into_iter()
+                .collect::<HashSet<_>>()
         };
         let project_panel = cx.new(|cx| {
             let focus_handle = cx.focus_handle();
@@ -2084,6 +2096,32 @@ impl ProjectPanel {
         }))
     }
 
+    async fn resolve_delete_entry(
+        task: Option<Task<Result<Option<fs::TrashedEntry>>>>,
+        worktree_id: WorktreeId,
+        trash: bool,
+    ) -> DeleteEntryOutcome {
+        let Some(task) = task else {
+            // If there's no task to be awaited on, it means that the entry, or
+            // worktree, were likely already deleted.
+            return DeleteEntryOutcome::Deleted;
+        };
+
+        match task.await {
+            Ok(Some(trashed_entry)) if trash => {
+                DeleteEntryOutcome::Trashed(Change::Trashed(worktree_id, trashed_entry))
+            }
+            Err(err) => {
+                log::error!(
+                    "Failed to {} an entry: {err:#}",
+                    if trash { "trash" } else { "delete" }
+                );
+                DeleteEntryOutcome::Failed
+            }
+            Ok(_) => DeleteEntryOutcome::Deleted,
+        }
+    }
+
     fn discard_edit_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(edit_state) = self.state.edit_state.take() {
             self.state.temporarily_unfolded_pending_state = edit_state
@@ -2114,8 +2152,7 @@ impl ProjectPanel {
 
     fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
         if cx.stop_active_drag(window) {
-            self.drag_target_entry.take();
-            self.hover_expand_task.take();
+            self.clear_drag_state(cx);
             return;
         }
         self.marked_entries.clear();
@@ -2371,7 +2408,7 @@ impl ProjectPanel {
             let file_name = entry.path.file_name()?.to_string();
 
             let answer = if !action.skip_prompt {
-                let prompt = format!("Discard changes to {}?", file_name);
+                let prompt = format!("Discard changes to {}?", MarkdownInlineCode(&file_name));
                 Some(window.prompt(PromptLevel::Info, &prompt, None, &["Restore", "Cancel"], cx))
             } else {
                 None
@@ -2591,7 +2628,7 @@ impl ProjectPanel {
                                 .iter()
                                 .map(|(_, _, path)| MarkdownInlineCode(path).to_string())
                                 .take(CUTOFF_POINT)
-                                .collect::<Vec<_>>();
+                                .collect::<Vec<String>>();
                             paths.truncate(CUTOFF_POINT);
                             if truncated_path_counts == 1 {
                                 paths.push(".. 1 file not shown".into());
@@ -2642,27 +2679,35 @@ impl ProjectPanel {
                 }
 
                 let mut changes = Vec::new();
+                let total_count = file_paths.len();
+                let mut failed_count = 0;
 
-                for (entry_id, worktree_id, _) in file_paths {
-                    let trashed_entry = panel
-                        .update(cx, |panel, cx| {
-                            panel
-                                .project
-                                .update(cx, |project, cx| project.delete_entry(entry_id, trash, cx))
-                                .context("no such entry")
-                        })??
-                        .await?;
+                let tasks = panel.update(cx, |panel, cx| {
+                    panel.project.update(cx, |project, cx| {
+                        file_paths
+                            .into_iter()
+                            .map(|(entry_id, worktree_id, _)| {
+                                (worktree_id, project.delete_entry(entry_id, trash, cx))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })?;
 
-                    // Keep track of trashed change so that we can then record
-                    // all of the changes at once, such that undoing and redoing
-                    // restores or trashes all files in batch.
-                    if trash && let Some(trashed_entry) = trashed_entry {
-                        changes.push(Change::Trashed(worktree_id, trashed_entry));
+                for (worktree_id, task) in tasks {
+                    match Self::resolve_delete_entry(task, worktree_id, trash).await {
+                        DeleteEntryOutcome::Deleted => {}
+                        DeleteEntryOutcome::Trashed(change) => changes.push(change),
+                        DeleteEntryOutcome::Failed => failed_count += 1,
                     }
                 }
+
                 panel.update_in(cx, |panel, window, cx| {
                     if trash {
                         panel.undo_manager.record(changes).log_err();
+                    }
+
+                    if failed_count > 0 {
+                        panel.show_remove_failure_toast(trash, total_count, failed_count, cx);
                     }
 
                     if let Some(next_selection) = next_selection {
@@ -2682,6 +2727,39 @@ impl ProjectPanel {
             .detach_and_log_err(cx);
             Some(())
         });
+    }
+
+    /// Displays a toast notification, informing that the application was not
+    /// able to delete/trash some of the files the user intended to
+    /// delete/trash.
+    fn show_remove_failure_toast(
+        &self,
+        trash: bool,
+        total_count: usize,
+        failed_count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let message = match (trash, total_count) {
+            (true, 1) => format!("Failed to trash {failed_count} of {total_count} file."),
+            (true, _) => format!("Failed to trash {failed_count} of {total_count} files."),
+            (false, 1) => format!("Failed to delete {failed_count} of {total_count} file."),
+            (false, _) => format!("Failed to delete {failed_count} of {total_count} files."),
+        };
+
+        let toast = StatusToast::new(message, cx, |this, _| {
+            this.icon(
+                Icon::new(IconName::XCircle)
+                    .size(IconSize::Small)
+                    .color(Color::Error),
+            )
+            .dismiss_button(true)
+        });
+
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_status_toast(toast, cx);
+            })
+            .ok();
     }
 
     fn find_next_selection_after_deletion(
@@ -4636,7 +4714,7 @@ impl ProjectPanel {
                             "already exists in the destination folder. ",
                             "Do you want to replace it?"
                         ),
-                        filename
+                        MarkdownInlineCode(filename)
                     );
                     let answer = cx
                         .update(|window, cx| {
@@ -4728,6 +4806,17 @@ impl ProjectPanel {
             if existing_cursor != new_cursor {
                 cx.set_active_drag_cursor_style(new_cursor, window);
             }
+        }
+    }
+
+    fn clear_drag_state(&mut self, cx: &mut Context<Self>) {
+        let had_drag_state = self.drag_target_entry.take().is_some()
+            | self.folded_directory_drag_target.take().is_some()
+            | self.hover_scroll_task.take().is_some()
+            | self.hover_expand_task.take().is_some()
+            | self.previous_drag_position.take().is_some();
+        if had_drag_state {
+            cx.notify();
         }
     }
 
@@ -5782,8 +5871,7 @@ impl ProjectPanel {
                     ))
                     .on_drop(cx.listener(
                         move |this, external_paths: &ExternalPaths, window, cx| {
-                            this.drag_target_entry = None;
-                            this.hover_scroll_task.take();
+                            this.clear_drag_state(cx);
                             this.drop_external_files(external_paths.paths(), entry_id, window, cx);
                             cx.stop_propagation();
                         },
@@ -5912,9 +6000,7 @@ impl ProjectPanel {
                     })
                     .on_drop(cx.listener(
                         move |this, selections: &DraggedSelection, window, cx| {
-                            this.drag_target_entry = None;
-                            this.hover_scroll_task.take();
-                            this.hover_expand_task.take();
+                            this.clear_drag_state(cx);
                             if folded_directory_drag_target.is_some() {
                                 return;
                             }
@@ -6307,9 +6393,7 @@ impl ProjectPanel {
                                     ))
                                     .on_drop(cx.listener(
                                         move |this, selections: &DraggedSelection, window, cx| {
-                                            this.hover_scroll_task.take();
-                                            this.drag_target_entry = None;
-                                            this.folded_directory_drag_target = None;
+                                            this.clear_drag_state(cx);
                                             if let Some(target_entry_id) = target_entry_id {
                                                 this.drag_onto(
                                                     selections,
@@ -6406,9 +6490,7 @@ impl ProjectPanel {
                 div.when(drag_and_drop_enabled, |div| {
                     div.on_drop(cx.listener(
                         move |this, selections: &DraggedSelection, window, cx| {
-                            this.hover_scroll_task.take();
-                            this.drag_target_entry = None;
-                            this.folded_directory_drag_target = None;
+                            this.clear_drag_state(cx);
                             if let Some(target_entry_id) = target_entry_id {
                                 this.drag_onto(selections, target_entry_id, is_file, window, cx);
                             }
@@ -6881,7 +6963,7 @@ impl Render for ProjectPanel {
                 this.previous_drag_position = Some(e.event.position);
 
                 if !e.bounds.contains(&e.event.position) {
-                    this.drag_target_entry = None;
+                    this.clear_drag_state(cx);
                     return;
                 }
                 this.hover_scroll_task.take();
@@ -6938,6 +7020,10 @@ impl Render for ProjectPanel {
                 .when(panel_settings.drag_and_drop, |this| {
                     this.on_drag_move(cx.listener(handle_drag_move::<ExternalPaths>))
                         .on_drag_move(cx.listener(handle_drag_move::<DraggedSelection>))
+                        .on_mouse_exit(cx.listener(|this, _: &MouseExitEvent, window, cx| {
+                            cx.stop_active_drag(window);
+                            this.clear_drag_state(cx);
+                        }))
                 })
                 .size_full()
                 .bg(cx.theme().colors().editor_background)
@@ -7324,8 +7410,7 @@ impl Render for ProjectPanel {
                                 ))
                                 .on_drop(cx.listener(
                                     move |this, external_paths: &ExternalPaths, window, cx| {
-                                        this.drag_target_entry = None;
-                                        this.hover_scroll_task.take();
+                                        this.clear_drag_state(cx);
                                         if let Some(entry_id) = this.state.last_worktree_root_id {
                                             this.drop_external_files(
                                                 external_paths.paths(),
@@ -7339,8 +7424,7 @@ impl Render for ProjectPanel {
                                 ))
                                 .on_drop(cx.listener(
                                     move |this, selections: &DraggedSelection, window, cx| {
-                                        this.drag_target_entry = None;
-                                        this.hover_scroll_task.take();
+                                        this.clear_drag_state(cx);
                                         if let Some(entry_id) = this.state.last_worktree_root_id {
                                             this.drag_onto(selections, entry_id, false, window, cx);
                                         }
@@ -7444,8 +7528,7 @@ impl Render for ProjectPanel {
                         })
                         .on_drop(cx.listener(
                             move |this, external_paths: &ExternalPaths, window, cx| {
-                                this.drag_target_entry = None;
-                                this.hover_scroll_task.take();
+                                this.clear_drag_state(cx);
                                 if let Some(task) = this
                                     .workspace
                                     .update(cx, |workspace, cx| {

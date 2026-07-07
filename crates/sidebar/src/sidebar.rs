@@ -7657,12 +7657,13 @@ impl Sidebar {
             return;
         };
 
-        let (workspaces, active_workspace) = multi_workspace.read_with(cx, |multi_workspace, _cx| {
-            (
-                multi_workspace.workspaces().cloned().collect::<Vec<_>>(),
-                multi_workspace.workspace().clone(),
-            )
-        });
+        let (workspaces, active_workspace) =
+            multi_workspace.read_with(cx, |multi_workspace, _cx| {
+                (
+                    multi_workspace.workspaces().cloned().collect::<Vec<_>>(),
+                    multi_workspace.workspace().clone(),
+                )
+            });
         let workspace_count = workspaces.len();
         if workspace_count < 2 {
             return;

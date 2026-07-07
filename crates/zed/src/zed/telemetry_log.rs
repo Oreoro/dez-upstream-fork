@@ -35,8 +35,8 @@ pub fn init(cx: &mut App) {
         |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
             workspace.register_action(
                 |workspace, _: &zed_actions::OpenTelemetryLog, window, cx| {
-                    let telemetry_log = cx
-                        .new(|cx| TelemetryLogView::new(workspace.project().clone(), window, cx));
+                    let telemetry_log =
+                        cx.new(|cx| TelemetryLogView::new(workspace.project().clone(), window, cx));
 
                     cx.subscribe(&telemetry_log, |workspace, _, event, cx| {
                         let TelemetryLogEvent::ShowToast(toast) = event;

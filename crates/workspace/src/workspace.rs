@@ -33,10 +33,9 @@ mod workspace_settings;
 pub use dock::Panel;
 pub use multi_workspace::{
     CloseSidebar, DraggedSidebar, FocusSidebar, MultiWorkspace, MultiWorkspaceEvent, NextProject,
-    NextThread, PreviousProject, PreviousThread, ProjectGroup, ProjectGroupKey,
-    Sidebar, SidebarEvent, SidebarHandle, SidebarRenderState, SidebarSide, ToggleSidebar,
-    render_sidebar_header_controls,
-    render_sidebar_header_controls_with_project_pane_visibility,
+    NextThread, PreviousProject, PreviousThread, ProjectGroup, ProjectGroupKey, Sidebar,
+    SidebarEvent, SidebarHandle, SidebarRenderState, SidebarSide, ToggleSidebar,
+    render_sidebar_header_controls, render_sidebar_header_controls_with_project_pane_visibility,
     render_sidebar_header_controls_with_state, sidebar_side_context_menu,
 };
 pub use path_list::{PathList, SerializedPathList};
@@ -1950,7 +1949,9 @@ impl Workspace {
     ) -> Task<anyhow::Result<OpenResult>> {
         let project = app_state
             .shared_project_store
-            .update(cx, |shared_project_store, cx| shared_project_store.new_workspace_project(cx));
+            .update(cx, |shared_project_store, cx| {
+                shared_project_store.new_workspace_project(cx)
+            });
 
         let db = WorkspaceDb::global(cx);
         let kvp = db::kvp::KeyValueStore::global(cx);
@@ -2010,9 +2011,7 @@ impl Workspace {
                 }
 
                 if let Some((_, project_entry)) = cx
-                    .update(|cx| {
-                        Workspace::project_path_for_path(project.clone(), &path, true, cx)
-                    })
+                    .update(|cx| Workspace::project_path_for_path(project.clone(), &path, true, cx))
                     .await
                     .log_err()
                 {
@@ -5802,13 +5801,7 @@ impl Workspace {
 
         let item = pane.update(cx, |pane, cx| {
             cx.new(|cx| {
-                T::for_project_item(
-                    self.project().clone(),
-                    Some(pane),
-                    project_item,
-                    window,
-                    cx,
-                )
+                T::for_project_item(self.project().clone(), Some(pane), project_item, window, cx)
             })
         });
         let mut destination_index = None;
@@ -8947,7 +8940,8 @@ impl Workspace {
         let user_store = project.read(cx).user_store();
         let workspace_store = cx.new(|cx| WorkspaceStore::new(client.clone(), cx));
         let session = cx.new(|cx| AppSession::new(Session::test(), cx));
-        let shared_project_store = cx.new(|_| SharedProjectStore::from_local_project(project.clone()));
+        let shared_project_store =
+            cx.new(|_| SharedProjectStore::from_local_project(project.clone()));
         window.activate_window();
         let app_state = Arc::new(AppState {
             languages: project.read(cx).languages().clone(),
@@ -10527,11 +10521,18 @@ pub async fn find_existing_workspace(
                         }
 
                         let project = workspace.read(cx).project.read(cx);
-                        let m = project.visibility_for_paths(
-                            abs_paths,
-                            open_options.workspace_matching != WorkspaceMatching::MatchSubdirectory,
-                            cx,
-                        );
+                        let m = match open_options.workspace_matching {
+                            WorkspaceMatching::None => None,
+                            WorkspaceMatching::MatchExact => {
+                                project.visibility_for_paths(abs_paths, true, cx)
+                            }
+                            WorkspaceMatching::MatchSubpaths => {
+                                project.visibility_for_subpaths(abs_paths, cx)
+                            }
+                            WorkspaceMatching::MatchSubdirectory => {
+                                project.visibility_for_paths(abs_paths, false, cx)
+                            }
+                        };
                         if m > best_match {
                             existing = Some((window, workspace.clone()));
                             best_match = m;
@@ -10593,6 +10594,9 @@ pub enum WorkspaceMatching {
     /// Match paths against existing worktree roots and files within them.
     #[default]
     MatchExact,
+    /// Match files and directories inside existing worktrees, excluding the
+    /// worktree roots themselves.
+    MatchSubpaths,
     /// Match paths against existing worktrees including subdirectories, and
     /// fall back to the app window if no worktree matched.
     ///
@@ -10634,7 +10638,10 @@ impl Default for OpenOptions {
 
 impl OpenOptions {
     fn should_reuse_existing_window(&self) -> bool {
-        self.workspace_matching != WorkspaceMatching::None
+        !matches!(
+            self.workspace_matching,
+            WorkspaceMatching::None | WorkspaceMatching::MatchSubpaths
+        )
     }
 }
 
@@ -10655,7 +10662,9 @@ pub fn open_workspace_by_id(
 ) -> Task<anyhow::Result<WindowHandle<MultiWorkspace>>> {
     let project = app_state
         .shared_project_store
-        .update(cx, |shared_project_store, cx| shared_project_store.new_workspace_project(cx));
+        .update(cx, |shared_project_store, cx| {
+            shared_project_store.new_workspace_project(cx)
+        });
 
     let db = WorkspaceDb::global(cx);
     let kvp = db::kvp::KeyValueStore::global(cx);
@@ -10674,9 +10683,7 @@ pub fn open_workspace_by_id(
             }
 
             let project_path = cx
-                .update(|cx| {
-                    Workspace::project_path_for_path(project.clone(), &path, true, cx)
-                })
+                .update(|cx| Workspace::project_path_for_path(project.clone(), &path, true, cx))
                 .await
                 .log_err()
                 .map(|(_, project_path)| project_path);
@@ -10729,13 +10736,8 @@ pub fn open_workspace_by_id(
                 let project = project.clone();
                 move |window, cx| {
                     let workspace = cx.new(|cx| {
-                        let mut workspace = Workspace::new(
-                            Some(workspace_id),
-                            project,
-                            app_state,
-                            window,
-                            cx,
-                        );
+                        let mut workspace =
+                            Workspace::new(Some(workspace_id), project, app_state, window, cx);
                         workspace.centered_layout = centered_layout;
                         workspace
                     });

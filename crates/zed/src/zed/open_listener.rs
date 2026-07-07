@@ -596,6 +596,30 @@ pub async fn handle_cli_connection(
                     return;
                 }
 
+                if open_behavior == cli::OpenBehavior::Default {
+                    match resolve_open_behavior(
+                        &paths,
+                        &app_state,
+                        responses.as_ref(),
+                        &mut requests,
+                        cx,
+                    )
+                    .await
+                    {
+                        Some(settings::CliDefaultOpenBehavior::ExistingWindow) => {
+                            open_behavior = cli::OpenBehavior::ExistingWindow;
+                        }
+                        Some(settings::CliDefaultOpenBehavior::NewWindow) => {
+                            open_behavior = cli::OpenBehavior::PreferNewWindow;
+                        }
+                        None => {}
+                    }
+                }
+
+                if open_behavior == cli::OpenBehavior::Default {
+                    open_behavior = cx.update(|cx| open_behavior_for_default_setting(cx));
+                }
+
                 cx.update(|cx| cx.activate(true));
 
                 let open_workspace_result = open_workspaces(
@@ -617,12 +641,106 @@ pub async fn handle_cli_connection(
                 responses.send(CliResponse::Exit { status }).log_err();
             }
             CliRequest::SetOpenBehavior { .. } => {
-                // The fork no longer prompts for CLI open behavior, so this
-                // message should not be sent by current clients.
+                // We handle this case in a situation-specific way in
+                // resolve_open_behavior.
                 debug_panic!("unexpected SetOpenBehavior message");
             }
         }
     }
+}
+
+/// Resolves the CLI open behavior when no explicit open behavior flag was given.
+/// May prompt the user interactively on first run.
+///
+/// Returns `Some(behavior)` to override the default, or `None` if no override
+/// is needed (e.g. no existing windows, paths already in a workspace, or the
+/// user has already configured `cli_default_open_behavior` in settings).
+async fn resolve_open_behavior(
+    paths: &[String],
+    app_state: &Arc<AppState>,
+    responses: &dyn CliResponseSink,
+    requests: &mut mpsc::UnboundedReceiver<CliRequest>,
+    cx: &mut AsyncApp,
+) -> Option<settings::CliDefaultOpenBehavior> {
+    let has_existing_windows = cx.update(|cx| {
+        cx.windows()
+            .iter()
+            .any(|window| window.downcast::<MultiWorkspace>().is_some())
+    });
+
+    if !has_existing_windows {
+        return None;
+    }
+
+    if !paths.is_empty() {
+        let paths_as_pathbufs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        let paths_in_existing_workspace = cx.update(|cx| {
+            for window in cx.windows() {
+                if let Some(multi_workspace) = window.downcast::<MultiWorkspace>() {
+                    if let Ok(multi_workspace) = multi_workspace.read(cx) {
+                        for workspace in multi_workspace.workspaces() {
+                            let project = workspace.read(cx).project().read(cx);
+                            if project
+                                .visibility_for_paths(&paths_as_pathbufs, false, cx)
+                                .is_some()
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        });
+
+        if paths_in_existing_workspace {
+            return None;
+        }
+    }
+
+    if !paths.is_empty() {
+        let has_directory =
+            futures::future::join_all(paths.iter().map(|p| app_state.fs.is_dir(Path::new(p))))
+                .await
+                .into_iter()
+                .any(|is_dir| is_dir);
+
+        if !has_directory {
+            return None;
+        }
+    }
+
+    let settings_text = app_state
+        .fs
+        .load(paths::settings_file())
+        .await
+        .unwrap_or_default();
+
+    if settings_text.contains("cli_default_open_behavior") {
+        return None;
+    }
+
+    responses.send(CliResponse::PromptOpenBehavior).log_err()?;
+
+    if let Some(CliRequest::SetOpenBehavior { behavior }) = requests.next().await {
+        let behavior = match behavior {
+            cli::CliBehaviorSetting::ExistingWindow => {
+                settings::CliDefaultOpenBehavior::ExistingWindow
+            }
+            cli::CliBehaviorSetting::NewWindow => settings::CliDefaultOpenBehavior::NewWindow,
+        };
+
+        let fs = app_state.fs.clone();
+        cx.update(|cx| {
+            settings::update_settings_file(fs, cx, move |content, _cx| {
+                content.workspace.cli_default_open_behavior = Some(behavior);
+            });
+        });
+
+        return Some(behavior);
+    }
+
+    None
 }
 
 pub(crate) fn open_options_for_request(
@@ -630,9 +748,13 @@ pub(crate) fn open_options_for_request(
     location: &SerializedWorkspaceLocation,
     cx: &App,
 ) -> workspace::OpenOptions {
-    open_behavior.map_or_else(workspace::OpenOptions::default, |open_behavior| {
-        open_options_for_behavior(open_behavior, location, cx)
-    })
+    let open_behavior = open_behavior.unwrap_or_else(|| {
+        match workspace::WorkspaceSettings::get_global(cx).default_open_behavior {
+            settings::DefaultOpenBehavior::ExistingWindow => cli::OpenBehavior::ExistingWindow,
+            settings::DefaultOpenBehavior::NewWindow => cli::OpenBehavior::PreferNewWindow,
+        }
+    });
+    open_options_for_behavior(open_behavior, location, cx)
 }
 
 pub(crate) fn open_options_for_behavior(
@@ -640,9 +762,17 @@ pub(crate) fn open_options_for_behavior(
     location: &SerializedWorkspaceLocation,
     cx: &App,
 ) -> workspace::OpenOptions {
+    let open_behavior = if open_behavior == cli::OpenBehavior::Default {
+        open_behavior_for_default_setting(cx)
+    } else {
+        open_behavior
+    };
+
     let requesting_window = if matches!(
         open_behavior,
-        cli::OpenBehavior::AlwaysNew | cli::OpenBehavior::Reuse
+        cli::OpenBehavior::AlwaysNew
+            | cli::OpenBehavior::Reuse
+            | cli::OpenBehavior::PreferNewWindow
     ) {
         workspace::workspace_windows_for_location(location, cx)
             .into_iter()
@@ -655,18 +785,24 @@ pub(crate) fn open_options_for_behavior(
             cli::OpenBehavior::AlwaysNew | cli::OpenBehavior::Reuse => {
                 workspace::WorkspaceMatching::None
             }
+            cli::OpenBehavior::PreferNewWindow => workspace::WorkspaceMatching::MatchSubpaths,
             cli::OpenBehavior::Add => workspace::WorkspaceMatching::MatchSubdirectory,
             cli::OpenBehavior::Default => workspace::WorkspaceMatching::default(),
             _ => workspace::WorkspaceMatching::MatchExact,
         },
         add_dirs_to_sidebar: match open_behavior {
-            cli::OpenBehavior::Default
-            | cli::OpenBehavior::ExistingWindow
-            | cli::OpenBehavior::Add => true,
+            cli::OpenBehavior::ExistingWindow | cli::OpenBehavior::Add => true,
             _ => false,
         },
         requesting_window,
         ..Default::default()
+    }
+}
+
+fn open_behavior_for_default_setting(cx: &App) -> cli::OpenBehavior {
+    match workspace::WorkspaceSettings::get_global(cx).cli_default_open_behavior {
+        settings::CliDefaultOpenBehavior::ExistingWindow => cli::OpenBehavior::ExistingWindow,
+        settings::CliDefaultOpenBehavior::NewWindow => cli::OpenBehavior::PreferNewWindow,
     }
 }
 
@@ -683,7 +819,13 @@ async fn open_workspaces(
     cwd: Option<PathBuf>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    if paths.is_empty() && diff_paths.is_empty() && open_behavior != cli::OpenBehavior::AlwaysNew {
+    if paths.is_empty()
+        && diff_paths.is_empty()
+        && !matches!(
+            open_behavior,
+            cli::OpenBehavior::AlwaysNew | cli::OpenBehavior::PreferNewWindow
+        )
+    {
         return restore_or_create_workspace(app_state, cx).await;
     }
 
@@ -979,7 +1121,7 @@ mod tests {
     use cli::CliResponse;
     use editor::Editor;
     use futures::poll;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, TestAppContext, UpdateGlobal as _};
     use language::LineEnding;
     use remote::SshConnectionOptions;
     use rope::Rope;
@@ -1241,6 +1383,48 @@ mod tests {
         );
         assert!(!options.add_dirs_to_sidebar);
         assert!(options.requesting_window.is_none());
+    }
+
+    #[gpui::test]
+    fn test_open_options_for_request_respects_default_open_behavior(cx: &mut TestAppContext) {
+        use gpui::UpdateGlobal as _;
+
+        let _app_state = init_test(cx);
+
+        // A `None` behavior (e.g. a Finder or URL open) consults the UI-level
+        // `default_open_behavior` setting rather than falling back to fixed
+        // defaults.
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.default_open_behavior =
+                        Some(settings::DefaultOpenBehavior::NewWindow);
+                });
+            });
+        });
+        let options =
+            cx.update(|cx| open_options_for_request(None, &SerializedWorkspaceLocation::Local, cx));
+        assert_eq!(
+            options.workspace_matching,
+            workspace::WorkspaceMatching::MatchSubpaths
+        );
+        assert!(!options.add_dirs_to_sidebar);
+
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.default_open_behavior =
+                        Some(settings::DefaultOpenBehavior::ExistingWindow);
+                });
+            });
+        });
+        let options =
+            cx.update(|cx| open_options_for_request(None, &SerializedWorkspaceLocation::Local, cx));
+        assert_eq!(
+            options.workspace_matching,
+            workspace::WorkspaceMatching::MatchExact
+        );
+        assert!(options.add_dirs_to_sidebar);
     }
 
     #[gpui::test]
@@ -2464,6 +2648,135 @@ mod tests {
             !prompt_shown,
             "no prompt should be shown when setting already configured"
         );
+    }
+
+    #[gpui::test]
+    async fn test_e2e_new_window_setting_stays_in_single_window(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/project"), json!({ "file.txt": "content" }))
+            .await;
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                paths::config_dir(),
+                json!({
+                    "settings.json": r#"{"cli_default_open_behavior": "new_window"}"#
+                }),
+            )
+            .await;
+
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.cli_default_open_behavior =
+                        Some(settings::CliDefaultOpenBehavior::NewWindow);
+                });
+            });
+        });
+
+        open_workspace_file(path!("/project"), Default::default(), app_state.clone(), cx).await;
+        assert_eq!(cx.windows().len(), 1);
+
+        let (status, prompt_shown) = run_cli_with_zed_handler(
+            cx,
+            app_state,
+            make_cli_open_request(
+                vec![path!("/project").to_string()],
+                cli::OpenBehavior::Default,
+            ),
+            None,
+        );
+
+        assert_eq!(status, 0);
+        assert!(
+            !prompt_shown,
+            "no prompt should be shown when setting already configured"
+        );
+        assert_eq!(cx.windows().len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_e2e_new_window_setting_focuses_existing_window_for_subpaths(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/project"),
+                json!({
+                    "file.txt": "content",
+                    "src": {
+                        "main.rs": "fn main() {}",
+                    },
+                }),
+            )
+            .await;
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                paths::config_dir(),
+                json!({
+                    "settings.json": r#"{"cli_default_open_behavior": "new_window"}"#
+                }),
+            )
+            .await;
+
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.cli_default_open_behavior =
+                        Some(settings::CliDefaultOpenBehavior::NewWindow);
+                });
+            });
+        });
+
+        open_workspace_file(path!("/project"), Default::default(), app_state.clone(), cx).await;
+        assert_eq!(cx.windows().len(), 1);
+
+        let (status, prompt_shown) = run_cli_with_zed_handler(
+            cx,
+            app_state.clone(),
+            make_cli_open_request(
+                vec![path!("/project/src").to_string()],
+                cli::OpenBehavior::Default,
+            ),
+            None,
+        );
+
+        assert_eq!(status, 0);
+        assert!(
+            !prompt_shown,
+            "no prompt should be shown when setting already configured"
+        );
+        assert_eq!(cx.windows().len(), 1);
+
+        let (status, prompt_shown) = run_cli_with_zed_handler(
+            cx,
+            app_state,
+            make_cli_open_request(
+                vec![path!("/project/file.txt").to_string()],
+                cli::OpenBehavior::Default,
+            ),
+            None,
+        );
+
+        assert_eq!(status, 0);
+        assert!(
+            !prompt_shown,
+            "no prompt should be shown when setting already configured"
+        );
+        assert_eq!(cx.windows().len(), 1);
     }
 
     #[gpui::test]
