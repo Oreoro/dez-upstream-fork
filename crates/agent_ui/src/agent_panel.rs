@@ -45,12 +45,11 @@ use crate::terminal_thread_metadata_store::{
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
-    AddContextServer, Agent, AgentDiffPane, AgentInitialContent, AgentThreadSource,
-    ConversationView, CopyThreadToClipboard, ExternalSourcePrompt, Follow, LoadThreadFromClipboard,
+    Agent, AgentDiffPane, AgentInitialContent, AgentThreadSource, ConversationView,
+    CopyThreadToClipboard, ExternalSourcePrompt, Follow, LoadThreadFromClipboard,
     NewExternalAgentThread, NewNativeAgentThreadFromSummary, NewThread, OpenActiveThreadAsMarkdown,
     OpenAgentDiff, ResetFastModeWarnings, ResetTrialEndUpsell, ResetTrialUpsell,
     ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
-    agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -95,7 +94,7 @@ use ui::{
 use util::ResultExt as _;
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PaneKind, PathList,
-    SerializedPathList, ToggleSidebar, ToggleZoom, Workspace, WorkspaceId,
+    SerializedPathList, ToggleSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
 };

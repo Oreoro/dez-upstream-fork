@@ -16,13 +16,12 @@ use agent_ui::threads_archive_view::{
     fuzzy_match_positions,
 };
 use agent_ui::{
-    AcpThreadImportOnboarding, AddContextServer, Agent, AgentPanel, AgentPanelEvent,
-    AgentThreadItem, AgentThreadSource, ArchiveSelectedThread, ConversationView,
-    CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE, ManageProfiles, NewThread,
-    RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal, ThreadTitleRegenerationResult,
-    ToggleOptionsMenu, channels_with_threads, connection_store_for_project,
-    create_agent_thread_in_workspace, import_threads_from_other_channels,
-    open_agent_thread_in_workspace,
+    AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentThreadItem,
+    AgentThreadSource, ArchiveSelectedThread, ConversationView, CrossChannelImportOnboarding,
+    DEFAULT_THREAD_TITLE, ManageProfiles, NewThread, RenameSelectedThread, TerminalId, ThreadId,
+    ThreadImportModal, ThreadTitleRegenerationResult, ToggleOptionsMenu, channels_with_threads,
+    connection_store_for_project, create_agent_thread_in_workspace,
+    import_threads_from_other_channels, open_agent_thread_in_workspace,
 };
 use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
 use chrono::{DateTime, Utc};
@@ -8014,8 +8013,13 @@ impl Sidebar {
 
                         menu = menu
                             .header("MCP Servers")
-                            .action("Add Custom Server…", Box::new(AddContextServer::local()))
-                            .action("Add Remote Server…", Box::new(AddContextServer::remote()))
+                            .action(
+                                "Add Server…",
+                                Box::new(zed_actions::OpenSettingsAt {
+                                    path: "context_servers".to_string(),
+                                    target: None,
+                                }),
+                            )
                             .action(
                                 "Install New Servers…",
                                 Box::new(zed_actions::Extensions {

@@ -559,7 +559,7 @@ pub async fn handle_cli_connection(
                 diff_all,
                 wait,
                 wsl,
-                open_behavior,
+                mut open_behavior,
                 env,
                 user_data_dir: _,
                 dev_container,

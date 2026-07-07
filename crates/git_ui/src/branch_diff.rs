@@ -143,7 +143,9 @@ impl BranchDiff {
             }
         });
         let workspace_handle = workspace.weak_handle();
+        let project_for_picker = project.clone();
         let on_select = Arc::new({
+            let project = project.clone();
             let repository = repository.clone();
             let workspace = workspace_handle.clone();
             move |branch: git::repository::Branch, window: &mut Window, cx: &mut App| {
@@ -166,6 +168,7 @@ impl BranchDiff {
         workspace.toggle_modal(window, cx, |window, cx| {
             branch_picker::select_modal(
                 workspace_handle,
+                Some(project_for_picker),
                 Some(repository),
                 selected_branch,
                 on_select,

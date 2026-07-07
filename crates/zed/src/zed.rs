@@ -63,7 +63,7 @@ use paths::{
     local_debug_file_relative_path, local_settings_file_relative_path,
     local_tasks_file_relative_path,
 };
-use project::{ProjectItem, WorktreeId};
+use project::{DisableAiSettings, ProjectItem, WorktreeId};
 use project_panel::ProjectPanel;
 use quick_action_bar::QuickActionBar;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
@@ -2302,18 +2302,6 @@ fn filter_disabled_ai_bindings(bindings: Vec<KeyBinding>, cx: &App) -> Vec<KeyBi
         .into_iter()
         .filter(|binding| !is_ai_keybinding(binding))
         .collect()
-}
-
-pub fn open_new_ssh_project_from_project(
-    workspace: &mut Workspace,
-    paths: Vec<PathBuf>,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) -> Task<anyhow::Result<()>> {
-    let _ = (workspace, paths, window, cx);
-    Task::ready(Err(anyhow::anyhow!(
-        "Remote workspaces are disabled in the single-session workspace model"
-    )))
 }
 
 fn open_project_settings_file(
