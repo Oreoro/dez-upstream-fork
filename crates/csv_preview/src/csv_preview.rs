@@ -250,6 +250,8 @@ impl EventEmitter<()> for CsvPreviewView {}
 impl Item for CsvPreviewView {
     type Event = ();
 
+    const CONTRIBUTES_PATH_EVIDENCE: bool = true;
+
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
         Some(Icon::new(IconName::FileDoc))
     }
@@ -270,6 +272,10 @@ impl Item for CsvPreviewView {
                     .map(|name| format!("Preview {}", name.to_string_lossy()).into())
             })
             .unwrap_or_else(|| SharedString::from("CSV Preview"))
+    }
+
+    fn workspace_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
+        self.editor_state().editor.read(cx).workspace_directory(cx)
     }
 }
 

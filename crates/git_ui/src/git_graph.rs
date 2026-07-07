@@ -1104,7 +1104,11 @@ pub fn init(cx: &mut App) {
                 },
             )
             .when(
-                workspace.project().read(cx).active_repository(cx).is_some(),
+                workspace
+                    .project()
+                    .read(cx)
+                    .active_repository(cx)
+                    .is_some(),
                 |div| {
                     let workspace = workspace.weak_handle();
 
@@ -1139,7 +1143,8 @@ pub fn init(cx: &mut App) {
                         let sha = action.sha.clone();
                         workspace
                             .update(cx, |workspace, cx| {
-                                let Some(repo) = workspace.project().read(cx).active_repository(cx)
+                                let Some(repo) =
+                                    workspace.project().read(cx).active_repository(cx)
                                 else {
                                     return;
                                 };

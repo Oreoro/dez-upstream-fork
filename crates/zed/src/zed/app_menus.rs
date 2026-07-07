@@ -64,8 +64,11 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::submenu(Menu::new("Settings").items([
                     MenuItem::action("Open Settings", zed_actions::OpenSettings),
                     MenuItem::action("Open Settings File", super::OpenSettingsFile),
-                    MenuItem::action("Open Project Settings", zed_actions::OpenProjectSettings),
-                    MenuItem::action("Open Project Settings File", super::OpenProjectSettingsFile),
+                    MenuItem::action("Open Worktree Settings", zed_actions::OpenProjectSettings),
+                    MenuItem::action(
+                        "Open Worktree Settings File",
+                        super::OpenProjectSettingsFile,
+                    ),
                     MenuItem::action("Open Default Settings", super::OpenDefaultSettings),
                     MenuItem::separator(),
                     MenuItem::action("Open Keymap", zed_actions::OpenKeymap),
@@ -104,23 +107,9 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("New", workspace::NewFile),
-                MenuItem::action("New Window", workspace::NewWindow),
                 MenuItem::separator(),
                 #[cfg(not(target_os = "macos"))]
                 MenuItem::action("Open File...", workspace::OpenFiles),
-                MenuItem::action(
-                    if cfg!(not(target_os = "macos")) {
-                        "Open Folder..."
-                    } else {
-                        "Open…"
-                    },
-                    workspace::Open::default(),
-                ),
-                MenuItem::action("Open Recent…", zed_actions::OpenRecent::default()),
-                MenuItem::action("Open Remote…", zed_actions::OpenRemote::default()),
-                MenuItem::separator(),
-                MenuItem::action("Add Folder to Project…", workspace::AddFolderToProject),
-                MenuItem::separator(),
                 MenuItem::action("Save", workspace::Save { save_intent: None }),
                 MenuItem::action("Save As…", workspace::SaveAs),
                 MenuItem::action("Save All", workspace::SaveAll { save_intent: None }),
@@ -149,7 +138,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::os_action("Paste", editor::actions::Paste, OsAction::Paste),
                 MenuItem::separator(),
                 MenuItem::action("Find", search::buffer_search::Deploy::find()),
-                MenuItem::action("Find in Project", workspace::DeploySearch::default()),
+                MenuItem::action("Search Workspace", workspace::DeploySearch::default()),
                 MenuItem::separator(),
                 MenuItem::action(
                     "Toggle Line Comment",

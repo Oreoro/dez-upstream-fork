@@ -11,8 +11,11 @@ use gpui::{
     Render, SharedString, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions, rems,
 };
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
-use project::git_store::{Repository, RepositoryEvent};
 use project::project_settings::ProjectSettings;
+use project::{
+    Event as ProjectEvent, Project,
+    git_store::{Repository, RepositoryEvent},
+};
 use settings::Settings;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -25,7 +28,10 @@ use util::ResultExt;
 use workspace::notifications::DetachAndPromptErr;
 use workspace::{ModalView, Workspace};
 
-use crate::{branch_picker, git_panel::show_error_toast};
+use crate::{
+    branch_picker, git_panel::show_error_toast,
+    repository_selector::repository_selector_menu_default,
+};
 
 actions!(
     branch_picker,
@@ -64,11 +70,13 @@ pub fn open(
     cx: &mut Context<Workspace>,
 ) {
     let workspace_handle = workspace.weak_handle();
-    let repository = workspace.project().read(cx).active_repository(cx);
+    let project = workspace.project().clone();
+    let repository = project.read(cx).active_repository(cx);
 
     workspace.toggle_modal(window, cx, |window, cx| {
         BranchList::new(
             workspace_handle,
+            Some(project),
             repository,
             BranchListStyle::Modal,
             rems(34.),
@@ -92,7 +100,8 @@ pub fn popover(
     };
 
     cx.new(|cx| {
-        let list = BranchList::new(workspace, repository, style, width, window, cx);
+        let project = project_from_workspace(&workspace, cx);
+        let list = BranchList::new(workspace, project, repository, style, width, window, cx);
         list.focus_handle(cx).focus(window, cx);
         list
     })
@@ -107,8 +116,10 @@ pub fn select_popover(
     cx: &mut App,
 ) -> Entity<BranchList> {
     cx.new(|cx| {
+        let project = project_from_workspace(&workspace, cx);
         let list = BranchList::new_select(
             workspace,
+            project,
             repository,
             BranchListStyle::Popover,
             rems(20.),
@@ -124,6 +135,7 @@ pub fn select_popover(
 
 pub fn select_modal(
     workspace: WeakEntity<Workspace>,
+    project: Option<Entity<Project>>,
     repository: Option<Entity<Repository>>,
     selected_branch: Option<SharedString>,
     on_select: SelectBranchCallback,
@@ -132,6 +144,7 @@ pub fn select_modal(
 ) -> BranchList {
     let list = BranchList::new_select(
         workspace,
+        project,
         repository,
         BranchListStyle::Modal,
         rems(34.),
@@ -148,13 +161,28 @@ pub type SelectBranchCallback = Arc<dyn Fn(Branch, &mut Window, &mut App)>;
 
 pub fn create_embedded(
     workspace: WeakEntity<Workspace>,
+    project: Option<Entity<Project>>,
     repository: Option<Entity<Repository>>,
     width: Rems,
     show_footer: bool,
     window: &mut Window,
     cx: &mut Context<BranchList>,
 ) -> BranchList {
-    BranchList::new_embedded(workspace, repository, width, show_footer, window, cx)
+    BranchList::new_embedded(
+        workspace,
+        project,
+        repository,
+        width,
+        show_footer,
+        window,
+        cx,
+    )
+}
+
+fn project_from_workspace(workspace: &WeakEntity<Workspace>, cx: &App) -> Option<Entity<Project>> {
+    workspace
+        .read_with(cx, |workspace, _| workspace.project().clone())
+        .ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -173,13 +201,16 @@ pub struct BranchList {
 impl BranchList {
     fn new(
         workspace: WeakEntity<Workspace>,
+        project: Option<Entity<Project>>,
         repository: Option<Entity<Repository>>,
         style: BranchListStyle,
         width: Rems,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut this = Self::new_inner(workspace, repository, style, width, false, window, cx);
+        let mut this = Self::new_inner(
+            workspace, project, repository, style, width, false, window, cx,
+        );
         this._subscriptions
             .push(cx.subscribe(&this.picker, |_, _, _, cx| {
                 cx.emit(DismissEvent);
@@ -189,6 +220,7 @@ impl BranchList {
 
     fn new_inner(
         workspace: WeakEntity<Workspace>,
+        project: Option<Entity<Project>>,
         repository: Option<Entity<Repository>>,
         style: BranchListStyle,
         width: Rems,
@@ -198,6 +230,7 @@ impl BranchList {
     ) -> Self {
         Self::new_inner_with_behavior(
             workspace,
+            project,
             repository,
             style,
             width,
@@ -210,6 +243,7 @@ impl BranchList {
 
     fn new_select(
         workspace: WeakEntity<Workspace>,
+        project: Option<Entity<Project>>,
         repository: Option<Entity<Repository>>,
         style: BranchListStyle,
         width: Rems,
@@ -220,6 +254,7 @@ impl BranchList {
     ) -> Self {
         let mut this = Self::new_inner_with_behavior(
             workspace,
+            project,
             repository,
             style,
             width,
@@ -240,6 +275,7 @@ impl BranchList {
 
     fn new_inner_with_behavior(
         workspace: WeakEntity<Workspace>,
+        project: Option<Entity<Project>>,
         repository: Option<Entity<Repository>>,
         style: BranchListStyle,
         width: Rems,
@@ -266,7 +302,8 @@ impl BranchList {
         });
 
         let mut delegate = BranchListDelegate::new(
-            workspace,
+            workspace.clone(),
+            project.clone(),
             repository.clone(),
             style,
             branch_selection_behavior,
@@ -286,6 +323,8 @@ impl BranchList {
         picker.update(cx, |picker, _| {
             picker.delegate.focus_handle = picker_focus_handle.clone();
             picker.delegate.show_footer = !embedded && !picker.delegate.is_select_only();
+            picker.delegate.show_repository_selector =
+                !embedded && matches!(picker.delegate.style, BranchListStyle::Modal);
         });
 
         let mut subscriptions = Vec::new();
@@ -312,6 +351,19 @@ impl BranchList {
                             picker.delegate.branch_list_error = branch_list_error;
                             picker.refresh(window, cx);
                         });
+                    }
+                },
+            ));
+        }
+
+        if let Some(project) = project {
+            subscriptions.push(cx.subscribe_in(
+                &project,
+                window,
+                move |this, project, event, window, cx| {
+                    if matches!(event, ProjectEvent::ActiveRepositoryChanged(_)) {
+                        let repository = project.read(cx).active_repository(cx);
+                        this.set_repository(repository, window, cx);
                     }
                 },
             ));
@@ -345,8 +397,65 @@ impl BranchList {
         }
     }
 
+    fn set_repository(
+        &mut self,
+        repository: Option<Entity<Repository>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let all_branches = repository
+            .as_ref()
+            .map(|repo| {
+                process_branches(
+                    &repo.read(cx).branch_list,
+                    self.picker
+                        .read(cx)
+                        .delegate
+                        .branch_selection_behavior
+                        .selected_branch(),
+                )
+            })
+            .unwrap_or_default();
+        let branch_list_error = repository
+            .as_ref()
+            .and_then(|repo| repo.read(cx).branch_list_error.clone());
+        let default_branch_request = repository.clone().map(|repository| {
+            repository.update(cx, |repository, _| repository.default_branch(false))
+        });
+
+        self.picker.update(cx, |picker, cx| {
+            picker.delegate.repo = repository;
+            picker.delegate.all_branches = all_branches;
+            picker.delegate.branch_list_error = branch_list_error;
+            picker.delegate.default_branch = None;
+            picker.refresh(window, cx);
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let default_branch = match default_branch_request {
+                Some(default_branch_request) => default_branch_request
+                    .await
+                    .map(Result::ok)
+                    .ok()
+                    .flatten()
+                    .flatten(),
+                None => None,
+            };
+
+            this.update_in(cx, |this, window, cx| {
+                this.picker.update(cx, |picker, cx| {
+                    picker.delegate.default_branch = default_branch;
+                    picker.refresh(window, cx);
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn new_embedded(
         workspace: WeakEntity<Workspace>,
+        project: Option<Entity<Project>>,
         repository: Option<Entity<Repository>>,
         width: Rems,
         show_footer: bool,
@@ -355,6 +464,7 @@ impl BranchList {
     ) -> Self {
         let mut this = Self::new_inner(
             workspace,
+            project,
             repository,
             BranchListStyle::Modal,
             width,
@@ -441,12 +551,38 @@ impl Focusable for BranchList {
 
 impl Render for BranchList {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let repository_selector = self
+            .picker
+            .read(cx)
+            .delegate
+            .show_repository_selector
+            .then(|| {
+                let project = self.picker.read(cx).delegate.project.clone();
+                project.and_then(|project| {
+                    repository_selector_menu_default(
+                        "branch-picker-repository-selector",
+                        &project,
+                        cx,
+                    )
+                })
+            })
+            .flatten();
         v_flex()
             .key_context("GitBranchSelector")
             .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
             .on_action(cx.listener(Self::handle_delete))
             .on_action(cx.listener(Self::handle_force_delete))
             .on_action(cx.listener(Self::handle_filter))
+            .when_some(repository_selector, |this, repository_selector| {
+                this.child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(repository_selector),
+                )
+            })
             .child(self.picker.clone())
             .when(!self.embedded, |this| {
                 this.on_mouse_down_out({
@@ -525,6 +661,7 @@ impl BranchFilter {
 
 pub struct BranchListDelegate {
     workspace: WeakEntity<Workspace>,
+    project: Option<Entity<Project>>,
     matches: Vec<Entry>,
     all_branches: Vec<Branch>,
     branch_list_error: Option<SharedString>,
@@ -540,6 +677,7 @@ pub struct BranchListDelegate {
     focus_handle: FocusHandle,
     restore_selected_branch: Option<SharedString>,
     show_footer: bool,
+    show_repository_selector: bool,
     hovered_delete_index: Option<usize>,
 }
 
@@ -835,6 +973,7 @@ fn process_branches(
 impl BranchListDelegate {
     fn new(
         workspace: WeakEntity<Workspace>,
+        project: Option<Entity<Project>>,
         repo: Option<Entity<Repository>>,
         style: BranchListStyle,
         branch_selection_behavior: BranchSelectionBehavior,
@@ -849,6 +988,7 @@ impl BranchListDelegate {
 
         Self {
             workspace,
+            project,
             matches: vec![],
             repo,
             style,
@@ -864,6 +1004,7 @@ impl BranchListDelegate {
             focus_handle: cx.focus_handle(),
             restore_selected_branch,
             show_footer: false,
+            show_repository_selector: false,
             hovered_delete_index: None,
         }
     }
@@ -1107,15 +1248,16 @@ impl PickerDelegate for BranchListDelegate {
                     .overflow_hidden()
                     .flex_none()
                     .h_9()
+                    .gap_1()
                     .px_2p5()
-                    .child(editor.clone())
+                    .child(div().flex_1().min_w_0().child(editor.clone()))
                     .when(show_inline_filter, |this| {
                         let tooltip_label = match self.branch_filter {
                             BranchFilter::All => "Filter Remote Branches",
                             BranchFilter::Remote => "Show All Branches",
                         };
 
-                        this.gap_1().justify_between().child({
+                        this.child({
                             IconButton::new("filter-remotes", IconName::Filter)
                                 .toggle_state(self.branch_filter == BranchFilter::Remote)
                                 .icon_size(IconSize::Small)
@@ -2068,6 +2210,7 @@ mod tests {
                 cx.new(|cx| {
                     let mut delegate = BranchListDelegate::new(
                         workspace.downgrade(),
+                        Some(project.clone()),
                         repository,
                         BranchListStyle::Modal,
                         BranchSelectionBehavior::Checkout,

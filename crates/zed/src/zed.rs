@@ -24,6 +24,9 @@ use assets::Assets;
 use breadcrumbs::Breadcrumbs;
 use client::zed_urls;
 use collections::VecDeque;
+use command_palette_hooks::{
+    CommandInterceptItem, CommandInterceptResult, GlobalCommandPaletteInterceptor,
+};
 use debugger_ui::debugger_panel::DebugPanel;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
@@ -57,17 +60,16 @@ use paths::{
     local_debug_file_relative_path, local_settings_file_relative_path,
     local_tasks_file_relative_path,
 };
-use project::{DirectoryLister, ProjectItem};
+use project::{ProjectItem, WorktreeId};
 use project_panel::ProjectPanel;
 use quick_action_bar::QuickActionBar;
-use recent_projects::open_remote_project;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rope::Rope;
 use search::project_search::ProjectSearchBar;
 use settings::{
-    BaseKeymap, DEFAULT_KEYMAP_PATH, DefaultOpenBehavior, InvalidSettingsError, KeybindSource,
-    KeymapFile, KeymapFileLoadResult, MigrationStatus, SPECIFIC_OVERRIDES_KEYMAP_PATH, Settings,
-    SettingsFile, SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
+    BaseKeymap, DEFAULT_KEYMAP_PATH, InvalidSettingsError, KeybindSource, KeymapFile,
+    KeymapFileLoadResult, MigrationStatus, SPECIFIC_OVERRIDES_KEYMAP_PATH, Settings, SettingsFile,
+    SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
     initial_project_settings_content, initial_tasks_content, update_settings_file,
 };
 use sidebar::Sidebar;
@@ -93,7 +95,7 @@ use workspace::notifications::{NotificationId, dismiss_app_notification, show_ap
 use workspace::{
     AppState, MultiWorkspace, NewFile, NewWindow, OpenLog, Toast, Workspace, WorkspaceSettings,
     create_and_open_local_file, notifications::simple_message_notification::MessageNotification,
-    open_new,
+    open_new, singleton_multi_workspace_window,
 };
 use workspace::{
     CloseIntent, CloseProject, CloseWindow, RestoreBanner, with_active_or_new_workspace,
@@ -101,7 +103,8 @@ use workspace::{
 use workspace::{Pane, notifications::DetachAndPromptErr};
 use zed_actions::{
     About, OpenAccountSettings, OpenBrowser, OpenDocs, OpenServerSettings, OpenSettingsFile,
-    OpenStatusPage, OpenZedUrl, Quit,
+    OpenStatusPage, OpenWorktreeDebugTasks, OpenWorktreeSettings, OpenWorktreeTasks, OpenZedUrl,
+    Quit,
 };
 
 const DOCS_URL: &str = "https://zed.dev/docs/";
@@ -110,6 +113,8 @@ const STATUS_URL: &str = "https://status.zed.dev";
 pub struct CrashHandler(pub Arc<crashes::Client>);
 
 impl gpui::Global for CrashHandler {}
+
+struct WorktreeScopedCommandPaletteInterceptor;
 
 actions!(
     zed,
@@ -166,7 +171,134 @@ actions!(
     ]
 );
 
+const MAX_SCOPED_COMMAND_WORKTREES: usize = 24;
+
+fn install_worktree_scoped_command_palette_interceptor(cx: &mut App) {
+    GlobalCommandPaletteInterceptor::set_for_type::<WorktreeScopedCommandPaletteInterceptor>(
+        cx,
+        worktree_scoped_command_palette_interceptor,
+    );
+}
+
+fn worktree_scoped_command_palette_interceptor(
+    query: &str,
+    workspace: WeakEntity<Workspace>,
+    cx: &mut App,
+) -> Task<CommandInterceptResult> {
+    if query
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .take(2)
+        .count()
+        < 2
+    {
+        return Task::ready(CommandInterceptResult::default());
+    }
+
+    let worktrees = workspace
+        .read_with(cx, |workspace, cx| {
+            workspace
+                .visible_worktrees(cx)
+                .take(MAX_SCOPED_COMMAND_WORKTREES)
+                .map(|worktree| {
+                    let worktree = worktree.read(cx);
+                    let name = {
+                        let root_name = worktree.root_name().as_unix_str();
+                        if root_name.is_empty() {
+                            worktree
+                                .abs_path()
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_else(|| worktree.abs_path().display().to_string())
+                        } else {
+                            root_name.to_string()
+                        }
+                    };
+                    (worktree.id().to_usize(), name)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut append_results = Vec::new();
+    for (worktree_id, worktree_name) in worktrees {
+        push_scoped_worktree_command(
+            &mut append_results,
+            query,
+            "Open Worktree Settings",
+            &worktree_name,
+            OpenWorktreeSettings { worktree_id }.boxed_clone(),
+        );
+        push_scoped_worktree_command(
+            &mut append_results,
+            query,
+            "Open Tasks Config",
+            &worktree_name,
+            OpenWorktreeTasks { worktree_id }.boxed_clone(),
+        );
+        push_scoped_worktree_command(
+            &mut append_results,
+            query,
+            "Open Debug Config",
+            &worktree_name,
+            OpenWorktreeDebugTasks { worktree_id }.boxed_clone(),
+        );
+        push_scoped_worktree_command(
+            &mut append_results,
+            query,
+            "Open Agent Rules",
+            &worktree_name,
+            zed_actions::assistant::OpenWorktreeAgentsMdRules { worktree_id }.boxed_clone(),
+        );
+    }
+
+    Task::ready(CommandInterceptResult {
+        append_results,
+        exclusive: false,
+        ..Default::default()
+    })
+}
+
+fn push_scoped_worktree_command(
+    results: &mut Vec<CommandInterceptItem>,
+    query: &str,
+    command_name: &'static str,
+    worktree_name: &str,
+    action: Box<dyn Action>,
+) {
+    let string = format!("{command_name}: {worktree_name}");
+    if let Some(positions) = command_match_positions(&string, query) {
+        results.push(CommandInterceptItem {
+            action,
+            string,
+            positions,
+        });
+    }
+}
+
+fn command_match_positions(string: &str, query: &str) -> Option<Vec<usize>> {
+    let mut positions = Vec::new();
+    let mut query_chars = query.trim().chars();
+    let mut current = query_chars.next()?;
+
+    for (index, character) in string.char_indices() {
+        if character.eq_ignore_ascii_case(&current) {
+            positions.push(index);
+            if let Some(next) = query_chars.next() {
+                current = next;
+            } else {
+                return Some(positions);
+            }
+        }
+    }
+
+    None
+}
+
 pub fn init(cx: &mut App) {
+    install_worktree_scoped_command_palette_interceptor(cx);
+
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &Hide, cx| cx.hide());
     #[cfg(target_os = "macos")]
@@ -867,12 +999,7 @@ fn register_actions(
                     multiple: true,
                     prompt: None,
                 },
-                action.create_new_window.unwrap_or_else(|| {
-                    matches!(
-                        WorkspaceSettings::get_global(cx).default_open_behavior,
-                        DefaultOpenBehavior::NewWindow
-                    )
-                }),
+                action.create_new_window.unwrap_or(false),
                 window,
                 cx,
             );
@@ -894,40 +1021,12 @@ fn register_actions(
             );
         })
         .register_action(|workspace, action: &zed_actions::OpenRemote, window, cx| {
-            if !action.from_existing_connection {
-                cx.propagate();
-                return;
-            }
-            // You need existing remote connection to open it this way
-            if workspace.project().read(cx).is_local() {
-                return;
-            }
-            telemetry::event!("Project Opened");
-            let paths = workspace.prompt_for_open_path(
-                PathPromptOptions {
-                    files: true,
-                    directories: true,
-                    multiple: true,
-                    prompt: None,
-                },
-                DirectoryLister::Project(workspace.project().clone()),
-                window,
+            let _ = action;
+            let _ = window;
+            workspace.show_error(
+                "Remote workspaces are disabled in the single-session workspace model",
                 cx,
             );
-            cx.spawn_in(window, async move |this, cx| {
-                let Some(paths) = paths.await.log_err().flatten() else {
-                    return;
-                };
-                if let Some(task) = this
-                    .update_in(cx, |this, window, cx| {
-                        open_new_ssh_project_from_project(this, paths, window, cx)
-                    })
-                    .log_err()
-                {
-                    task.await.log_err();
-                }
-            })
-            .detach()
         })
         .register_action({
             let fs = app_state.fs.clone();
@@ -1064,8 +1163,11 @@ fn register_actions(
             );
         })
         .register_action(open_project_settings_file)
+        .register_action(open_worktree_settings_file)
         .register_action(open_project_tasks_file)
+        .register_action(open_worktree_tasks_file)
         .register_action(open_project_debug_tasks_file)
+        .register_action(open_worktree_debug_tasks_file)
         .register_action(
             |workspace: &mut Workspace,
              _: &zed_actions::project_panel::ToggleFocus,
@@ -1090,35 +1192,21 @@ fn register_actions(
                 workspace.toggle_panel_focus::<collab_ui::collab_panel::CollabPanel>(window, cx);
             },
         )
-        .register_action({
-            let app_state = app_state.clone();
-            move |_, _: &NewWindow, _, cx| {
-                open_new(
-                    Default::default(),
-                    app_state.clone(),
-                    cx,
-                    |workspace, window, cx| {
-                        cx.activate(true);
-                        // Create buffer synchronously to avoid flicker
-                        let project = workspace.project().clone();
-                        let buffer = project.update(cx, |project, cx| {
-                            project.create_local_buffer("", None, true, cx)
-                        });
-                        let editor = cx.new(|cx| {
-                            Editor::for_buffer(buffer, Some(project), window, cx)
-                        });
-                        workspace.add_item_to_active_pane(
-                            Box::new(editor),
-                            None,
-                            true,
-                            window,
-                            cx,
-                        );
-                    },
-                )
-                .detach();
-            }
-        })
+        .register_action(
+            |_, _: &NewWindow, _window, cx| {
+                cx.defer(|cx| {
+                    let Some(multi_workspace) = singleton_multi_workspace_window(cx) else {
+                        return;
+                    };
+
+                    multi_workspace
+                        .update(cx, |multi_workspace, window, cx| {
+                            multi_workspace.create_empty_workspace(window, cx);
+                        })
+                        .log_err();
+                });
+            },
+        )
         .register_action({
             let app_state = app_state.clone();
             move |workspace, _: &CloseProject, window, cx| {
@@ -2130,7 +2218,7 @@ fn reload_keymaps(cx: &mut App, mut user_key_bindings: Vec<KeyBinding>) {
     // On Windows, this is set in the `update_jump_list` method of the `HistoryManager`.
     #[cfg(not(target_os = "windows"))]
     cx.set_dock_menu(vec![gpui::MenuItem::action(
-        "New Window",
+        "New Workspace",
         workspace::NewWindow,
     )]);
     // todo: nicer api here?
@@ -2167,31 +2255,17 @@ pub fn load_default_keymap(cx: &mut App) {
     );
 }
 
+#[allow(dead_code)]
 pub fn open_new_ssh_project_from_project(
     workspace: &mut Workspace,
     paths: Vec<PathBuf>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<()>> {
-    let app_state = workspace.app_state().clone();
-    let Some(ssh_client) = workspace.project().read(cx).remote_client() else {
-        return Task::ready(Err(anyhow::anyhow!("Not an ssh project")));
-    };
-    let connection_options = ssh_client.read(cx).connection_options();
-    cx.spawn_in(window, async move |_, cx| {
-        open_remote_project(
-            connection_options,
-            paths,
-            app_state,
-            workspace::OpenOptions {
-                workspace_matching: workspace::WorkspaceMatching::None,
-                ..Default::default()
-            },
-            cx,
-        )
-        .await
-        .map(|_| ())
-    })
+    let _ = (workspace, paths, window, cx);
+    Task::ready(Err(anyhow::anyhow!(
+        "Remote workspaces are disabled in the single-session workspace model"
+    )))
 }
 
 fn open_project_settings_file(
@@ -2204,6 +2278,23 @@ fn open_project_settings_file(
         workspace,
         local_settings_file_relative_path(),
         initial_project_settings_content(),
+        None,
+        window,
+        cx,
+    )
+}
+
+fn open_worktree_settings_file(
+    workspace: &mut Workspace,
+    action: &zed_actions::OpenWorktreeSettingsFile,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    open_local_file(
+        workspace,
+        local_settings_file_relative_path(),
+        initial_project_settings_content(),
+        Some(WorktreeId::from_usize(action.worktree_id)),
         window,
         cx,
     )
@@ -2219,6 +2310,23 @@ fn open_project_tasks_file(
         workspace,
         local_tasks_file_relative_path(),
         initial_tasks_content(),
+        None,
+        window,
+        cx,
+    )
+}
+
+fn open_worktree_tasks_file(
+    workspace: &mut Workspace,
+    action: &zed_actions::OpenWorktreeTasks,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    open_local_file(
+        workspace,
+        local_tasks_file_relative_path(),
+        initial_tasks_content(),
+        Some(WorktreeId::from_usize(action.worktree_id)),
         window,
         cx,
     )
@@ -2234,6 +2342,23 @@ fn open_project_debug_tasks_file(
         workspace,
         local_debug_file_relative_path(),
         initial_local_debug_tasks_content(),
+        None,
+        window,
+        cx,
+    )
+}
+
+fn open_worktree_debug_tasks_file(
+    workspace: &mut Workspace,
+    action: &zed_actions::OpenWorktreeDebugTasks,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    open_local_file(
+        workspace,
+        local_debug_file_relative_path(),
+        initial_local_debug_tasks_content(),
+        Some(WorktreeId::from_usize(action.worktree_id)),
         window,
         cx,
     )
@@ -2243,14 +2368,28 @@ fn open_local_file(
     workspace: &mut Workspace,
     settings_relative_path: &'static RelPath,
     initial_contents: Cow<'static, str>,
+    target_worktree_id: Option<WorktreeId>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
     let project = workspace.project().clone();
-    let worktree = project
-        .read(cx)
-        .visible_worktrees(cx)
-        .find_map(|tree| tree.read(cx).root_entry()?.is_dir().then_some(tree));
+    let worktree = target_worktree_id
+        .and_then(|target_worktree_id| {
+            workspace
+                .visible_worktrees(cx)
+                .find(|tree| tree.read(cx).id() == target_worktree_id)
+        })
+        .or_else(|| {
+            target_worktree_id
+                .is_none()
+                .then(|| workspace.active_worktree(cx))
+                .flatten()
+        })
+        .or_else(|| {
+            workspace
+                .visible_worktrees(cx)
+                .find_map(|tree| tree.read(cx).root_entry()?.is_dir().then_some(tree))
+        });
     if let Some(worktree) = worktree {
         let tree_id = worktree.read(cx).id();
         cx.spawn_in(window, async move |workspace, cx| {
@@ -2321,7 +2460,7 @@ fn open_local_file(
         struct NoOpenFolders;
 
         workspace.show_notification(NotificationId::unique::<NoOpenFolders>(), cx, |cx| {
-            cx.new(|cx| MessageNotification::new("This project has no folders open.", cx))
+            cx.new(|cx| MessageNotification::new("No worktree detected", cx))
         })
     }
 }
@@ -6253,10 +6392,9 @@ mod tests {
 
     #[gpui::test]
     async fn test_multi_workspace_session_restore(cx: &mut TestAppContext) {
-        use collections::HashMap;
         use session::Session;
         use util::path_list::PathList;
-        use workspace::{OpenMode, ProjectGroupKey, Workspace, WorkspaceId};
+        use workspace::{OpenMode, ProjectGroupKey, Workspace};
 
         let app_state = init_test(cx);
 
@@ -6272,10 +6410,7 @@ mod tests {
 
         let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
 
-        // --- Create 3 workspaces in 2 windows ---
-        //
-        //   Window A: workspace for dir1, workspace for dir2
-        //   Window B: workspace for dir3
+        // --- Create 3 workspaces in 1 window ---
         let workspace::OpenResult {
             window: window_a, ..
         } = cx
@@ -6308,30 +6443,21 @@ mod tests {
             .expect("failed to open second workspace into window A");
         cx.run_until_parked();
 
-        let workspace::OpenResult {
-            window: window_b, ..
-        } = cx
-            .update(|cx| {
-                Workspace::new_local(
-                    vec![dir3.into()],
-                    app_state.clone(),
-                    None,
-                    None,
-                    None,
-                    OpenMode::Activate,
-                    cx,
-                )
-            })
-            .await
-            .expect("failed to open third workspace");
+        cx.update(|cx| {
+            Workspace::new_local(
+                vec![dir3.into()],
+                app_state.clone(),
+                None,
+                None,
+                None,
+                OpenMode::Activate,
+                cx,
+            )
+        })
+        .await
+        .expect("failed to open third workspace");
 
-        window_b
-            .update(cx, |multi_workspace, _, cx| {
-                multi_workspace.open_sidebar(cx);
-            })
-            .unwrap();
-
-        // Currently dir2 is active because it was added last.
+        // Currently dir3 is active because it was added last.
         // So, switch window_a's active workspace to dir1 (index 0).
         // This sets up a non-trivial assertion: after restore, dir1 should
         // still be active rather than whichever workspace happened to restore last.
@@ -6344,7 +6470,6 @@ mod tests {
 
         cx.run_until_parked();
         flush_workspace_serialization(&window_a, cx).await;
-        flush_workspace_serialization(&window_b, cx).await;
         cx.run_until_parked();
 
         // Verify all workspaces retained their session_ids.
@@ -6359,18 +6484,14 @@ mod tests {
             "all 3 workspaces should have session_ids in the DB"
         );
 
-        // Close the original windows.
+        // Close the original window.
         window_a
-            .update(cx, |_, window, _| window.remove_window())
-            .unwrap();
-        window_b
             .update(cx, |_, window, _| window.remove_window())
             .unwrap();
         cx.run_until_parked();
 
         // Simulate a new session launch: replace the session so that
         // `last_session_id()` returns the ID used during workspace creation.
-        // `restore_on_startup` defaults to `LastSession`, which is what we need.
         cx.update(|cx| {
             app_state.session.update(cx, |app_session, _cx| {
                 app_session
@@ -6386,28 +6507,11 @@ mod tests {
 
         assert_eq!(locations.len(), 3, "expected 3 session workspaces");
 
-        let mut groups_by_window: HashMap<gpui::WindowId, Vec<WorkspaceId>> = HashMap::default();
-        for session_workspace in &locations {
-            if let Some(window_id) = session_workspace.window_id {
-                groups_by_window
-                    .entry(window_id)
-                    .or_default()
-                    .push(session_workspace.workspace_id);
-            }
-        }
-        assert_eq!(
-            groups_by_window.len(),
-            2,
-            "expected 2 window groups, got {groups_by_window:?}"
-        );
-        assert!(
-            groups_by_window.values().any(|g| g.len() == 2),
-            "expected one group with 2 workspaces"
-        );
-        assert!(
-            groups_by_window.values().any(|g| g.len() == 1),
-            "expected one group with 1 workspace"
-        );
+        let window_ids = locations
+            .iter()
+            .filter_map(|session_workspace| session_workspace.window_id)
+            .collect::<collections::HashSet<_>>();
+        assert_eq!(window_ids.len(), 1, "expected one window group");
 
         let mut async_cx = cx.to_async();
         crate::restore_or_create_workspace(app_state.clone(), &mut async_cx)
@@ -6415,56 +6519,27 @@ mod tests {
             .expect("failed to restore workspaces");
         cx.run_until_parked();
 
-        // --- Verify the restored windows ---
+        // --- Verify the restored window ---
         let restored_windows: Vec<WindowHandle<MultiWorkspace>> = cx.read(|cx| {
             cx.windows()
                 .into_iter()
                 .filter_map(|window| window.downcast::<MultiWorkspace>())
                 .collect()
         });
-        assert_eq!(restored_windows.len(), 2,);
+        assert_eq!(restored_windows.len(), 1);
+        let restored = &restored_windows[0];
 
-        // Identify restored windows by their active workspace root paths.
-        let (restored_a, restored_b) = {
-            let (mut with_dir1, mut with_dir3) = (None, None);
-            for window in &restored_windows {
-                let active_paths = window
-                    .read_with(cx, |mw, cx| mw.workspace().read(cx).root_paths(cx))
-                    .unwrap();
-                if active_paths.iter().any(|p| p.as_ref() == Path::new(dir1)) {
-                    with_dir1 = Some(window);
-                } else {
-                    with_dir3 = Some(window);
-                }
-            }
-            (
-                with_dir1.expect("expected a window with dir1 active"),
-                with_dir3.expect("expected a window with dir3 active"),
-            )
-        };
+        restored
+            .read_with(cx, |mw, cx| {
+                let active_paths = mw.workspace().read(cx).root_paths(cx);
+                assert!(active_paths.iter().any(|p| p.as_ref() == Path::new(dir1)));
+                assert_eq!(mw.workspaces().count(), 3);
 
-        // Window A (dir1+dir2): 1 workspace restored, but 2 project group keys.
-        restored_a
-            .read_with(cx, |mw, _| {
-                assert_eq!(
-                    mw.project_group_keys(),
-                    vec![
-                        ProjectGroupKey::new(None, PathList::new(&[dir2])),
-                        ProjectGroupKey::new(None, PathList::new(&[dir1])),
-                    ]
-                );
-                assert_eq!(mw.workspaces().count(), 1);
-            })
-            .unwrap();
-
-        // Window B (dir3): 1 workspace, 1 project group key.
-        restored_b
-            .read_with(cx, |mw, _| {
-                assert_eq!(
-                    mw.project_group_keys(),
-                    vec![ProjectGroupKey::new(None, PathList::new(&[dir3]))]
-                );
-                assert_eq!(mw.workspaces().count(), 1);
+                let keys = mw.project_group_keys();
+                assert_eq!(keys.len(), 3);
+                assert!(keys.contains(&ProjectGroupKey::new(None, PathList::new(&[dir1]))));
+                assert!(keys.contains(&ProjectGroupKey::new(None, PathList::new(&[dir2]))));
+                assert!(keys.contains(&ProjectGroupKey::new(None, PathList::new(&[dir3]))));
             })
             .unwrap();
     }

@@ -983,9 +983,21 @@ fn init_app_state(cx: &mut App) -> Arc<AppState> {
     let clock = Arc::new(clock::FakeSystemClock::new());
     let http_client = http_client::FakeHttpClient::with_404_response();
     let client = client::Client::new(clock, http_client, cx);
+    let node_runtime = NodeRuntime::unavailable();
     let session = cx.new(|cx| session::AppSession::new(Session::test(), cx));
     let user_store = cx.new(|cx| client::UserStore::new(client.clone(), cx));
     let workspace_store = cx.new(|cx| workspace::WorkspaceStore::new(client.clone(), cx));
+    let shared_project_store = cx.new(|cx| {
+        workspace::SharedProjectStore::new(
+            client.clone(),
+            node_runtime.clone(),
+            user_store.clone(),
+            languages.clone(),
+            fs.clone(),
+            None,
+            cx,
+        )
+    });
 
     theme_settings::init(theme::LoadThemes::JustBase, cx);
     client::init(&client, cx);
@@ -996,7 +1008,8 @@ fn init_app_state(cx: &mut App) -> Arc<AppState> {
         languages,
         user_store,
         workspace_store,
-        node_runtime: NodeRuntime::unavailable(),
+        shared_project_store,
+        node_runtime,
         build_window_options: |_, _| Default::default(),
         session,
     });

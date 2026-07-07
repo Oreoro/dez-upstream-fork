@@ -52,6 +52,7 @@ pub struct ActivityIndicator {
 
 #[derive(Debug)]
 struct ServerStatus {
+    language_server_id: Option<LanguageServerId>,
     name: LanguageServerName,
     status: LanguageServerStatusUpdate,
 }
@@ -90,6 +91,7 @@ impl ActivityIndicator {
                     this.update(cx, |this: &mut ActivityIndicator, cx| {
                         this.statuses.retain(|s| s.name != name);
                         this.statuses.push(ServerStatus {
+                            language_server_id: None,
                             name,
                             status: LanguageServerStatusUpdate::Binary(binary_status),
                         });
@@ -124,7 +126,22 @@ impl ActivityIndicator {
             cx.subscribe(
                 &project.read(cx).lsp_store(),
                 |activity_indicator, _, event, cx| {
-                    if let LspStoreEvent::LanguageServerUpdate { name, message, .. } = event {
+                    if let LspStoreEvent::LanguageServerUpdate {
+                        language_server_id,
+                        name,
+                        message,
+                    } = event
+                    {
+                        let server_is_visible = activity_indicator
+                            .project
+                            .read(cx)
+                            .language_server_statuses(cx)
+                            .any(|(server_id, _)| server_id == *language_server_id);
+                        if !server_is_visible {
+                            cx.notify();
+                            return;
+                        }
+
                         if let proto::update_language_server::Variant::StatusUpdate(status_update) =
                             message
                         {
@@ -187,9 +204,11 @@ impl ActivityIndicator {
                             };
 
                             activity_indicator.statuses.retain(|s| s.name != name);
-                            activity_indicator
-                                .statuses
-                                .push(ServerStatus { name, status });
+                            activity_indicator.statuses.push(ServerStatus {
+                                language_server_id: Some(*language_server_id),
+                                name,
+                                status,
+                            });
                         }
                         cx.notify()
                     }
@@ -386,9 +405,8 @@ impl ActivityIndicator {
         if let Some(session) = self
             .project
             .read(cx)
-            .dap_store()
-            .read(cx)
-            .sessions()
+            .debug_sessions(cx)
+            .into_iter()
             .find(|s| !s.read(cx).is_started())
         {
             return Some(Content {
@@ -435,7 +453,19 @@ impl ActivityIndicator {
         let mut failed = SmallVec::<[_; 3]>::new();
         let mut health_messages = SmallVec::<[_; 3]>::new();
         let mut servers_to_clear_statuses = HashSet::<LanguageServerName>::default();
+        let visible_language_server_ids = self
+            .project
+            .read(cx)
+            .language_server_statuses(cx)
+            .map(|(server_id, _)| server_id)
+            .collect::<HashSet<_>>();
         for status in &self.statuses {
+            if status
+                .language_server_id
+                .is_some_and(|server_id| !visible_language_server_ids.contains(&server_id))
+            {
+                continue;
+            }
             match &status.status {
                 LanguageServerStatusUpdate::Binary(
                     BinaryStatus::Starting | BinaryStatus::Stopping,
@@ -463,8 +493,12 @@ impl ActivityIndicator {
                 },
             }
         }
-        self.statuses
-            .retain(|status| !servers_to_clear_statuses.contains(&status.name));
+        self.statuses.retain(|status| {
+            !servers_to_clear_statuses.contains(&status.name)
+                && status
+                    .language_server_id
+                    .is_none_or(|server_id| visible_language_server_ids.contains(&server_id))
+        });
 
         health_messages.sort_by_key(|(_, health, _)| match health {
             ServerHealth::Error => 2,

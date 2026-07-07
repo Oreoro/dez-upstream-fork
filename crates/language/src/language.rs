@@ -57,7 +57,8 @@ pub use language_registry::{
     LanguageName, LanguageServerStatusUpdate, LoadedLanguage, ServerHealth,
 };
 use lsp::{
-    CodeActionKind, InitializeParams, LanguageServerBinary, LanguageServerBinaryOptions, Uri,
+    CodeActionKind, InitializeParams, LanguageServer, LanguageServerBinary,
+    LanguageServerBinaryOptions, Uri,
 };
 pub use manifest::{ManifestDelegate, ManifestName, ManifestProvider, ManifestQuery};
 pub use modeline::{ModelineSettings, parse_modeline};
@@ -566,6 +567,10 @@ pub trait LspAdapter: 'static + Send + Sync + DynLspInstaller {
         None
     }
 
+    fn cancel_disk_based_diagnostics(&self, _server: &LanguageServer) -> Result<()> {
+        Ok(())
+    }
+
     fn language_ids(&self) -> HashMap<LanguageName, String> {
         HashMap::default()
     }
@@ -834,6 +839,7 @@ pub struct FakeLspAdapter {
     pub prettier_plugins: Vec<&'static str>,
     pub disk_based_diagnostics_progress_token: Option<String>,
     pub disk_based_diagnostics_sources: Vec<String>,
+    pub disk_based_diagnostics_cancellations: Option<Arc<std::sync::atomic::AtomicUsize>>,
     pub language_server_binary: LanguageServerBinary,
 
     pub capabilities: lsp::ServerCapabilities,
@@ -1385,6 +1391,7 @@ impl Default for FakeLspAdapter {
             disk_based_diagnostics_progress_token: None,
             initialization_options: None,
             disk_based_diagnostics_sources: Vec::new(),
+            disk_based_diagnostics_cancellations: None,
             prettier_plugins: Vec::new(),
             language_server_binary: LanguageServerBinary {
                 path: "/the/fake/lsp/path".into(),
@@ -1451,6 +1458,13 @@ impl LspAdapter for FakeLspAdapter {
 
     fn disk_based_diagnostics_progress_token(&self) -> Option<String> {
         self.disk_based_diagnostics_progress_token.clone()
+    }
+
+    fn cancel_disk_based_diagnostics(&self, _server: &LanguageServer) -> Result<()> {
+        if let Some(cancellations) = &self.disk_based_diagnostics_cancellations {
+            cancellations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     async fn initialization_options(

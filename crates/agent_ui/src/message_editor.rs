@@ -237,7 +237,7 @@ fn insert_mention_for_project_path(
     let (file_name, mention_uri) = {
         let project = project.read(cx);
         let path_style = project.path_style(cx);
-        let entry = project.entry_for_path(project_path, cx)?;
+        let entry = project.entry_for_path(&project_path, cx)?;
         let worktree = project.worktree_for_id(project_path.worktree_id, cx)?;
         let abs_path = worktree.read(cx).absolutize(&project_path.path);
         let (file_name, _) = crate::completion_provider::extract_file_name_and_directory(

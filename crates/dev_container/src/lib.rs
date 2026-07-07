@@ -106,7 +106,7 @@ pub struct DevContainerContext {
 
 impl DevContainerContext {
     pub fn from_workspace(workspace: &Workspace, cx: &App) -> Option<Self> {
-        let project_directory = workspace.project().read(cx).active_project_directory(cx)?;
+        let project_directory = workspace.active_project_directory(cx)?;
         let settings = DevContainerSettings::get_global(cx);
         let use_podman = settings.use_podman;
         let use_buildkit = settings.use_buildkit;

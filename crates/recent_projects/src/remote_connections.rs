@@ -20,7 +20,7 @@ use settings::{DevContainerConnection, ExtendingVec, RegisterSetting, Settings, 
 use util::paths::PathWithPosition;
 use workspace::{
     AppState, MultiWorkspace, OpenOptions, SerializedWorkspaceLocation, Workspace,
-    find_existing_workspace,
+    find_existing_workspace, singleton_multi_workspace_window,
 };
 
 pub use remote_connection::{
@@ -202,7 +202,11 @@ pub async fn open_remote_project(
         );
     }
 
-    let (window, initial_workspace) = if let Some(window) = open_options.requesting_window {
+    let target_window = open_options
+        .requesting_window
+        .or_else(|| cx.update(|cx| singleton_multi_workspace_window(cx)));
+
+    let (window, initial_workspace) = if let Some(window) = target_window {
         let workspace = window.update(cx, |multi_workspace, _, _| {
             multi_workspace.workspace().clone()
         })?;

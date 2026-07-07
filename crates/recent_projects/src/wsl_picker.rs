@@ -243,15 +243,9 @@ impl WslOpenModal {
             user: None,
         });
 
-        let replace_current_window = match self.create_new_window {
-            true => secondary,
-            false => !secondary,
-        };
-        let open_mode = if replace_current_window {
-            workspace::OpenMode::Activate
-        } else {
-            workspace::OpenMode::NewWindow
-        };
+        let _ = self.create_new_window;
+        let _ = secondary;
+        let open_mode = workspace::OpenMode::Activate;
 
         let paths = self.paths.clone();
         let open_options = workspace::OpenOptions {

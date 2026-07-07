@@ -8,6 +8,7 @@ use gpui::{
 };
 use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
+use project::{ProjectItem, ProjectPath};
 use ui::prelude::*;
 use workspace::item::Item;
 use workspace::{Pane, Workspace};
@@ -316,6 +317,8 @@ impl EventEmitter<()> for SvgPreviewView {}
 impl Item for SvgPreviewView {
     type Event = ();
 
+    const CONTRIBUTES_PATH_EVIDENCE: bool = true;
+
     fn tab_icon(&self, _window: &Window, cx: &App) -> Option<Icon> {
         self.buffer
             .as_ref()
@@ -335,6 +338,10 @@ impl Item for SvgPreviewView {
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
         Some("svg preview: open")
+    }
+
+    fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        self.buffer.as_ref()?.read(cx).project_path(cx)
     }
 
     fn to_item_events(_event: &Self::Event, _f: &mut dyn FnMut(workspace::item::ItemEvent)) {}

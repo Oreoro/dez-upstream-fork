@@ -35,7 +35,7 @@ use picker::{
 use project::{Worktree, git_store::Repository};
 pub use remote_connections::RemoteSettings;
 pub use remote_servers::RemoteServerProjects;
-use settings::{DefaultOpenBehavior, Settings, WorktreeId};
+use settings::{Settings, WorktreeId};
 use ui_input::ErasedEditor;
 use workspace::ProjectGroupKey;
 
@@ -92,15 +92,12 @@ enum ProjectPickerEntry {
     /// These entries come from `RecentProjectsDelegate::window_project_groups`, not from the
     /// recent-project database. Empty queries list every project group known to the current
     /// window; non-empty queries list matching project groups. Confirming one activates or loads
-    /// that project group in the current window, while secondary confirm can move local project
-    /// groups to a new window when multiple groups are available.
+    /// that project group in the current window.
     ProjectGroup(StringMatch),
     /// A workspace from the recent-project database's "Recent Projects" section.
     ///
     /// The match's `candidate_id` indexes into `RecentProjectsDelegate::workspaces`. Confirming
-    /// one opens that recent workspace in either the current window or a new window, depending on
-    /// whether the picker was invoked for new-window behavior and whether this was a primary or
-    /// secondary confirm.
+    /// one opens that recent workspace in the current window.
     RecentProject(StringMatch),
 }
 
@@ -278,10 +275,8 @@ fn get_branch_for_worktree(
 }
 
 pub(crate) fn default_open_in_new_window(cx: &App) -> bool {
-    matches!(
-        workspace::WorkspaceSettings::get_global(cx).default_open_behavior,
-        DefaultOpenBehavior::NewWindow
-    )
+    let _ = cx;
+    false
 }
 
 pub fn init(cx: &mut App) {
@@ -331,10 +326,8 @@ pub fn init(cx: &mut App) {
                         user: None,
                     });
 
-                    let requesting_window = match create_new_window {
-                        false => window_handle,
-                        true => None,
-                    };
+                    let _ = create_new_window;
+                    let requesting_window = window_handle;
 
                     let open_options = workspace::OpenOptions {
                         requesting_window,
@@ -391,13 +384,7 @@ pub fn init(cx: &mut App) {
         with_active_or_new_workspace(cx, move |workspace, window, cx| {
             let fs = workspace.project().read(cx).fs().clone();
             add_wsl_distro(fs, &open_wsl.distro, cx);
-            let requesting_window =
-                match workspace::WorkspaceSettings::get_global(cx).default_open_behavior {
-                    DefaultOpenBehavior::ExistingWindow => {
-                        window.window_handle().downcast::<MultiWorkspace>()
-                    }
-                    DefaultOpenBehavior::NewWindow => None,
-                };
+            let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
             let open_options = OpenOptions {
                 requesting_window,
                 ..Default::default()
@@ -1155,9 +1142,8 @@ impl PickerDelegate for RecentProjectsDelegate {
                 let worktree_id = folder.worktree_id;
                 if let Some(workspace) = self.workspace.upgrade() {
                     workspace.update(cx, |workspace, cx| {
-                        let git_store = workspace.project().read(cx).git_store().clone();
-                        git_store.update(cx, |git_store, cx| {
-                            git_store.set_active_repo_for_worktree(worktree_id, cx);
+                        workspace.project().update(cx, |project, cx| {
+                            project.set_active_repo_for_worktree(worktree_id, cx);
                         });
                     });
                 }
@@ -1416,13 +1402,13 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .gap_0p5()
                     .when(is_local && has_multiple_groups, |this| {
                         this.child(
-                            IconButton::new("move_to_new_window", IconName::ArrowUpRight)
+                            IconButton::new("focus_project_group", IconName::ThisWindow)
                                 .icon_size(IconSize::Small)
                                 .tooltip({
                                     let focus_handle = self.focus_handle.clone();
                                     move |_, cx| {
                                         Tooltip::for_action_in(
-                                            "Open in New Window",
+                                            "Focus Project",
                                             &menu::SecondaryConfirm,
                                             &focus_handle,
                                             cx,
@@ -1561,21 +1547,9 @@ impl PickerDelegate for RecentProjectsDelegate {
                 };
 
                 let focus_handle = self.focus_handle.clone();
-                let secondary_confirm_tooltip = if self.create_new_window {
-                    "Open Project in This Window"
-                } else {
-                    "Open Project in New Window"
-                };
-                let primary_confirm_tooltip = if self.create_new_window {
-                    "Open Project in New Window"
-                } else {
-                    "Open Project in This Window"
-                };
-                let secondary_confirm_icon = if self.create_new_window {
-                    IconName::ThisWindow
-                } else {
-                    IconName::ArrowUpRight
-                };
+                let secondary_confirm_tooltip = "Open Worktree in This Workspace";
+                let primary_confirm_tooltip = "Open Worktree in This Workspace";
+                let secondary_confirm_icon = IconName::ThisWindow;
 
                 let secondary_actions = h_flex()
                     .gap_px()
@@ -1851,31 +1825,8 @@ impl PickerDelegate for RecentProjectsDelegate {
                 })
                 .map(|this| {
                     if is_already_open_entry {
-                        this.when(show_move_to_new_window, |this| {
-                            this.child({
-                                let window_project_groups = self.window_project_groups.clone();
-                                let selected_index = self.selected_index;
-                                let filtered_entries = self.filtered_entries.clone();
-                                Button::new("move_to_new_window", "New Window")
-                                    .key_binding(KeyBinding::for_action_in(
-                                        &menu::SecondaryConfirm,
-                                        &focus_handle,
-                                        cx,
-                                    ))
-                                    .on_click(move |_, window, cx| {
-                                        let key = match filtered_entries.get(selected_index) {
-                                            Some(ProjectPickerEntry::ProjectGroup(hit)) => {
-                                                window_project_groups.get(hit.candidate_id).cloned()
-                                            }
-                                            _ => None,
-                                        };
-                                        if let Some(key) = key {
-                                            move_project_group_to_new_window(&key, window, cx);
-                                        }
-                                    })
-                            })
-                        })
-                        .child(
+                        let _ = show_move_to_new_window;
+                        this.child(
                             Button::new("activate", "Activate")
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::Confirm,
@@ -1888,17 +1839,6 @@ impl PickerDelegate for RecentProjectsDelegate {
                         )
                     } else if self.create_new_window {
                         this.child(
-                            Button::new("open_here", "This Window")
-                                .key_binding(KeyBinding::for_action_in(
-                                    &menu::SecondaryConfirm,
-                                    &focus_handle,
-                                    cx,
-                                ))
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
-                                }),
-                        )
-                        .child(
                             Button::new("open_new_window", "Open")
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::Confirm,
@@ -1911,17 +1851,6 @@ impl PickerDelegate for RecentProjectsDelegate {
                         )
                     } else {
                         this.child(
-                            Button::new("open_new_window", "New Window")
-                                .key_binding(KeyBinding::for_action_in(
-                                    &menu::SecondaryConfirm,
-                                    &focus_handle,
-                                    cx,
-                                ))
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
-                                }),
-                        )
-                        .child(
                             Button::new("open_here", "Open")
                                 .key_binding(KeyBinding::for_action_in(
                                     &menu::Confirm,
@@ -2137,22 +2066,21 @@ fn open_local_project(
             let Some(paths) = paths.await.log_err().flatten() else {
                 return;
             };
-            if !create_new_window {
-                if let Some(handle) = multi_workspace_handle {
-                    if let Some(task) = handle
-                        .update(cx, |multi_workspace, window, cx| {
-                            multi_workspace.open_project(paths, OpenMode::Activate, window, cx)
-                        })
-                        .log_err()
-                    {
-                        task.await.log_err();
-                    }
-                    return;
+            let _ = create_new_window;
+            if let Some(handle) = multi_workspace_handle {
+                if let Some(task) = handle
+                    .update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.open_project(paths, OpenMode::Activate, window, cx)
+                    })
+                    .log_err()
+                {
+                    task.await.log_err();
                 }
+                return;
             }
             if let Some(task) = workspace
                 .update_in(cx, |workspace, window, cx| {
-                    workspace.open_workspace_for_paths(OpenMode::NewWindow, paths, window, cx)
+                    workspace.open_workspace_for_paths(OpenMode::Activate, paths, window, cx)
                 })
                 .log_err()
             {
@@ -2177,7 +2105,7 @@ impl RecentProjectsDelegate {
             return;
         };
 
-        let replace_current_window = self.create_new_window == secondary;
+        let _ = secondary;
         let candidate_workspace_id = candidate_workspace.workspace_id;
         let candidate_workspace_location = candidate_workspace.location.clone();
         let candidate_workspace_paths = candidate_workspace.paths.clone();
@@ -2189,45 +2117,35 @@ impl RecentProjectsDelegate {
             match candidate_workspace_location {
                 SerializedWorkspaceLocation::Local => {
                     let paths = candidate_workspace_paths.paths().to_vec();
-                    if replace_current_window {
-                        if let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() {
-                            cx.defer(move |cx| {
-                                if let Some(task) = handle
-                                    .update(cx, |multi_workspace, window, cx| {
-                                        multi_workspace.open_project(
-                                            paths,
-                                            OpenMode::Activate,
-                                            window,
-                                            cx,
-                                        )
-                                    })
-                                    .log_err()
-                                {
-                                    task.detach_and_log_err(cx);
-                                }
-                            });
-                        }
+                    if let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() {
+                        cx.defer(move |cx| {
+                            if let Some(task) = handle
+                                .update(cx, |multi_workspace, window, cx| {
+                                    multi_workspace.open_project(
+                                        paths,
+                                        OpenMode::Activate,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .log_err()
+                            {
+                                task.detach_and_log_err(cx);
+                            }
+                        });
                         return;
-                    } else {
-                        workspace
-                            .open_workspace_for_paths(OpenMode::NewWindow, paths, window, cx)
-                            .detach_and_prompt_err(
-                                "Failed to open project",
-                                window,
-                                cx,
-                                |_, _, _| None,
-                            );
                     }
+
+                    workspace
+                        .open_workspace_for_paths(OpenMode::Activate, paths, window, cx)
+                        .detach_and_prompt_err("Failed to open project", window, cx, |_, _, _| {
+                            None
+                        });
                 }
                 SerializedWorkspaceLocation::Remote(mut connection) => {
                     let app_state = workspace.app_state().clone();
-                    let replace_window = if replace_current_window {
-                        window.window_handle().downcast::<MultiWorkspace>()
-                    } else {
-                        None
-                    };
                     let open_options = OpenOptions {
-                        requesting_window: replace_window,
+                        requesting_window: window.window_handle().downcast::<MultiWorkspace>(),
                         ..Default::default()
                     };
                     if let RemoteConnectionOptions::Ssh(connection) = &mut connection {

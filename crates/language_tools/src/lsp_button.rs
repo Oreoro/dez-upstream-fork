@@ -261,10 +261,13 @@ impl LanguageServerState {
         }
 
         let server_metadata = self
-            .lsp_store
-            .update(cx, |lsp_store, _| {
-                lsp_store
-                    .language_server_statuses()
+            .workspace
+            .upgrade()
+            .map(|workspace| {
+                let project = workspace.read(cx).project().clone();
+                project
+                    .read(cx)
+                    .language_server_statuses(cx)
                     .map(|(server_id, status)| {
                         (
                             server_id,
@@ -838,9 +841,10 @@ impl LspButton {
                 }
             });
 
-        let lsp_store = workspace.project().read(cx).lsp_store();
+        let project = workspace.project();
+        let lsp_store = project.read(cx).lsp_store();
         let mut language_servers = LanguageServers::default();
-        for (_, status) in lsp_store.read(cx).language_server_statuses() {
+        for (_, status) in project.read(cx).language_server_statuses(cx) {
             language_servers.binary_statuses.insert(
                 status.name.clone(),
                 LanguageServerBinaryStatus {
@@ -1049,25 +1053,24 @@ impl LspButton {
                     }
                 }
             }
-            state
-                .lsp_store
-                .update(cx, |lsp_store, cx| {
-                    for (server_id, status) in lsp_store.language_server_statuses() {
-                        if let Some(worktree) = status.worktree.and_then(|worktree_id| {
-                            lsp_store
-                                .worktree_store()
-                                .read(cx)
-                                .worktree_for_id(worktree_id, cx)
-                        }) {
-                            server_ids_to_worktrees.insert(server_id, worktree.clone());
-                            server_names_to_worktrees
-                                .entry(status.name.clone())
-                                .or_default()
-                                .insert((worktree, server_id));
-                        }
+            if let Some(project) = state
+                .workspace
+                .upgrade()
+                .map(|workspace| workspace.read(cx).project().clone())
+            {
+                for (server_id, status) in project.read(cx).language_server_statuses(cx) {
+                    if let Some(worktree) = status
+                        .worktree
+                        .and_then(|worktree_id| project.read(cx).worktree_for_id(worktree_id, cx))
+                    {
+                        server_ids_to_worktrees.insert(server_id, worktree.clone());
+                        server_names_to_worktrees
+                            .entry(status.name.clone())
+                            .or_default()
+                            .insert((worktree, server_id));
                     }
-                })
-                .ok();
+                }
+            }
 
             let mut servers_per_worktree = BTreeMap::<SharedString, Vec<ServerData>>::new();
             let mut servers_with_health_checks = HashSet::default();
@@ -1324,7 +1327,13 @@ impl Render for LspButton {
         let is_via_ssh = state
             .workspace
             .upgrade()
-            .map(|workspace| workspace.read(cx).project().read(cx).is_via_remote_server())
+            .map(|workspace| {
+                workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .is_via_remote_server()
+            })
             .unwrap_or(false);
 
         let mut has_errors = false;

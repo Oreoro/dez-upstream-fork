@@ -34,7 +34,6 @@
       "alt-shift-enter": "menu::Restart",
       "cmd-shift-w": "workspace::CloseWindow",
       "shift-escape": "workspace::ToggleZoom",
-      "cmd-o": "workspace::Open",
       "cmd-=": ["zed::IncreaseBufferFontSize", { "persist": false }],
       "cmd-+": ["zed::IncreaseBufferFontSize", { "persist": false }],
       "cmd--": ["zed::DecreaseBufferFontSize", { "persist": false }],
@@ -699,12 +698,6 @@
     "context": "Workspace",
     "use_key_equivalents": true,
     "bindings": {
-      // Change the default action on `menu::Confirm` by setting the parameter
-      // "alt-cmd-o": ["projects::OpenRecent", {"create_new_window": true }],
-      "alt-cmd-o": "projects::OpenRecent",
-      "ctrl-r": "projects::OpenRecent",
-      "ctrl-cmd-o": ["projects::OpenRemote", { "from_existing_connection": false }],
-      "ctrl-cmd-shift-o": ["projects::OpenRemote", { "from_existing_connection": true }],
       "cmd-ctrl-b": "branches::OpenRecent",
       "cmd-ctrl-w": "git::Worktree",
       "ctrl-~": "workspace::NewTerminal",
@@ -712,7 +705,6 @@
       "cmd-k s": "workspace::SaveWithoutFormat",
       "alt-shift-enter": "toast::RunAction",
       "cmd-shift-s": "workspace::SaveAs",
-      "cmd-shift-n": "workspace::NewWindow",
       "ctrl-`": "workspace::NewTerminal",
       "cmd-1": ["workspace::ActivatePane", 0],
       "cmd-2": ["workspace::ActivatePane", 1],
@@ -1244,9 +1236,7 @@
     "use_key_equivalents": true,
     "bindings": {
       "cmd-k": "recent_projects::ToggleActionsMenu",
-      "cmd-shift-a": "workspace::AddFolderToProject",
       "shift-backspace": "recent_projects::RemoveSelected",
-      "cmd-shift-enter": "recent_projects::AddToWorkspace",
     },
   },
   {
@@ -1483,11 +1473,6 @@
       "cmd-+": ["zed::IncreaseUiFontSize", { "persist": false }],
       "cmd--": ["zed::DecreaseUiFontSize", { "persist": false }],
       "cmd-0": ["zed::ResetUiFontSize", { "persist": false }],
-      "cmd-1": ["welcome::OpenRecentProject", 0],
-      "cmd-2": ["welcome::OpenRecentProject", 1],
-      "cmd-3": ["welcome::OpenRecentProject", 2],
-      "cmd-4": ["welcome::OpenRecentProject", 3],
-      "cmd-5": ["welcome::OpenRecentProject", 4],
     },
   },
   {

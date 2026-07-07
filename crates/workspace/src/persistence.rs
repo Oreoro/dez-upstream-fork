@@ -55,12 +55,20 @@ use model::{
     SerializedPaneGroup, SerializedWorkspace,
 };
 
-use self::model::{DockStructure, SerializedWorkspaceLocation, SessionWorkspace};
+use self::model::{AppSessionState, DockStructure, SerializedWorkspaceLocation, SessionWorkspace};
 
 // https://www.sqlite.org/limits.html
 // > <..> the maximum value of a host parameter number is SQLITE_MAX_VARIABLE_NUMBER,
 // > which defaults to <..> 32766 for SQLite versions after 3.32.0.
 const MAX_QUERY_PLACEHOLDERS: usize = 32000;
+const APP_SESSION_STATE_SCOPE: &str = "app_session_state";
+const APP_SESSION_STATE_KEY: &str = "default";
+
+pub enum AppSessionStateReadStatus {
+    Missing,
+    Loaded(AppSessionState),
+    Corrupt,
+}
 
 fn parse_timestamp(text: &str) -> DateTime<Utc> {
     NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
@@ -347,6 +355,7 @@ fn read_multi_workspace_state(window_id: WindowId, cx: &App) -> model::MultiWork
     read_multi_workspace_state_if_present(window_id, cx).unwrap_or_default()
 }
 
+#[cfg(test)]
 pub async fn write_multi_workspace_state(
     kvp: &KeyValueStore,
     window_id: WindowId,
@@ -360,53 +369,174 @@ pub async fn write_multi_workspace_state(
     }
 }
 
+pub fn read_app_session_state_if_present(cx: &App) -> Option<AppSessionState> {
+    match read_app_session_state_status(cx) {
+        AppSessionStateReadStatus::Loaded(state) => Some(state),
+        AppSessionStateReadStatus::Missing | AppSessionStateReadStatus::Corrupt => None,
+    }
+}
+
+pub fn read_app_session_state_status(cx: &App) -> AppSessionStateReadStatus {
+    let kvp = KeyValueStore::global(cx);
+    let Some(json) = kvp
+        .scoped(APP_SESSION_STATE_SCOPE)
+        .read(APP_SESSION_STATE_KEY)
+        .log_err()
+        .flatten()
+    else {
+        return AppSessionStateReadStatus::Missing;
+    };
+
+    match serde_json::from_str::<AppSessionState>(&json) {
+        Ok(state) => AppSessionStateReadStatus::Loaded(state.normalized()),
+        Err(error) => {
+            log::error!("failed to deserialize app session state: {error:#}");
+            AppSessionStateReadStatus::Corrupt
+        }
+    }
+}
+
+pub fn read_app_session_state(cx: &App) -> AppSessionState {
+    read_app_session_state_if_present(cx).unwrap_or_default()
+}
+
+pub async fn write_app_session_state(kvp: &KeyValueStore, state: AppSessionState) {
+    match serde_json::to_string(&state.normalized()) {
+        Ok(json) => {
+            kvp.scoped(APP_SESSION_STATE_SCOPE)
+                .write(APP_SESSION_STATE_KEY.to_string(), json)
+                .await
+                .log_err();
+        }
+        Err(error) => {
+            log::error!("failed to serialize app session state: {error:#}");
+        }
+    }
+}
+
 pub fn read_serialized_multi_workspaces(
     session_workspaces: Vec<model::SessionWorkspace>,
     cx: &App,
 ) -> Vec<model::SerializedMultiWorkspace> {
-    let mut window_groups: Vec<Vec<model::SessionWorkspace>> = Vec::new();
-    let mut window_id_to_group: HashMap<WindowId, usize> = HashMap::default();
+    let mut session_workspaces = session_workspaces
+        .into_iter()
+        .filter(|workspace| {
+            matches!(
+                workspace.location,
+                model::SerializedWorkspaceLocation::Local
+            )
+        })
+        .collect::<Vec<_>>();
 
-    for session_workspace in session_workspaces {
-        match session_workspace.window_id {
-            Some(window_id) => {
-                let group_index = *window_id_to_group.entry(window_id).or_insert_with(|| {
-                    window_groups.push(Vec::new());
-                    window_groups.len() - 1
-                });
-                window_groups[group_index].push(session_workspace);
-            }
-            None => {
-                window_groups.push(vec![session_workspace]);
+    let state = session_workspaces
+        .iter()
+        .find_map(|workspace| workspace.window_id)
+        .map(|window_id| read_multi_workspace_state(window_id, cx))
+        .unwrap_or_default();
+
+    if !state.workspace_ids.is_empty() {
+        let mut ordered_workspaces = Vec::new();
+        let mut ordered_workspace_ids = HashSet::default();
+        for workspace_id in &state.workspace_ids {
+            if let Some(workspace) = session_workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == *workspace_id)
+                && ordered_workspace_ids.insert(*workspace_id)
+            {
+                ordered_workspaces.push(workspace.clone());
             }
         }
+
+        for workspace in session_workspaces {
+            if ordered_workspace_ids.insert(workspace.workspace_id) {
+                ordered_workspaces.push(workspace);
+            }
+        }
+
+        session_workspaces = ordered_workspaces;
     }
 
-    window_groups
-        .into_iter()
-        .filter_map(|group| {
-            let window_id = group.first().and_then(|sw| sw.window_id);
-            let state = window_id
-                .map(|wid| read_multi_workspace_state(wid, cx))
-                .unwrap_or_default();
-            let active_workspace = state
-                .active_workspace_id
-                .and_then(|id| group.iter().position(|ws| ws.workspace_id == id))
-                // If the persisted active workspace can't be matched (e.g. its
-                // pointer was lost or its row was pruned), fall back to the
-                // first workspace that actually has paths rather than blindly
-                // taking index 0, so a stray scratch/empty workspace isn't
-                // restored as the focused window. Only if none have paths do we
-                // fall back to the first entry.
-                .or_else(|| group.iter().position(|ws| !ws.paths.is_empty()))
-                .or(Some(0))
-                .and_then(|index| group.into_iter().nth(index))?;
-            Some(model::SerializedMultiWorkspace {
-                active_workspace,
-                state,
-            })
+    let Some(active_workspace) = state
+        .active_workspace_id
+        .and_then(|id| {
+            session_workspaces
+                .iter()
+                .position(|workspace| workspace.workspace_id == id)
         })
-        .collect()
+        .or(Some(0))
+        .and_then(|index| session_workspaces.get(index).cloned())
+    else {
+        return Vec::new();
+    };
+
+    vec![model::SerializedMultiWorkspace {
+        active_workspace,
+        workspaces: session_workspaces,
+        state,
+    }]
+}
+
+pub fn read_serialized_app_session_workspaces(
+    app_session_state: AppSessionState,
+    session_workspaces: Vec<model::SessionWorkspace>,
+) -> Vec<model::SerializedMultiWorkspace> {
+    let mut state = app_session_state.normalized();
+    let mut session_workspaces = session_workspaces
+        .into_iter()
+        .filter(|workspace| {
+            matches!(
+                workspace.location,
+                model::SerializedWorkspaceLocation::Local
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if !state.workspace_ids.is_empty() {
+        let mut ordered_workspaces = Vec::new();
+        let mut ordered_workspace_ids = HashSet::default();
+        for workspace_id in &state.workspace_ids {
+            if let Some(workspace) = session_workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == *workspace_id)
+                && ordered_workspace_ids.insert(*workspace_id)
+            {
+                ordered_workspaces.push(workspace.clone());
+            }
+        }
+        for workspace in session_workspaces {
+            if ordered_workspace_ids.insert(workspace.workspace_id) {
+                state.workspace_ids.push(workspace.workspace_id);
+                ordered_workspaces.push(workspace);
+            }
+        }
+        session_workspaces = ordered_workspaces;
+    } else {
+        state.workspace_ids = session_workspaces
+            .iter()
+            .map(|workspace| workspace.workspace_id)
+            .collect();
+    }
+
+    state.normalize();
+
+    let Some(active_workspace) = state
+        .active_workspace_id
+        .and_then(|id| {
+            session_workspaces
+                .iter()
+                .position(|workspace| workspace.workspace_id == id)
+        })
+        .or(Some(0))
+        .and_then(|index| session_workspaces.get(index).cloned())
+    else {
+        return Vec::new();
+    };
+
+    vec![model::SerializedMultiWorkspace {
+        active_workspace,
+        workspaces: session_workspaces,
+        state: state.into(),
+    }]
 }
 
 const DEFAULT_DOCK_STATE_KEY: &str = "default_dock_state";
@@ -1192,6 +1322,7 @@ impl WorkspaceDb {
                 WHERE
                     paths IS ? AND
                     remote_connection_id IS ?
+                ORDER BY timestamp DESC, workspace_id DESC
                 LIMIT 1
             })
             .and_then(|mut prepared_statement| {
@@ -1599,25 +1730,6 @@ impl WorkspaceDb {
                     }
                 }
 
-                // Clear out old workspaces with the same paths.
-                // Skip this for empty workspaces - they are identified by workspace_id, not paths.
-                // Multiple empty workspaces with different content should coexist.
-                if !paths.paths.is_empty() {
-                    conn.exec_bound(sql!(
-                        DELETE
-                        FROM workspaces
-                        WHERE
-                            workspace_id != ?1 AND
-                            paths IS ?2 AND
-                            remote_connection_id IS ?3
-                    ))?((
-                        workspace.id,
-                        paths.paths.clone(),
-                        remote_connection_id,
-                    ))
-                    .context("clearing out old locations")?;
-                }
-
                 // Upsert
                 let query = sql!(
                     INSERT INTO workspaces(
@@ -1927,6 +2039,42 @@ impl WorkspaceDb {
         }
     }
 
+    pub async fn app_session_workspace_locations(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<(Vec<SessionWorkspace>, Vec<WorkspaceId>)> {
+        let mut workspaces = Vec::new();
+        let mut unresolved_workspace_ids = Vec::new();
+
+        for workspace_id in workspace_ids {
+            let Some(workspace) = self.workspace_for_id(*workspace_id) else {
+                unresolved_workspace_ids.push(*workspace_id);
+                continue;
+            };
+
+            match workspace.location {
+                SerializedWorkspaceLocation::Local => {
+                    workspaces.push(SessionWorkspace {
+                        workspace_id: *workspace_id,
+                        location: SerializedWorkspaceLocation::Local,
+                        paths: workspace.paths,
+                        window_id: workspace.window_id.map(WindowId::from),
+                    });
+                }
+                SerializedWorkspaceLocation::Remote(connection) => {
+                    log::warn!(
+                        "preserving remote workspace {:?} as unresolved; remote workspace restore is disabled for {:?}",
+                        workspace_id,
+                        connection
+                    );
+                    unresolved_workspace_ids.push(*workspace_id);
+                }
+            }
+        }
+
+        Ok((workspaces, unresolved_workspace_ids))
+    }
+
     query! {
         pub fn breakpoints_for_file(workspace_id: WorkspaceId, file_path: &Path) -> Result<Vec<Breakpoint>> {
             SELECT breakpoint_location
@@ -2165,12 +2313,33 @@ impl WorkspaceDb {
         current_session_id: &str,
         last_session_id: Option<&str>,
     ) -> Result<()> {
+        self.garbage_collect_workspaces_protecting(
+            fs,
+            current_session_id,
+            last_session_id,
+            std::iter::empty::<WorkspaceId>(),
+        )
+        .await
+    }
+
+    pub async fn garbage_collect_workspaces_protecting(
+        &self,
+        fs: &dyn Fs,
+        current_session_id: &str,
+        last_session_id: Option<&str>,
+        protected_workspace_ids: impl IntoIterator<Item = WorkspaceId>,
+    ) -> Result<()> {
+        let protected_workspace_ids = protected_workspace_ids.into_iter().collect::<HashSet<_>>();
         let remote_connections = self.remote_connections()?;
         let now = Utc::now();
         let mut workspaces_to_delete = Vec::new();
         for (id, paths, _identity_paths_hint, remote_connection_id, session_id, timestamp) in
             self.recent_workspaces()?
         {
+            if protected_workspace_ids.contains(&id) {
+                continue;
+            }
+
             if let Some(session_id) = session_id.as_deref() {
                 if session_id == current_session_id || Some(session_id) == last_session_id {
                     continue;
@@ -2836,10 +3005,10 @@ mod tests {
         multi_workspace::MultiWorkspace,
         persistence::{
             model::{
-                SerializedItem, SerializedPane, SerializedPaneGroup, SerializedWorkspace,
-                SessionWorkspace,
+                AppSessionState, SerializedItem, SerializedPane, SerializedPaneGroup,
+                SerializedWorkspace, SessionWorkspace,
             },
-            read_multi_workspace_state,
+            read_app_session_state,
         },
     };
     use gpui::TaskExt;
@@ -2878,9 +3047,6 @@ mod tests {
             mw.set_random_database_id(cx);
         });
 
-        let window_id =
-            multi_workspace.update_in(cx, |_, window, _cx| window.window_handle().window_id());
-
         // --- Add a second workspace ---
         let workspace2 = multi_workspace.update_in(cx, |mw, window, cx| {
             let workspace = cx.new(|cx| crate::Workspace::test_new(project2.clone(), window, cx));
@@ -2893,7 +3059,7 @@ mod tests {
         cx.run_until_parked();
 
         // Read back the persisted state and check that the active workspace ID was written.
-        let state_after_add = cx.update(|_, cx| read_multi_workspace_state(window_id, cx));
+        let state_after_add = cx.update(|_, cx| read_app_session_state(cx));
         let active_workspace2_db_id = workspace2.read_with(cx, |ws, _| ws.database_id());
         assert_eq!(
             state_after_add.active_workspace_id, active_workspace2_db_id,
@@ -2914,13 +3080,104 @@ mod tests {
 
         cx.run_until_parked();
 
-        let state_after_remove = cx.update(|_, cx| read_multi_workspace_state(window_id, cx));
+        let state_after_remove = cx.update(|_, cx| read_app_session_state(cx));
         let remaining_db_id =
             multi_workspace.read_with(cx, |mw, cx| mw.workspace().read(cx).database_id());
         assert_eq!(
             state_after_remove.active_workspace_id, remaining_db_id,
             "After removing a workspace, the serialized active_workspace_id should match \
              the remaining active workspace's database id"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_app_session_state_round_trips(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        let state = AppSessionState {
+            active_workspace_id: Some(WorkspaceId(2)),
+            workspace_ids: vec![WorkspaceId(1), WorkspaceId(2), WorkspaceId(1)],
+            unresolved_workspace_ids: vec![WorkspaceId(3), WorkspaceId(3)],
+            sidebar_open: true,
+            sidebar_state: Some("{\"width\":240}".to_string()),
+        };
+
+        write_app_session_state(&kvp, state).await;
+
+        let restored = cx.update(|_, cx| read_app_session_state(cx));
+        assert_eq!(restored.active_workspace_id, Some(WorkspaceId(2)));
+        assert_eq!(restored.workspace_ids, vec![WorkspaceId(1), WorkspaceId(2)]);
+        assert_eq!(restored.unresolved_workspace_ids, vec![WorkspaceId(3)]);
+        assert!(restored.sidebar_open);
+        assert_eq!(restored.sidebar_state, Some("{\"width\":240}".to_string()));
+    }
+
+    #[gpui::test]
+    async fn test_app_session_state_preserves_active_unresolved_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        write_app_session_state(
+            &kvp,
+            AppSessionState {
+                active_workspace_id: Some(WorkspaceId(9)),
+                workspace_ids: vec![],
+                unresolved_workspace_ids: vec![WorkspaceId(9)],
+                sidebar_open: false,
+                sidebar_state: None,
+            },
+        )
+        .await;
+
+        let restored = cx.update(|_, cx| read_app_session_state(cx));
+        assert_eq!(restored.active_workspace_id, Some(WorkspaceId(9)));
+        assert!(restored.workspace_ids.is_empty());
+        assert_eq!(restored.unresolved_workspace_ids, vec![WorkspaceId(9)]);
+    }
+
+    #[gpui::test]
+    async fn test_read_serialized_app_session_workspaces_preserves_order_and_unresolved(
+        _cx: &mut gpui::TestAppContext,
+    ) {
+        let state = AppSessionState {
+            active_workspace_id: Some(WorkspaceId(3)),
+            workspace_ids: vec![WorkspaceId(3), WorkspaceId(1)],
+            unresolved_workspace_ids: vec![WorkspaceId(9)],
+            sidebar_open: true,
+            sidebar_state: None,
+        };
+        let session_workspaces = vec![
+            SessionWorkspace {
+                workspace_id: WorkspaceId(1),
+                location: SerializedWorkspaceLocation::Local,
+                paths: PathList::new(&["/one"]),
+                window_id: None,
+            },
+            SessionWorkspace {
+                workspace_id: WorkspaceId(3),
+                location: SerializedWorkspaceLocation::Local,
+                paths: PathList::new(&["/three"]),
+                window_id: None,
+            },
+        ];
+
+        let serialized = read_serialized_app_session_workspaces(state, session_workspaces);
+        assert_eq!(serialized.len(), 1);
+        assert_eq!(serialized[0].active_workspace.workspace_id, WorkspaceId(3));
+        assert_eq!(
+            serialized[0]
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.workspace_id)
+                .collect::<Vec<_>>(),
+            vec![WorkspaceId(3), WorkspaceId(1)]
+        );
+        assert_eq!(
+            serialized[0].state.unresolved_workspace_ids,
+            vec![WorkspaceId(9)]
         );
     }
 
@@ -3901,6 +4158,42 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_app_session_workspace_locations_preserves_order_and_empty_workspaces(
+        _cx: &mut gpui::TestAppContext,
+    ) {
+        let db = WorkspaceDb::open_test_db(
+            "test_app_session_workspace_locations_preserves_order_and_empty_workspaces",
+        )
+        .await;
+
+        db.save_workspace(workspace_with(1, &[], empty_pane_group(), None))
+            .await;
+        db.save_workspace(workspace_with(
+            2,
+            &[Path::new("/missing/path")],
+            empty_pane_group(),
+            None,
+        ))
+        .await;
+
+        let (locations, unresolved) = db
+            .app_session_workspace_locations(&[WorkspaceId(2), WorkspaceId(99), WorkspaceId(1)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            locations
+                .iter()
+                .map(|workspace| workspace.workspace_id)
+                .collect::<Vec<_>>(),
+            vec![WorkspaceId(2), WorkspaceId(1)]
+        );
+        assert_eq!(locations[0].paths, PathList::new(&["/missing/path"]));
+        assert!(locations[1].paths.is_empty());
+        assert_eq!(unresolved, vec![WorkspaceId(99)]);
+    }
+
+    #[gpui::test]
     async fn test_scratch_only_workspace_restores_from_last_session(cx: &mut gpui::TestAppContext) {
         let fs = fs::FakeFs::new(cx.executor());
         let db =
@@ -4652,6 +4945,8 @@ mod tests {
             window_10,
             MultiWorkspaceState {
                 active_workspace_id: Some(WorkspaceId(2)),
+                workspace_ids: vec![],
+                unresolved_workspace_ids: vec![],
                 project_groups: vec![],
                 sidebar_open: true,
                 sidebar_state: None,
@@ -4664,6 +4959,8 @@ mod tests {
             window_20,
             MultiWorkspaceState {
                 active_workspace_id: Some(WorkspaceId(3)),
+                workspace_ids: vec![],
+                unresolved_workspace_ids: vec![],
                 project_groups: vec![],
                 sidebar_open: false,
                 sidebar_state: None,
@@ -4701,26 +4998,95 @@ mod tests {
 
         let results = cx.update(|cx| read_serialized_multi_workspaces(session_workspaces, cx));
 
-        // Should produce 3 results: window 10, window 20, and the orphan.
-        assert_eq!(results.len(), 3);
+        assert_eq!(results.len(), 1);
 
-        // Window 10: active_workspace_id = 2 picks workspace 2 (paths /b), sidebar open.
-        let group_10 = &results[0];
-        assert_eq!(group_10.active_workspace.workspace_id, WorkspaceId(2));
-        assert_eq!(group_10.state.active_workspace_id, Some(WorkspaceId(2)));
-        assert_eq!(group_10.state.sidebar_open, true);
+        let group = &results[0];
+        assert_eq!(group.active_workspace.workspace_id, WorkspaceId(2));
+        assert_eq!(group.state.active_workspace_id, Some(WorkspaceId(2)));
+        assert_eq!(group.state.sidebar_open, true);
+        assert_eq!(
+            group
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.workspace_id)
+                .collect::<Vec<_>>(),
+            vec![
+                WorkspaceId(1),
+                WorkspaceId(2),
+                WorkspaceId(3),
+                WorkspaceId(4)
+            ]
+        );
+    }
 
-        // Window 20: active_workspace_id = 3 picks workspace 3 (paths /c), sidebar closed.
-        let group_20 = &results[1];
-        assert_eq!(group_20.active_workspace.workspace_id, WorkspaceId(3));
-        assert_eq!(group_20.state.active_workspace_id, Some(WorkspaceId(3)));
-        assert_eq!(group_20.state.sidebar_open, false);
+    #[gpui::test]
+    async fn test_read_serialized_multi_workspaces_uses_persisted_workspace_order(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::persistence::model::MultiWorkspaceState;
 
-        // Orphan: no active_workspace_id, falls back to first workspace (id 4).
-        let group_none = &results[2];
-        assert_eq!(group_none.active_workspace.workspace_id, WorkspaceId(4));
-        assert_eq!(group_none.state.active_workspace_id, None);
-        assert_eq!(group_none.state.sidebar_open, false);
+        let window_id = WindowId::from(10u64);
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+
+        write_multi_workspace_state(
+            &kvp,
+            window_id,
+            MultiWorkspaceState {
+                active_workspace_id: Some(WorkspaceId(3)),
+                workspace_ids: vec![WorkspaceId(3), WorkspaceId(1)],
+                unresolved_workspace_ids: vec![],
+                project_groups: vec![],
+                sidebar_open: true,
+                sidebar_state: None,
+            },
+        )
+        .await;
+
+        let session_workspaces = vec![
+            SessionWorkspace {
+                workspace_id: WorkspaceId(1),
+                location: SerializedWorkspaceLocation::Local,
+                paths: PathList::new(&["/a"]),
+                window_id: Some(window_id),
+            },
+            SessionWorkspace {
+                workspace_id: WorkspaceId(2),
+                location: SerializedWorkspaceLocation::Local,
+                paths: PathList::new(&["/b"]),
+                window_id: Some(window_id),
+            },
+            SessionWorkspace {
+                workspace_id: WorkspaceId(3),
+                location: SerializedWorkspaceLocation::Local,
+                paths: PathList::new(&["/c"]),
+                window_id: Some(window_id),
+            },
+            SessionWorkspace {
+                workspace_id: WorkspaceId(4),
+                location: SerializedWorkspaceLocation::Local,
+                paths: PathList::new(&["/d"]),
+                window_id: Some(window_id),
+            },
+        ];
+
+        let results = cx.update(|cx| read_serialized_multi_workspaces(session_workspaces, cx));
+
+        assert_eq!(results.len(), 1);
+        let group = &results[0];
+        assert_eq!(group.active_workspace.workspace_id, WorkspaceId(3));
+        assert_eq!(
+            group
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.workspace_id)
+                .collect::<Vec<_>>(),
+            vec![
+                WorkspaceId(3),
+                WorkspaceId(1),
+                WorkspaceId(2),
+                WorkspaceId(4)
+            ]
+        );
     }
 
     #[gpui::test]
@@ -4778,9 +5144,6 @@ mod tests {
             mw.set_random_database_id(cx);
         });
 
-        let window_id =
-            multi_workspace.update_in(cx, |_, window, _cx| window.window_handle().window_id());
-
         // Create a new workspace via the MultiWorkspace API (triggers next_id()).
         multi_workspace.update_in(cx, |mw, window, cx| {
             mw.create_test_workspace(window, cx).detach();
@@ -4797,8 +5160,8 @@ mod tests {
             "New workspace should have a database_id after run_until_parked"
         );
 
-        // The multi-workspace state should record it as the active workspace.
-        let state = cx.update(|_, cx| read_multi_workspace_state(window_id, cx));
+        // The app-session state should record it as the active workspace.
+        let state = cx.update(|_, cx| read_app_session_state(cx));
         assert_eq!(
             state.active_workspace_id, new_workspace_db_id,
             "Serialized active_workspace_id should match the new workspace's database_id"

@@ -1668,7 +1668,10 @@ async fn test_following_across_workspaces(cx_a: &mut TestAppContext, cx_b: &mut 
     executor.run_until_parked();
 
     workspace_a_project_b.update(cx_a2, |workspace, cx| {
-        assert_eq!(workspace.project().read(cx).remote_id(), Some(project_b_id));
+        assert_eq!(
+            workspace.project().read(cx).remote_id(),
+            Some(project_b_id)
+        );
         assert!(workspace.is_being_followed(client_b.peer_id().unwrap()));
         assert_eq!(
             client_b.peer_id().map(Into::into),

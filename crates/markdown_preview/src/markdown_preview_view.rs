@@ -1083,6 +1083,8 @@ impl EventEmitter<SearchEvent> for MarkdownPreviewView {}
 impl Item for MarkdownPreviewView {
     type Event = MarkdownPreviewEvent;
 
+    const CONTRIBUTES_PATH_EVIDENCE: bool = true;
+
     fn act_as_type<'a>(
         &'a self,
         type_id: TypeId,
@@ -1206,6 +1208,12 @@ impl Item for MarkdownPreviewView {
 
     fn buffer_kind(&self, _cx: &App) -> ItemBufferKind {
         ItemBufferKind::Singleton
+    }
+
+    fn workspace_directory(&self, cx: &App) -> Option<PathBuf> {
+        self.active_editor
+            .as_ref()
+            .and_then(|editor_state| editor_state.editor.read(cx).workspace_directory(cx))
     }
 
     fn as_searchable(

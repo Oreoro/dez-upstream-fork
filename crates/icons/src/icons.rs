@@ -143,6 +143,7 @@ pub enum IconName {
     FoldVertical,
     Folder,
     FolderAdd,
+    FolderGit,
     FolderInclude,
     FolderOpen,
     FolderSearch,

@@ -1884,6 +1884,7 @@ pub fn command_interceptor(
         return Task::ready(CommandInterceptResult {
             results: commands,
             exclusive: false,
+            ..Default::default()
         });
     } else if query.starts_with('s') {
         let mut substitute = "substitute".chars().peekable();
@@ -1935,6 +1936,7 @@ pub fn command_interceptor(
                 positions,
             }],
             exclusive: false,
+            ..Default::default()
         });
     }
 
@@ -2028,12 +2030,14 @@ pub fn command_interceptor(
             CommandInterceptResult {
                 results,
                 exclusive: true,
+                ..Default::default()
             }
         })
     } else {
         Task::ready(CommandInterceptResult {
             results,
             exclusive: false,
+            ..Default::default()
         })
     }
 }

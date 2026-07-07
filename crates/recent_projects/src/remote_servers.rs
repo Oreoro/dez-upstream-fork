@@ -486,21 +486,8 @@ impl ProjectPicker {
                     })
                     .log_err();
 
-                    let window = if create_new_window {
-                        let options = cx
-                            .update(|_, cx| (app_state.build_window_options)(None, cx))
-                            .log_err()?;
-                        cx.open_window(options, |window, cx| {
-                            let workspace = cx.new(|cx| {
-                                telemetry::event!("SSH Project Created");
-                                Workspace::new(None, project.clone(), app_state.clone(), window, cx)
-                            });
-                            cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
-                        })
-                        .log_err()
-                    } else {
-                        cx.window_handle().downcast::<MultiWorkspace>()
-                    }?;
+                    let _ = create_new_window;
+                    let window = cx.window_handle().downcast::<MultiWorkspace>()?;
 
                     let items = open_remote_project_with_existing_connection(
                         connection, project, paths, app_state, window, None, None, cx,
@@ -1358,13 +1345,6 @@ impl PickerDelegate for RemoteServerPickerDelegate {
         let buttons = if is_project_selected {
             h_flex()
                 .gap_1()
-                .child(
-                    Button::new("open_new_window", "New Window")
-                        .key_binding(KeyBinding::for_action(&menu::SecondaryConfirm, cx))
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
-                        }),
-                )
                 .child(confirm_button("Open".into()))
                 .into_any_element()
         } else {
@@ -1975,9 +1955,7 @@ impl RemoteServerProjects {
         });
     }
 
-    /// Opens a saved remote project, mirroring whether a new window should be
-    /// created based on the modal's `create_new_window` preference and whether
-    /// the confirm was a secondary (platform-modifier) confirm.
+    /// Opens a saved remote project in the current workspace window.
     fn open_remote_project_entry(
         &mut self,
         _index: ServerIndex,
@@ -1994,13 +1972,11 @@ impl RemoteServerProjects {
         else {
             return;
         };
-        let create_new_window = self.create_new_window;
+        let _create_new_window = self.create_new_window;
         cx.emit(DismissEvent);
 
-        let replace_window = match (create_new_window, secondary_confirm) {
-            (true, false) | (false, true) => None,
-            (true, true) | (false, false) => window.window_handle().downcast::<MultiWorkspace>(),
-        };
+        let _ = secondary_confirm;
+        let replace_window = window.window_handle().downcast::<MultiWorkspace>();
 
         cx.spawn_in(window, async move |_, cx| {
             let result = open_remote_project(

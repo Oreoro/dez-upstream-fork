@@ -1570,13 +1570,27 @@ fn subscribe_for_terminal_events(
         terminal,
         window,
         move |terminal_view, terminal, event, window, cx| {
-            let current_cwd = terminal.read(cx).working_directory();
-            if current_cwd != previous_cwd {
-                previous_cwd = current_cwd;
-                terminal_view.needs_serialize = true;
-            }
-
             match event {
+                Event::WorkingDirectoryChanged => {
+                    let current_cwd = terminal.read(cx).working_directory();
+                    if current_cwd != previous_cwd {
+                        previous_cwd = current_cwd.clone();
+                        terminal_view.needs_serialize = true;
+                        cx.emit(ItemEvent::UpdateBreadcrumbs);
+                        if let Some(workspace) = workspace.upgrade() {
+                            let active_path = current_cwd
+                                .clone()
+                                .filter(|_| terminal_view.focus_handle.is_focused(window));
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.path_evidence_changed_with_active_path(
+                                    active_path,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                    }
+                }
                 Event::Wakeup => {
                     cx.notify();
                     cx.emit(Event::Wakeup);
@@ -1742,6 +1756,13 @@ impl TerminalView {
             terminal.set_cursor_shape(self.cursor_shape);
             terminal.focus_in();
         });
+        if let Some(working_directory) = self.terminal.read(cx).working_directory()
+            && let Some(workspace) = self.workspace.upgrade()
+        {
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_active_context_from_path(working_directory, cx);
+            });
+        }
 
         let should_blink = match TerminalSettings::get_global(cx).blinking {
             TerminalBlink::Off => false,
@@ -1877,6 +1898,8 @@ impl Render for TerminalView {
 
 impl Item for TerminalView {
     type Event = ItemEvent;
+
+    const CONTRIBUTES_PATH_EVIDENCE: bool = true;
 
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
@@ -2092,6 +2115,10 @@ impl Item for TerminalView {
         workspace::item::ItemBufferKind::Singleton
     }
 
+    fn workspace_directory(&self, cx: &App) -> Option<PathBuf> {
+        self.terminal.read(cx).working_directory()
+    }
+
     fn can_split(&self) -> bool {
         true
     }
@@ -2102,10 +2129,8 @@ impl Item for TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>> {
+        let cwd = self.terminal.read(cx).working_directory();
         let Ok(terminal) = self.project.update(cx, |project, cx| {
-            let cwd = project
-                .active_project_directory(cx)
-                .map(|it| it.to_path_buf());
             project.clone_terminal(self.terminal(), cx, cwd)
         }) else {
             return Task::ready(None);
@@ -2475,8 +2500,6 @@ pub fn default_working_directory(workspace: &Workspace, cx: &App) -> Option<Path
     let is_remote = workspace.project().read(cx).is_remote();
     let directory = match &TerminalSettings::get_global(cx).working_directory {
         WorkingDirectory::CurrentFileDirectory => workspace
-            .project()
-            .read(cx)
             .active_entry_directory(cx)
             .or_else(|| current_project_directory(workspace, cx)),
         WorkingDirectory::CurrentProjectDirectory => current_project_directory(workspace, cx),
@@ -2498,8 +2521,6 @@ pub fn default_working_directory(workspace: &Workspace, cx: &App) -> Option<Path
 
 fn current_project_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
     workspace
-        .project()
-        .read(cx)
         .active_project_directory(cx)
         .as_deref()
         .map(Path::to_path_buf)

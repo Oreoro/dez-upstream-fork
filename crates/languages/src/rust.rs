@@ -8,7 +8,7 @@ use http_client::github::AssetKind;
 use http_client::github::{GitHubLspBinaryVersion, latest_github_release};
 use http_client::github_download::{GithubBinaryMetadata, download_server_binary};
 pub use language::*;
-use lsp::{InitializeParams, LanguageServerBinary, LanguageServerBinaryOptions};
+use lsp::{InitializeParams, LanguageServer, LanguageServerBinary, LanguageServerBinaryOptions};
 use project::lsp_store::lsp_ext_command;
 use project::lsp_store::rust_analyzer_ext::CARGO_DIAGNOSTICS_SOURCE_NAME;
 use project::project_settings::ProjectSettings;
@@ -314,6 +314,12 @@ impl LspAdapter for RustLspAdapter {
 
     fn disk_based_diagnostics_progress_token(&self) -> Option<String> {
         Some("rust-analyzer/flycheck".into())
+    }
+
+    fn cancel_disk_based_diagnostics(&self, server: &LanguageServer) -> Result<()> {
+        server.notify::<lsp_ext_command::LspExtCancelFlycheck>(())?;
+        server.notify::<lsp_ext_command::LspExtClearFlycheck>(())?;
+        Ok(())
     }
 
     fn process_diagnostics(&self, params: &mut lsp::PublishDiagnosticsParams, _: LanguageServerId) {

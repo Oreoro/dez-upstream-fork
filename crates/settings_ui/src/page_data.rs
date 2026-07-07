@@ -307,7 +307,7 @@ fn general_page(cx: &App) -> SettingsPage {
         ]
     }
 
-    fn workspace_restoration_section() -> [SettingsPageItem; 3] {
+    fn workspace_restoration_section() -> [SettingsPageItem; 2] {
         [
             SettingsPageItem::SectionHeader("Workspace Restoration"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -327,20 +327,6 @@ fn general_page(cx: &App) -> SettingsPage {
                             .session
                             .get_or_insert_default()
                             .restore_unsaved_buffers = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
-            SettingsPageItem::SettingItem(SettingItem {
-                title: "Restore On Startup",
-                description: "What to restore from the previous session when opening Zed.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("restore_on_startup"),
-                    pick: |settings_content| settings_content.workspace.restore_on_startup.as_ref(),
-                    write: |settings_content, value, _| {
-                        settings_content.workspace.restore_on_startup = value;
                     },
                 }),
                 metadata: None,
@@ -4010,7 +3996,7 @@ fn window_and_layout_page() -> SettingsPage {
         ]
     }
 
-    fn sidebar_chrome_section() -> [SettingsPageItem; 11] {
+    fn sidebar_chrome_section() -> [SettingsPageItem; 8] {
         [
             SettingsPageItem::SectionHeader("Sidebar"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -4031,75 +4017,6 @@ fn window_and_layout_page() -> SettingsPage {
                             .sidebar
                             .get_or_insert_default()
                             .show_project_pane_button = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
-            SettingsPageItem::SettingItem(SettingItem {
-                title: "Show Branch Status Icon",
-                description: "Show git status indicators on the branch icon in the sidebar.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("sidebar.show_branch_status_icon"),
-                    pick: |settings_content| {
-                        settings_content
-                            .sidebar
-                            .as_ref()?
-                            .show_branch_status_icon
-                            .as_ref()
-                    },
-                    write: |settings_content, value, _| {
-                        settings_content
-                            .sidebar
-                            .get_or_insert_default()
-                            .show_branch_status_icon = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
-            SettingsPageItem::SettingItem(SettingItem {
-                title: "Show Branch Name",
-                description: "Show the branch name button in the sidebar.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("sidebar.show_branch_name"),
-                    pick: |settings_content| {
-                        settings_content
-                            .sidebar
-                            .as_ref()?
-                            .show_branch_name
-                            .as_ref()
-                    },
-                    write: |settings_content, value, _| {
-                        settings_content
-                            .sidebar
-                            .get_or_insert_default()
-                            .show_branch_name = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
-            SettingsPageItem::SettingItem(SettingItem {
-                title: "Show Project Items",
-                description: "Show the project host and name in the sidebar.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("sidebar.show_project_items"),
-                    pick: |settings_content| {
-                        settings_content
-                            .sidebar
-                            .as_ref()?
-                            .show_project_items
-                            .as_ref()
-                    },
-                    write: |settings_content, value, _| {
-                        settings_content
-                            .sidebar
-                            .get_or_insert_default()
-                            .show_project_items = value;
                     },
                 }),
                 metadata: None,

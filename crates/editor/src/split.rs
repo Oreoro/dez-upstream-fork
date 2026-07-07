@@ -1840,6 +1840,8 @@ impl SplittableEditor {
 impl Item for SplittableEditor {
     type Event = EditorEvent;
 
+    const CONTRIBUTES_PATH_EVIDENCE: bool = true;
+
     fn tab_content_text(&self, detail: usize, cx: &App) -> ui::SharedString {
         self.rhs_editor.read(cx).tab_content_text(detail, cx)
     }
@@ -1874,6 +1876,10 @@ impl Item for SplittableEditor {
 
     fn active_project_path(&self, cx: &App) -> Option<project::ProjectPath> {
         self.rhs_editor.read(cx).active_project_path(cx)
+    }
+
+    fn workspace_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
+        self.rhs_editor.read(cx).workspace_directory(cx)
     }
 
     fn is_dirty(&self, cx: &App) -> bool {

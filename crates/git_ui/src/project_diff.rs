@@ -2,6 +2,7 @@ use crate::{
     branch_picker, conflict_view,
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
+    repository_selector::repository_selector_menu_default,
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
@@ -180,7 +181,9 @@ impl ProjectDiff {
             }
         });
         let workspace_handle = workspace.weak_handle();
+        let project_for_picker = project.clone();
         let on_select = Arc::new({
+            let project = project.clone();
             let repository = repository.clone();
             let workspace = workspace_handle.clone();
             move |branch: git::repository::Branch, window: &mut Window, cx: &mut App| {
@@ -203,6 +206,7 @@ impl ProjectDiff {
         workspace.toggle_modal(window, cx, |window, cx| {
             branch_picker::select_modal(
                 workspace_handle,
+                Some(project_for_picker),
                 Some(repository),
                 selected_branch,
                 on_select,
@@ -432,7 +436,7 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
-        let Some(repo) = project.read(cx).git_store().read(cx).active_repository() else {
+        let Some(repo) = project.read(cx).active_repository(cx) else {
             return Task::ready(Err(anyhow!("No active repository")));
         };
         let main_branch = repo.update(cx, |repo, _| repo.default_branch(true));
@@ -1736,8 +1740,11 @@ impl Render for ProjectDiffToolbar {
             return div();
         };
         let focus_handle = project_diff.focus_handle(cx);
+        let project = project_diff.read(cx).project.clone();
         let button_states = project_diff.read(cx).button_states(cx);
         let review_count = project_diff.read(cx).total_review_comment_count();
+        let repository_selector =
+            repository_selector_menu_default("project-diff-repository-selector", &project, cx);
 
         h_group_xl()
             .my_neg_1()
@@ -1889,6 +1896,9 @@ impl Render for ProjectDiffToolbar {
                     ),
                 )
             })
+            .when_some(repository_selector, |el, repository_selector| {
+                el.child(vertical_divider()).child(repository_selector)
+            })
     }
 }
 
@@ -1976,9 +1986,12 @@ impl Render for BranchDiffToolbar {
         };
         let selected_base_ref = base_ref.clone();
         let base_ref_label = format!("Base: {base_ref}");
+        let project = project_diff.read(cx).project.clone();
         let repository = project_diff.read(cx).branch_diff.read(cx).repo().cloned();
         let workspace = project_diff.read(cx).workspace.clone();
         let project_diff_for_picker = project_diff.downgrade();
+        let repository_selector =
+            repository_selector_menu_default("branch-diff-repository-selector", &project, cx);
 
         let is_multibuffer_empty = project_diff.read(cx).multibuffer.read(cx).is_empty();
         let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
@@ -2072,6 +2085,9 @@ impl Render for BranchDiffToolbar {
                         }),
                     ),
                 )
+            })
+            .when_some(repository_selector, |this, repository_selector| {
+                this.child(vertical_divider()).child(repository_selector)
             })
     }
 }

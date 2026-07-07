@@ -625,6 +625,8 @@ fn deserialize_anchor(anchor: proto::EditorAnchor, buffer: &MultiBufferSnapshot)
 impl Item for Editor {
     type Event = EditorEvent;
 
+    const CONTRIBUTES_PATH_EVIDENCE: bool = true;
+
     fn act_as_type<'a>(
         &'a self,
         type_id: TypeId,
@@ -834,6 +836,14 @@ impl Item for Editor {
 
     fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
         self.active_buffer(cx)?.read(cx).project_path(cx)
+    }
+
+    fn workspace_directory(&self, cx: &App) -> Option<PathBuf> {
+        let project_path = self.active_project_path(cx)?;
+        self.project()?
+            .read(cx)
+            .worktree_for_id(project_path.worktree_id, cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
     }
 
     fn can_save_as(&self, cx: &App) -> bool {

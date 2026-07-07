@@ -29,8 +29,8 @@ use util::{
     rel_path::RelPath,
 };
 use worktree::{
-    CreatedEntry, Entry, ProjectEntryId, UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree,
-    WorktreeId,
+    CreatedEntry, Entry, ProjectEntryId, SharedFsStore, UpdatedEntriesSet,
+    UpdatedGitRepositoriesSet, Worktree, WorktreeId,
 };
 
 use crate::{ProjectPath, trusted_worktrees::TrustedWorktrees};
@@ -188,12 +188,19 @@ pub struct WorktreeStore {
     downstream_client: Option<(AnyProtoClient, u64)>,
     retain_worktrees: bool,
     worktrees: Vec<WorktreeHandle>,
+    shared_fs_store: SharedFsStore,
     scanning_enabled: bool,
     #[allow(clippy::type_complexity)]
     loading_worktrees:
         HashMap<Arc<SanitizedPath>, Shared<Task<Result<Entity<Worktree>, Arc<anyhow::Error>>>>>,
     initial_scan_complete: (watch::Sender<bool>, watch::Receiver<bool>),
     state: WorktreeStoreState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorktreeLoadBehavior {
+    Shallow,
+    Recursive,
 }
 
 #[derive(Debug)]
@@ -235,6 +242,7 @@ impl WorktreeStore {
             loading_worktrees: Default::default(),
             downstream_client: None,
             worktrees: Vec::new(),
+            shared_fs_store: SharedFsStore::new(),
             scanning_enabled: true,
             retain_worktrees,
             initial_scan_complete: watch::channel_with(true),
@@ -255,6 +263,7 @@ impl WorktreeStore {
             loading_worktrees: Default::default(),
             downstream_client: None,
             worktrees: Vec::new(),
+            shared_fs_store: SharedFsStore::new(),
             scanning_enabled: true,
             retain_worktrees,
             initial_scan_complete: watch::channel_with(true),
@@ -402,6 +411,18 @@ impl WorktreeStore {
         None
     }
 
+    pub fn find_worktree_root(
+        &self,
+        abs_path: impl AsRef<Path>,
+        cx: &App,
+    ) -> Option<Entity<Worktree>> {
+        let abs_path = SanitizedPath::new(abs_path.as_ref());
+        self.worktrees().find(|tree| {
+            let tree_abs_path = tree.read(cx).abs_path();
+            SanitizedPath::new(tree_abs_path.as_ref()) == abs_path
+        })
+    }
+
     pub fn project_path_for_absolute_path(&self, abs_path: &Path, cx: &App) -> Option<ProjectPath> {
         self.find_worktree(abs_path, cx)
             .map(|(worktree, relative_path)| ProjectPath {
@@ -422,18 +443,66 @@ impl WorktreeStore {
         }
     }
 
+    pub fn shared_fs_store(&self) -> SharedFsStore {
+        self.shared_fs_store.clone()
+    }
+
     pub fn find_or_create_worktree(
         &mut self,
         abs_path: impl AsRef<Path>,
         visible: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<(Entity<Worktree>, Arc<RelPath>)>> {
+        self.find_or_create_worktree_with_behavior(
+            abs_path,
+            visible,
+            WorktreeLoadBehavior::Shallow,
+            cx,
+        )
+    }
+
+    pub fn find_or_create_worktree_with_behavior(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        visible: bool,
+        load_behavior: WorktreeLoadBehavior,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(Entity<Worktree>, Arc<RelPath>)>> {
         let abs_path = abs_path.as_ref();
         if let Some((tree, relative_path)) = self.find_worktree(abs_path, cx) {
             Task::ready(Ok((tree, relative_path)))
         } else {
-            let worktree = self.create_worktree(abs_path, visible, cx);
+            let worktree = self.create_worktree_with_behavior(abs_path, visible, load_behavior, cx);
             cx.background_spawn(async move { Ok((worktree.await?, RelPath::empty_arc())) })
+        }
+    }
+
+    pub fn find_or_create_worktree_root(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Worktree>>> {
+        self.find_or_create_worktree_root_with_behavior(
+            abs_path,
+            visible,
+            WorktreeLoadBehavior::Shallow,
+            cx,
+        )
+    }
+
+    pub fn find_or_create_worktree_root_with_behavior(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        visible: bool,
+        load_behavior: WorktreeLoadBehavior,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Worktree>>> {
+        let abs_path = abs_path.as_ref();
+        if let Some(tree) = self.find_worktree_root(abs_path, cx) {
+            Task::ready(Ok(tree))
+        } else {
+            self.create_worktree_with_behavior(abs_path, visible, load_behavior, cx)
         }
     }
 
@@ -701,6 +770,16 @@ impl WorktreeStore {
         visible: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Worktree>>> {
+        self.create_worktree_with_behavior(abs_path, visible, WorktreeLoadBehavior::Shallow, cx)
+    }
+
+    pub fn create_worktree_with_behavior(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        visible: bool,
+        load_behavior: WorktreeLoadBehavior,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Worktree>>> {
         let abs_path: Arc<SanitizedPath> = SanitizedPath::new_arc(&abs_path);
         let is_via_collab = matches!(&self.state, WorktreeStoreState::Remote { upstream_client, .. } if upstream_client.is_via_collab());
         if !self.loading_worktrees.contains_key(&abs_path) {
@@ -717,15 +796,21 @@ impl WorktreeStore {
                         self.create_remote_worktree(upstream_client.clone(), abs_path, visible, cx)
                     }
                 }
-                WorktreeStoreState::Local { fs } => {
-                    self.create_local_worktree(fs.clone(), abs_path.clone(), visible, cx)
-                }
+                WorktreeStoreState::Local { fs } => self.create_local_worktree(
+                    fs.clone(),
+                    self.shared_fs_store.clone(),
+                    abs_path.clone(),
+                    visible,
+                    load_behavior,
+                    cx,
+                ),
             };
 
             self.loading_worktrees
                 .insert(abs_path.clone(), task.shared());
 
-            if visible && self.scanning_enabled {
+            if visible && self.scanning_enabled && load_behavior == WorktreeLoadBehavior::Recursive
+            {
                 *self.initial_scan_complete.0.borrow_mut() = false;
             }
         }
@@ -734,7 +819,11 @@ impl WorktreeStore {
             let result = task.await;
             this.update(cx, |this, cx| {
                 this.loading_worktrees.remove(&abs_path);
-                if !visible || !this.scanning_enabled || result.is_err() {
+                if !visible
+                    || !this.scanning_enabled
+                    || load_behavior == WorktreeLoadBehavior::Shallow
+                    || result.is_err()
+                {
                     this.update_initial_scan_state(cx);
                 }
             })
@@ -760,7 +849,10 @@ impl WorktreeStore {
                         }
 
                         this.update(cx, |this, cx| {
-                            if this.scanning_enabled && visible {
+                            if this.scanning_enabled
+                                && visible
+                                && load_behavior == WorktreeLoadBehavior::Recursive
+                            {
                                 this.observe_worktree_scan_completion(&worktree, cx);
                             }
                         })
@@ -844,23 +936,29 @@ impl WorktreeStore {
     fn create_local_worktree(
         &mut self,
         fs: Arc<dyn Fs>,
+        shared_fs_store: SharedFsStore,
         abs_path: Arc<SanitizedPath>,
         visible: bool,
+        load_behavior: WorktreeLoadBehavior,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Worktree>, Arc<anyhow::Error>>> {
         let next_entry_id = self.next_entry_id.clone();
-        let scanning_enabled = self.scanning_enabled;
+        let scanning_enabled =
+            self.scanning_enabled && load_behavior == WorktreeLoadBehavior::Recursive;
+        let track_git_repositories = visible;
 
         let next_worktree_id = self.next_worktree_id();
 
         cx.spawn(async move |this, cx| {
             let worktree_id = next_worktree_id.await?;
-            let worktree = Worktree::local(
+            let worktree = Worktree::local_with_shared_store(
                 SanitizedPath::cast_arc(abs_path.clone()),
                 visible,
                 fs,
+                shared_fs_store,
                 next_entry_id,
                 scanning_enabled,
+                track_git_repositories,
                 worktree_id,
                 cx,
             )

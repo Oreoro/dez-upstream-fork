@@ -171,6 +171,10 @@ pub use worktree::{
 
 const SERVER_LAUNCHING_BEFORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SERVER_PROGRESS_THROTTLE_TIMEOUT: Duration = Duration::from_millis(100);
+const IDLE_LANGUAGE_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(any(test, feature = "test-support"))]
+pub const TEST_IDLE_LANGUAGE_SERVER_SHUTDOWN_TIMEOUT: Duration =
+    IDLE_LANGUAGE_SERVER_SHUTDOWN_TIMEOUT;
 const WORKSPACE_DIAGNOSTICS_TOKEN_START: &str = "id:";
 const SERVER_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_PROMPT_REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
@@ -330,6 +334,8 @@ pub struct LocalLspStore {
     lsp_tree: LanguageServerTree,
     registered_buffers: HashMap<BufferId, usize>,
     buffers_opened_in_servers: HashMap<BufferId, HashSet<LanguageServerId>>,
+    server_demands: HashMap<LanguageServerId, HashSet<BufferId>>,
+    idle_shutdown_tasks: HashMap<LanguageServerId, Task<()>>,
     buffer_pull_diagnostics_result_ids: HashMap<
         LanguageServerId,
         HashMap<Option<SharedString>, HashMap<PathBuf, Option<SharedString>>>,
@@ -348,6 +354,29 @@ pub struct LocalLspStore {
 }
 
 impl LocalLspStore {
+    fn record_buffer_demand_for_server(
+        &mut self,
+        buffer_id: BufferId,
+        server_id: LanguageServerId,
+    ) {
+        self.server_demands
+            .entry(server_id)
+            .or_default()
+            .insert(buffer_id);
+        self.idle_shutdown_tasks.remove(&server_id);
+    }
+
+    fn language_server_has_demand(&self, server_id: LanguageServerId) -> bool {
+        self.server_demands
+            .get(&server_id)
+            .is_some_and(|buffers| !buffers.is_empty())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn language_server_demand_count(&self, server_id: LanguageServerId) -> usize {
+        self.server_demands.get(&server_id).map_or(0, HashSet::len)
+    }
+
     /// Returns the running language server for the given ID. Note if the language server is starting, it will not be returned.
     pub fn running_language_server_for_id(
         &self,
@@ -2963,6 +2992,7 @@ impl LocalLspStore {
                 .entry(buffer_id)
                 .or_default()
                 .insert(server.server_id());
+            self.record_buffer_demand_for_server(buffer_id, server.server_id());
             if registered {
                 cx.emit(LspStoreEvent::LanguageServerUpdate {
                     language_server_id: server.server_id(),
@@ -3043,16 +3073,16 @@ impl LocalLspStore {
         buffer: &Entity<Buffer>,
         old_file: &File,
         cx: &mut App,
-    ) {
+    ) -> HashSet<LanguageServerId> {
         let old_path = match old_file.as_local() {
             Some(local) => local.abs_path(cx),
-            None => return,
+            None => return HashSet::default(),
         };
 
         let Ok(file_url) = lsp::Uri::from_file_path(old_path.as_path()) else {
-            return;
+            return HashSet::default();
         };
-        self.unregister_buffer_from_language_servers(buffer, &file_url, cx);
+        self.unregister_buffer_from_language_servers(buffer, &file_url, cx)
     }
 
     pub(crate) fn unregister_buffer_from_language_servers(
@@ -3060,19 +3090,32 @@ impl LocalLspStore {
         buffer: &Entity<Buffer>,
         file_url: &lsp::Uri,
         cx: &mut App,
-    ) {
-        buffer.update(cx, |buffer, cx| {
-            let mut snapshots = self.buffer_snapshots.remove(&buffer.remote_id());
+    ) -> HashSet<LanguageServerId> {
+        let buffer_id = buffer.read(cx).remote_id();
+        let server_ids = self
+            .buffers_opened_in_servers
+            .remove(&buffer_id)
+            .unwrap_or_default();
+        buffer.update(cx, |_buffer, _cx| {
+            let mut snapshots = self.buffer_snapshots.remove(&buffer_id);
 
-            for (_, language_server) in self.language_servers_for_buffer(buffer, cx) {
+            for server_id in &server_ids {
+                let Some(LanguageServerState::Running {
+                    server: language_server,
+                    ..
+                }) = self.language_servers.get(server_id)
+                else {
+                    continue;
+                };
                 if snapshots
                     .as_mut()
-                    .is_some_and(|map| map.remove(&language_server.server_id()).is_some())
+                    .is_some_and(|map| map.remove(server_id).is_some())
                 {
                     language_server.unregister_buffer(file_url.clone());
                 }
             }
         });
+        server_ids
     }
 
     fn buffer_snapshot_for_lsp_version(
@@ -3644,6 +3687,8 @@ impl LocalLspStore {
                 .remove(server_id_to_remove);
             self.workspace_pull_diagnostics_result_ids
                 .remove(server_id_to_remove);
+            self.server_demands.remove(server_id_to_remove);
+            self.idle_shutdown_tasks.remove(server_id_to_remove);
             for buffer_servers in self.buffers_opened_in_servers.values_mut() {
                 buffer_servers.remove(server_id_to_remove);
             }
@@ -4358,6 +4403,8 @@ impl LspStore {
                 toolchain_store,
                 registered_buffers: HashMap::default(),
                 buffers_opened_in_servers: HashMap::default(),
+                server_demands: HashMap::default(),
+                idle_shutdown_tasks: HashMap::default(),
                 buffer_pull_diagnostics_result_ids: HashMap::default(),
                 workspace_pull_diagnostics_result_ids: HashMap::default(),
                 restricted_worktrees_tasks: HashMap::default(),
@@ -4460,13 +4507,20 @@ impl LspStore {
             }
             BufferStoreEvent::BufferChangedFilePath { buffer, old_file } => {
                 let buffer_id = buffer.read(cx).remote_id();
-                if let Some(local) = self.as_local_mut()
-                    && let Some(old_file) = File::from_dyn(old_file.as_ref())
-                {
-                    local.reset_buffer(buffer, old_file, cx);
+                if let Some(old_file) = File::from_dyn(old_file.as_ref()) {
+                    let server_ids = if let Some(local) = self.as_local_mut() {
+                        local.reset_buffer(buffer, old_file, cx);
 
-                    if local.registered_buffers.contains_key(&buffer_id) {
-                        local.unregister_old_buffer_from_language_servers(buffer, old_file, cx);
+                        if local.registered_buffers.contains_key(&buffer_id) {
+                            local.unregister_old_buffer_from_language_servers(buffer, old_file, cx)
+                        } else {
+                            HashSet::default()
+                        }
+                    } else {
+                        HashSet::default()
+                    };
+                    if !server_ids.is_empty() {
+                        self.remove_buffer_demand_for_servers(buffer_id, server_ids, cx);
                     }
                 }
 
@@ -4476,6 +4530,23 @@ impl LspStore {
                     if local.registered_buffers.contains_key(&buffer_id) {
                         local.register_buffer_with_language_servers(buffer, HashSet::default(), cx);
                     }
+                }
+            }
+            BufferStoreEvent::BufferDropped(buffer_id) => {
+                self.lsp_data.remove(buffer_id);
+                self.buffer_reload_tasks.remove(buffer_id);
+                let server_ids = if let Some(local) = self.as_local_mut() {
+                    local.registered_buffers.remove(buffer_id);
+                    local.buffer_snapshots.remove(buffer_id);
+                    local
+                        .buffers_opened_in_servers
+                        .remove(buffer_id)
+                        .unwrap_or_default()
+                } else {
+                    HashSet::default()
+                };
+                if !server_ids.is_empty() {
+                    self.remove_buffer_demand_for_servers(*buffer_id, server_ids, cx);
                 }
             }
             _ => {}
@@ -4666,6 +4737,9 @@ impl LspStore {
         let buffer_id = buffer.read(cx).remote_id();
         let handle = OpenLspBufferHandle(cx.new(|_| OpenLspBuffer(buffer.clone())));
         if let Some(local) = self.as_local_mut() {
+            if ignore_refcounts && !local.registered_buffers.contains_key(&buffer_id) {
+                return handle;
+            }
             let refcount = local.registered_buffers.entry(buffer_id).or_insert(0);
             if !ignore_refcounts {
                 *refcount += 1;
@@ -4700,41 +4774,43 @@ impl LspStore {
                     if refcount == 0 {
                         lsp_store.lsp_data.remove(&buffer_id);
                         lsp_store.buffer_reload_tasks.remove(&buffer_id);
-                        let local = lsp_store.as_local_mut().unwrap();
-                        local.registered_buffers.remove(&buffer_id);
-
-                        local.buffers_opened_in_servers.remove(&buffer_id);
                         if let Some(file) = File::from_dyn(buffer.0.read(cx).file()).cloned() {
-                            local.unregister_old_buffer_from_language_servers(&buffer.0, &file, cx);
-
                             let buffer_abs_path = file.abs_path(cx);
-                            for (_, buffer_pull_diagnostics_result_ids) in
-                                &mut local.buffer_pull_diagnostics_result_ids
-                            {
-                                buffer_pull_diagnostics_result_ids.retain(
-                                    |_, buffer_result_ids| {
-                                        buffer_result_ids.remove(&buffer_abs_path);
-                                        !buffer_result_ids.is_empty()
-                                    },
+                            let (server_ids, diagnostic_updates) = {
+                                let local = lsp_store.as_local_mut().unwrap();
+                                local.registered_buffers.remove(&buffer_id);
+                                let server_ids = local.unregister_old_buffer_from_language_servers(
+                                    &buffer.0, &file, cx,
                                 );
-                            }
+                                for (_, buffer_pull_diagnostics_result_ids) in
+                                    &mut local.buffer_pull_diagnostics_result_ids
+                                {
+                                    buffer_pull_diagnostics_result_ids.retain(
+                                        |_, buffer_result_ids| {
+                                            buffer_result_ids.remove(&buffer_abs_path);
+                                            !buffer_result_ids.is_empty()
+                                        },
+                                    );
+                                }
 
-                            let diagnostic_updates = local
-                                .language_servers
-                                .keys()
-                                .cloned()
-                                .map(|server_id| DocumentDiagnosticsUpdate {
-                                    diagnostics: DocumentDiagnostics {
-                                        document_abs_path: buffer_abs_path.clone(),
-                                        version: None,
-                                        diagnostics: Vec::new(),
-                                    },
-                                    result_id: None,
-                                    registration_id: None,
-                                    server_id,
-                                    disk_based_sources: Cow::Borrowed(&[]),
-                                })
-                                .collect::<Vec<_>>();
+                                let diagnostic_updates = local
+                                    .language_servers
+                                    .keys()
+                                    .cloned()
+                                    .map(|server_id| DocumentDiagnosticsUpdate {
+                                        diagnostics: DocumentDiagnostics {
+                                            document_abs_path: buffer_abs_path.clone(),
+                                            version: None,
+                                            diagnostics: Vec::new(),
+                                        },
+                                        result_id: None,
+                                        registration_id: None,
+                                        server_id,
+                                        disk_based_sources: Cow::Borrowed(&[]),
+                                    })
+                                    .collect::<Vec<_>>();
+                                (server_ids, diagnostic_updates)
+                            };
 
                             lsp_store
                                 .merge_diagnostic_entries(
@@ -4746,6 +4822,17 @@ impl LspStore {
                                 )
                                 .context("Clearing diagnostics for the closed buffer")
                                 .log_err();
+                            lsp_store.remove_buffer_demand_for_servers(buffer_id, server_ids, cx);
+                        } else {
+                            let server_ids = {
+                                let local = lsp_store.as_local_mut().unwrap();
+                                local.registered_buffers.remove(&buffer_id);
+                                local
+                                    .buffers_opened_in_servers
+                                    .remove(&buffer_id)
+                                    .unwrap_or_default()
+                            };
+                            lsp_store.remove_buffer_demand_for_servers(buffer_id, server_ids, cx);
                         }
                     }
                 })
@@ -4788,6 +4875,182 @@ impl LspStore {
         handle
     }
 
+    fn language_server_has_demand(&self, server_id: LanguageServerId) -> bool {
+        self.as_local()
+            .is_some_and(|local| local.language_server_has_demand(server_id))
+    }
+
+    fn remove_buffer_demand_for_servers(
+        &mut self,
+        buffer_id: BufferId,
+        server_ids: impl IntoIterator<Item = LanguageServerId>,
+        cx: &mut Context<Self>,
+    ) {
+        for server_id in server_ids {
+            let became_idle = {
+                let Some(local) = self.as_local_mut() else {
+                    return;
+                };
+                let Some(demands) = local.server_demands.get_mut(&server_id) else {
+                    continue;
+                };
+                demands.remove(&buffer_id);
+                if demands.is_empty() {
+                    local.server_demands.remove(&server_id);
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if became_idle {
+                self.language_server_demand_became_empty(server_id, cx);
+            }
+        }
+    }
+
+    fn language_server_demand_became_empty(
+        &mut self,
+        server_id: LanguageServerId,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_language_server_work(server_id, None, cx);
+        self.cancel_disk_based_diagnostics(server_id);
+        self.finish_disk_based_diagnostics_for_idle_server(server_id, cx);
+        self.schedule_idle_language_server_shutdown(server_id, cx);
+    }
+
+    fn cancel_disk_based_diagnostics(&self, server_id: LanguageServerId) {
+        let Some((adapter, server)) = self.as_local().and_then(|local| {
+            let LanguageServerState::Running {
+                adapter, server, ..
+            } = local.language_servers.get(&server_id)?
+            else {
+                return None;
+            };
+            Some((adapter.clone(), server.clone()))
+        }) else {
+            return;
+        };
+
+        adapter
+            .adapter
+            .cancel_disk_based_diagnostics(&server)
+            .log_err();
+    }
+
+    fn finish_disk_based_diagnostics_for_idle_server(
+        &mut self,
+        server_id: LanguageServerId,
+        cx: &mut Context<Self>,
+    ) {
+        let disk_based_progress_token = self
+            .language_server_adapter_for_id(server_id)
+            .and_then(|adapter| adapter.disk_based_diagnostics_progress_token.clone());
+        let mut did_update = false;
+        if let Some(status) = self.language_server_statuses.get_mut(&server_id) {
+            let mut tokens_to_remove = status
+                .pending_work
+                .iter()
+                .filter_map(|(token, progress)| {
+                    progress
+                        .is_disk_based_diagnostics_progress
+                        .then(|| token.clone())
+                })
+                .collect::<Vec<_>>();
+            if let Some(disk_based_progress_token) = &disk_based_progress_token {
+                tokens_to_remove.extend(status.progress_tokens.iter().filter_map(|token| {
+                    if let ProgressToken::String(token) = token
+                        && token.starts_with(disk_based_progress_token)
+                    {
+                        Some(ProgressToken::String(token.clone()))
+                    } else {
+                        None
+                    }
+                }));
+                tokens_to_remove.sort();
+                tokens_to_remove.dedup();
+            }
+
+            for token in &tokens_to_remove {
+                status.pending_work.remove(token);
+                status.progress_tokens.remove(token);
+            }
+
+            did_update = status.has_pending_diagnostic_updates || !tokens_to_remove.is_empty();
+            status.has_pending_diagnostic_updates = false;
+        }
+        if let Some(LanguageServerState::Running {
+            simulate_disk_based_diagnostics_completion,
+            ..
+        }) = self
+            .as_local_mut()
+            .and_then(|local| local.language_servers.get_mut(&server_id))
+            && simulate_disk_based_diagnostics_completion.take().is_some()
+        {
+            did_update = true;
+        }
+
+        if did_update {
+            cx.emit(LspStoreEvent::DiskBasedDiagnosticsFinished {
+                language_server_id: server_id,
+            });
+            cx.emit(LspStoreEvent::LanguageServerUpdate {
+                language_server_id: server_id,
+                name: self
+                    .language_server_adapter_for_id(server_id)
+                    .map(|adapter| adapter.name()),
+                message: proto::update_language_server::Variant::DiskBasedDiagnosticsUpdated(
+                    Default::default(),
+                ),
+            });
+            cx.notify();
+        }
+    }
+
+    fn schedule_idle_language_server_shutdown(
+        &mut self,
+        server_id: LanguageServerId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.language_server_has_demand(server_id) {
+            return;
+        }
+
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        if local.idle_shutdown_tasks.contains_key(&server_id)
+            || !local.language_servers.contains_key(&server_id)
+        {
+            return;
+        }
+
+        let task = cx.spawn(async move |lsp_store, cx| {
+            cx.background_executor()
+                .timer(IDLE_LANGUAGE_SERVER_SHUTDOWN_TIMEOUT)
+                .await;
+
+            lsp_store
+                .update(cx, |lsp_store, cx| {
+                    let should_stop = lsp_store.as_local().is_some_and(|local| {
+                        local.idle_shutdown_tasks.contains_key(&server_id)
+                            && !local.language_server_has_demand(server_id)
+                    });
+                    if !should_stop {
+                        return;
+                    }
+
+                    if let Some(local) = lsp_store.as_local_mut() {
+                        local.idle_shutdown_tasks.remove(&server_id);
+                    }
+                    lsp_store.stop_local_language_server(server_id, cx).detach();
+                })
+                .ok();
+        });
+        local.idle_shutdown_tasks.insert(server_id, task);
+    }
+
     fn maintain_buffer_languages(
         languages: Arc<LanguageRegistry>,
         cx: &mut Context<Self>,
@@ -4803,14 +5066,16 @@ impl LspStore {
                     if reload_count > prev_reload_count {
                         prev_reload_count = reload_count;
                         this.update(cx, |this, cx| {
+                            let mut removed_demands = Vec::new();
                             this.buffer_store.clone().update(cx, |buffer_store, cx| {
                                 for buffer in buffer_store.buffers() {
                                     if let Some(f) = File::from_dyn(buffer.read(cx).file()).cloned()
                                     {
+                                        let buffer_id = buffer.read(cx).remote_id();
                                         buffer.update(cx, |buffer, cx| {
                                             buffer.set_language_async(None, cx)
                                         });
-                                        if let Some(local) = this.as_local_mut() {
+                                        let server_ids = if let Some(local) = this.as_local_mut() {
                                             local.reset_buffer(&buffer, &f, cx);
 
                                             if local
@@ -4821,12 +5086,22 @@ impl LspStore {
                                             {
                                                 local.unregister_buffer_from_language_servers(
                                                     &buffer, &file_url, cx,
-                                                );
+                                                )
+                                            } else {
+                                                HashSet::default()
                                             }
+                                        } else {
+                                            HashSet::default()
+                                        };
+                                        if !server_ids.is_empty() {
+                                            removed_demands.push((buffer_id, server_ids));
                                         }
                                     }
                                 }
                             });
+                            for (buffer_id, server_ids) in removed_demands {
+                                this.remove_buffer_demand_for_servers(buffer_id, server_ids, cx);
+                            }
                         });
                     }
 
@@ -4999,13 +5274,22 @@ impl LspStore {
         let buffer = buffer_entity.read(cx);
         let buffer_file = buffer.file().cloned();
         let buffer_id = buffer.remote_id();
-        if let Some(local_store) = self.as_local_mut()
+        let server_ids = if let Some(local_store) = self.as_local_mut()
             && local_store.registered_buffers.contains_key(&buffer_id)
-            && let Some(abs_path) =
-                File::from_dyn(buffer_file.as_ref()).map(|file| file.abs_path(cx))
-            && let Some(file_url) = file_path_to_lsp_url(&abs_path).log_err()
         {
-            local_store.unregister_buffer_from_language_servers(buffer_entity, &file_url, cx);
+            if let Some(abs_path) =
+                File::from_dyn(buffer_file.as_ref()).map(|file| file.abs_path(cx))
+                && let Some(file_url) = file_path_to_lsp_url(&abs_path).log_err()
+            {
+                local_store.unregister_buffer_from_language_servers(buffer_entity, &file_url, cx)
+            } else {
+                HashSet::default()
+            }
+        } else {
+            HashSet::default()
+        };
+        if !server_ids.is_empty() {
+            self.remove_buffer_demand_for_servers(buffer_id, server_ids, cx);
         }
         buffer_entity.update(cx, |buffer, cx| {
             if buffer
@@ -10267,6 +10551,18 @@ impl LspStore {
             .map(|(key, value)| (*key, value))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn language_server_demand_count(&self, server_id: LanguageServerId) -> usize {
+        self.as_local()
+            .map_or(0, |local| local.language_server_demand_count(server_id))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn has_idle_language_server_shutdown_task(&self, server_id: LanguageServerId) -> bool {
+        self.as_local()
+            .is_some_and(|local| local.idle_shutdown_tasks.contains_key(&server_id))
+    }
+
     #[cfg(feature = "test-support")]
     pub fn has_language_server_seed_for_worktree(&self, worktree_id: WorktreeId) -> bool {
         self.as_local().is_some_and(|local| {
@@ -10492,25 +10788,32 @@ impl LspStore {
         token: ProgressToken,
         cx: &mut Context<Self>,
     ) {
-        let language_server_status =
-            if let Some(status) = self.language_server_statuses.get_mut(&language_server_id) {
-                status
-            } else {
-                return;
-            };
+        let Some(is_disk_based_diagnostics_progress) = self
+            .language_server_statuses
+            .get(&language_server_id)
+            .and_then(|status| {
+                status.progress_tokens.contains(&token).then(|| {
+                    if let (Some(disk_based_token), ProgressToken::String(token)) =
+                        (&disk_based_diagnostics_progress_token, &token)
+                    {
+                        token.starts_with(disk_based_token)
+                    } else {
+                        false
+                    }
+                })
+            })
+        else {
+            return;
+        };
 
-        if !language_server_status.progress_tokens.contains(&token) {
+        if is_disk_based_diagnostics_progress
+            && !self.language_server_has_demand(language_server_id)
+        {
+            self.cancel_language_server_work(language_server_id, Some(token.clone()), cx);
+            self.cancel_disk_based_diagnostics(language_server_id);
+            self.finish_disk_based_diagnostics_for_idle_server(language_server_id, cx);
             return;
         }
-
-        let is_disk_based_diagnostics_progress =
-            if let (Some(disk_based_token), ProgressToken::String(token)) =
-                (&disk_based_diagnostics_progress_token, &token)
-            {
-                token.starts_with(disk_based_token)
-            } else {
-                false
-            };
 
         match progress {
             lsp::WorkDoneProgress::Begin(report) => {
@@ -10545,7 +10848,11 @@ impl LspStore {
                 cx,
             ),
             lsp::WorkDoneProgress::End(_) => {
-                language_server_status.progress_tokens.remove(&token);
+                if let Some(language_server_status) =
+                    self.language_server_statuses.get_mut(&language_server_id)
+                {
+                    language_server_status.progress_tokens.remove(&token);
+                }
                 self.on_lsp_work_end(language_server_id, token.clone(), cx);
                 if is_disk_based_diagnostics_progress {
                     self.disk_based_diagnostics_finished(language_server_id, cx);
@@ -11397,6 +11704,8 @@ impl LspStore {
         }
 
         let local = self.as_local_mut().unwrap();
+        local.idle_shutdown_tasks.remove(&server_id);
+        local.server_demands.remove(&server_id);
         for diagnostics in local.diagnostics.values_mut() {
             diagnostics.retain(|_, diagnostics_by_server_id| {
                 if let Ok(ix) = diagnostics_by_server_id.binary_search_by_key(&server_id, |e| e.0) {
@@ -12112,6 +12421,7 @@ impl LspStore {
                         .entry(buffer_id)
                         .or_default()
                         .insert(server_id);
+                    local.record_buffer_demand_for_server(buffer_id, server_id);
                 }
                 buffer_handle.update(cx, |buffer, cx| {
                     buffer.set_completion_triggers(
@@ -12642,6 +12952,8 @@ impl LspStore {
             local
                 .workspace_pull_diagnostics_result_ids
                 .remove(&for_server);
+            local.server_demands.remove(&for_server);
+            local.idle_shutdown_tasks.remove(&for_server);
             for buffer_servers in local.buffers_opened_in_servers.values_mut() {
                 buffer_servers.remove(&for_server);
             }
@@ -12702,6 +13014,9 @@ impl LspStore {
     }
 
     pub fn pull_workspace_diagnostics(&mut self, server_id: LanguageServerId) {
+        if !self.language_server_has_demand(server_id) {
+            return;
+        }
         if let Some(LanguageServerState::Running {
             workspace_diagnostics_refresh_tasks,
             ..
@@ -12726,8 +13041,16 @@ impl LspStore {
             return Task::ready(true);
         };
 
+        let demanded_servers = local
+            .server_demands
+            .iter()
+            .filter_map(|(server_id, buffers)| (!buffers.is_empty()).then_some(*server_id))
+            .collect::<HashSet<_>>();
         let mut receivers = Vec::new();
-        for state in local.language_servers.values_mut() {
+        for (server_id, state) in &mut local.language_servers {
+            if !demanded_servers.contains(server_id) {
+                continue;
+            }
             let LanguageServerState::Running {
                 workspace_diagnostics_refresh_tasks,
                 ..
@@ -13984,6 +14307,18 @@ fn lsp_workspace_diagnostics_refresh(
                     .timer(Duration::from_millis(backoff_millis))
                     .await;
                 attempts += 1;
+
+                let Ok(has_demand) = lsp_store.read_with(cx, |lsp_store, _| {
+                    lsp_store.language_server_has_demand(server.server_id())
+                }) else {
+                    return;
+                };
+                if !has_demand {
+                    if let Some(tx) = completion_tx.take() {
+                        tx.send(false).ok();
+                    }
+                    break 'request;
+                }
 
                 let Ok(previous_result_ids) = lsp_store.update(cx, |lsp_store, _| {
                     lsp_store

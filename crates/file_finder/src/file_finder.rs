@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod file_finder_tests;
 
+use fs::Fs;
 use futures::future::join_all;
 pub use open_path_prompt::OpenPathDelegate;
 
@@ -12,9 +13,9 @@ use file_icons::FileIcons;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use fuzzy_nucleo::{PathMatch, PathMatchCandidate};
 use gpui::{
-    Action, AnyElement, App, Context, DismissEvent, Empty, Entity, EventEmitter, FocusHandle,
-    Focusable, KeyContext, Modifiers, ModifiersChangedEvent, ParentElement, Render, Styled, Task,
-    TaskExt, WeakEntity, Window, actions, rems,
+    Action, AnyElement, App, AsyncApp, Context, DismissEvent, Empty, Entity, EventEmitter,
+    FocusHandle, Focusable, KeyContext, Modifiers, ModifiersChangedEvent, ParentElement, Render,
+    Styled, Task, TaskExt, WeakEntity, Window, actions, rems,
 };
 use language::{BufferSnapshot, Point};
 use open_path_prompt::{
@@ -23,13 +24,15 @@ use open_path_prompt::{
 };
 use picker::{Picker, PickerDelegate};
 use project::{
-    PathMatchCandidateSet, Project, ProjectPath, WorktreeId, worktree_store::WorktreeStore,
+    PathMatchCandidateSet, Project, ProjectPath, Worktree, WorktreeId,
+    worktree_store::WorktreeStore,
 };
 use project_panel::project_panel_settings::ProjectPanelSettings;
 use settings::Settings;
 use std::{
     borrow::Cow,
     cmp,
+    collections::VecDeque,
     ops::{Range, RangeInclusive},
     path::{Component, Path, PathBuf},
     sync::{
@@ -48,6 +51,11 @@ use util::{
 use workspace::{
     ModalView, OpenChannelNotesById, OpenOptions, OpenVisible, SplitDirection, Workspace,
     item::PreviewTabsSettings, notifications::NotifyResultExt, pane,
+};
+use worktree::{
+    IgnoreStack, SharedFsStore, WorktreeSettings,
+    ignore::{IgnoreKind, build_gitignore},
+    initial_ignore_stack_for_abs_path,
 };
 use zed_actions::search::ToggleIncludeIgnored;
 
@@ -788,8 +796,22 @@ impl FoundPath {
     }
 }
 
+#[derive(Clone)]
+struct FileFinderSearchRoot {
+    worktree_id: WorktreeId,
+    abs_path: Arc<Path>,
+    root_name: Arc<RelPath>,
+    include_root_name: bool,
+    include_ignored: bool,
+    path_style: PathStyle,
+    settings: WorktreeSettings,
+}
+
 const MAX_RECENT_SELECTIONS: usize = 20;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(100);
+const MAX_FILE_FINDER_DIRECTORY_ENTRIES: usize = 10_000;
+const FILE_FINDER_DISCOVERY_BATCH_SIZE: usize = 2048;
+const GITIGNORE_FILE_NAME: &str = ".gitignore";
 
 pub enum Event {
     Selected(ProjectPath),
@@ -900,6 +922,13 @@ fn buffer_range_for_line_range(
 }
 
 impl FileFinderDelegate {
+    fn visible_worktrees(&self, cx: &App) -> Vec<Entity<Worktree>> {
+        self.workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).visible_worktrees(cx).collect())
+            .unwrap_or_else(|| self.project.read(cx).visible_worktrees(cx).collect())
+    }
+
     fn new(
         file_finder: WeakEntity<FileFinder>,
         workspace: WeakEntity<Workspace>,
@@ -968,12 +997,56 @@ impl FileFinderDelegate {
             .currently_opened_path
             .as_ref()
             .map(|found_path| Arc::clone(&found_path.project.path));
-        let worktree_store = self.project.read(cx).worktree_store();
-        let worktrees = worktree_store
-            .read(cx)
-            .visible_worktrees_and_single_files(cx)
+        let worktrees = self
+            .workspace
+            .upgrade()
+            .map(|workspace| {
+                workspace
+                    .read(cx)
+                    .worktrees(cx)
+                    .filter(|worktree| {
+                        let worktree = worktree.read(cx);
+                        worktree.is_visible() || worktree.is_single_file()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                let worktree_store = self.project.read(cx).worktree_store();
+                worktree_store
+                    .read(cx)
+                    .visible_worktrees_and_single_files(cx)
+                    .collect::<Vec<_>>()
+            });
+        let multiple_worktrees = worktrees
+            .iter()
+            .filter(|worktree| !worktree.read(cx).is_single_file())
+            .nth(1)
+            .is_some();
+        let include_root_name =
+            !ProjectPanelSettings::get_global(cx).hide_root || multiple_worktrees;
+        let search_roots = worktrees
+            .iter()
+            .filter_map(|worktree| {
+                let worktree = worktree.read(cx);
+                let snapshot = worktree.snapshot();
+                let settings = worktree.as_local()?.settings();
+                let include_ignored = self
+                    .include_ignored
+                    .unwrap_or_else(|| worktree.root_entry().is_some_and(|entry| entry.is_ignored));
+                snapshot
+                    .root_entry()?
+                    .is_dir()
+                    .then(|| FileFinderSearchRoot {
+                        worktree_id: snapshot.id(),
+                        abs_path: snapshot.abs_path().clone(),
+                        root_name: snapshot.root_name().into(),
+                        include_root_name,
+                        include_ignored,
+                        path_style: snapshot.path_style(),
+                        settings,
+                    })
+            })
             .collect::<Vec<_>>();
-        let include_root_name = !should_hide_root_in_entry_path(&worktree_store, cx);
         let candidate_sets = worktrees
             .into_iter()
             .map(|worktree| {
@@ -988,12 +1061,22 @@ impl FileFinderDelegate {
                 }
             })
             .collect::<Vec<_>>();
+        let fs = self.project.read(cx).fs().clone();
+        let shared_fs_store = self
+            .project
+            .read(cx)
+            .worktree_store()
+            .read(cx)
+            .shared_fs_store();
 
         let search_id = util::post_inc(&mut self.search_count);
         self.cancel_flag.store(true, atomic::Ordering::Release);
         self.cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = self.cancel_flag.clone();
+        let should_discover_files = !query.path_query().is_empty();
         cx.spawn_in(window, async move |picker, cx| {
+            let discovery_query = query.clone();
+            let discovery_relative_to = relative_to.clone();
             let matches = fuzzy_nucleo::match_path_sets(
                 candidate_sets.as_slice(),
                 query.path_query(),
@@ -1014,7 +1097,250 @@ impl FileFinderDelegate {
                         .set_search_matches(search_id, did_cancel, query, matches, cx)
                 })
                 .log_err();
+            if should_discover_files && !did_cancel {
+                Self::stream_discovered_file_matches(
+                    fs,
+                    shared_fs_store,
+                    search_roots,
+                    discovery_query,
+                    discovery_relative_to,
+                    cancel_flag,
+                    search_id,
+                    picker,
+                    cx,
+                )
+                .await;
+            }
         })
+    }
+
+    async fn stream_discovered_file_matches(
+        fs: Arc<dyn Fs>,
+        shared_fs_store: SharedFsStore,
+        search_roots: Vec<FileFinderSearchRoot>,
+        query: FileSearchQuery,
+        relative_to: Option<Arc<RelPath>>,
+        cancel_flag: Arc<AtomicBool>,
+        search_id: usize,
+        picker: WeakEntity<Picker<Self>>,
+        cx: &mut AsyncApp,
+    ) {
+        for root in search_roots {
+            if cancel_flag.load(atomic::Ordering::Acquire) {
+                return;
+            }
+
+            let mut directories = VecDeque::new();
+            directories.push_back((
+                root.abs_path.clone(),
+                RelPath::empty_arc(),
+                initial_ignore_stack_for_abs_path(fs.clone(), root.abs_path.as_ref(), true).await,
+            ));
+            let mut batch = Vec::new();
+
+            while let Some((directory_abs_path, directory_rel_path, mut ignore_stack)) =
+                directories.pop_front()
+            {
+                if cancel_flag.load(atomic::Ordering::Acquire) {
+                    return;
+                }
+
+                if !directory_rel_path.is_empty()
+                    && root.settings.is_path_excluded(&directory_rel_path)
+                {
+                    continue;
+                }
+
+                let Ok((mut child_paths, limit_reached)) = shared_fs_store
+                    .read_dir_paths_limited(
+                        fs.as_ref(),
+                        &directory_abs_path,
+                        MAX_FILE_FINDER_DIRECTORY_ENTRIES,
+                    )
+                    .await
+                else {
+                    continue;
+                };
+
+                if limit_reached {
+                    log::warn!(
+                        "file finder skipped remaining entries in {:?} after {} entries",
+                        directory_abs_path,
+                        MAX_FILE_FINDER_DIRECTORY_ENTRIES
+                    );
+                }
+
+                child_paths.sort_by_key(|path| {
+                    if path
+                        .file_name()
+                        .is_some_and(|file_name| file_name == GITIGNORE_FILE_NAME)
+                    {
+                        0
+                    } else {
+                        1
+                    }
+                });
+
+                for child_abs_path in child_paths {
+                    if cancel_flag.load(atomic::Ordering::Acquire) {
+                        return;
+                    }
+
+                    let Ok(relative_path) = child_abs_path.strip_prefix(root.abs_path.as_ref())
+                    else {
+                        continue;
+                    };
+                    let Ok(relative_path) = RelPath::new(relative_path, root.path_style) else {
+                        continue;
+                    };
+                    let relative_path = relative_path.into_arc();
+
+                    if root.settings.is_path_excluded(&relative_path) {
+                        continue;
+                    }
+
+                    if child_abs_path
+                        .file_name()
+                        .is_some_and(|file_name| file_name == GITIGNORE_FILE_NAME)
+                        && let Ok(ignore) = build_gitignore(&child_abs_path, fs.as_ref()).await
+                    {
+                        ignore_stack = ignore_stack.append(
+                            IgnoreKind::Gitignore(directory_abs_path.clone()),
+                            Arc::new(ignore),
+                        );
+                    }
+
+                    let Ok(Some(metadata)) =
+                        shared_fs_store.metadata(fs.as_ref(), &child_abs_path).await
+                    else {
+                        continue;
+                    };
+
+                    let is_always_included = root
+                        .settings
+                        .is_path_always_included(&relative_path, metadata.is_dir);
+                    let is_ignored =
+                        ignore_stack.is_abs_path_ignored(&child_abs_path, metadata.is_dir);
+                    if !root.include_ignored && is_ignored && !is_always_included {
+                        continue;
+                    }
+
+                    if metadata.is_dir {
+                        if !metadata.is_symlink {
+                            let child_ignore_stack = if is_ignored {
+                                IgnoreStack::all()
+                            } else {
+                                ignore_stack.clone()
+                            };
+                            directories.push_back((
+                                child_abs_path.into(),
+                                relative_path,
+                                child_ignore_stack,
+                            ));
+                        }
+                        continue;
+                    }
+
+                    if metadata.is_fifo {
+                        continue;
+                    }
+
+                    batch.push(relative_path);
+                    if batch.len() >= FILE_FINDER_DISCOVERY_BATCH_SIZE {
+                        Self::send_discovered_file_match_batch(
+                            &root,
+                            &query,
+                            relative_to.as_ref(),
+                            std::mem::take(&mut batch),
+                            &cancel_flag,
+                            search_id,
+                            &picker,
+                            cx,
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            if !batch.is_empty() {
+                Self::send_discovered_file_match_batch(
+                    &root,
+                    &query,
+                    relative_to.as_ref(),
+                    batch,
+                    &cancel_flag,
+                    search_id,
+                    &picker,
+                    cx,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn send_discovered_file_match_batch(
+        root: &FileFinderSearchRoot,
+        query: &FileSearchQuery,
+        _relative_to: Option<&Arc<RelPath>>,
+        paths: Vec<Arc<RelPath>>,
+        cancel_flag: &Arc<AtomicBool>,
+        search_id: usize,
+        picker: &WeakEntity<Picker<Self>>,
+        cx: &mut AsyncApp,
+    ) {
+        if cancel_flag.load(atomic::Ordering::Acquire) {
+            return;
+        }
+
+        let include_root_name = root.include_root_name;
+        let root_name = root.root_name.clone();
+        let worktree_id = root.worktree_id.to_usize();
+        let path_style = root.path_style;
+        let query_for_match = query.clone();
+        let matches = cx
+            .background_spawn(async move {
+                let displayed_root_name = include_root_name.then(|| root_name.clone());
+                let candidates = paths
+                    .iter()
+                    .map(|path| {
+                        PathMatchCandidate::new(
+                            path,
+                            false,
+                            include_root_name.then_some(root_name.as_ref()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                fuzzy_nucleo::match_fixed_path_set(
+                    candidates,
+                    worktree_id,
+                    displayed_root_name,
+                    query_for_match.path_query(),
+                    fuzzy_nucleo::Case::Ignore,
+                    100,
+                    path_style,
+                )
+                .into_iter()
+                .map(ProjectPanelOrdMatch)
+                .collect::<Vec<_>>()
+            })
+            .await;
+
+        if matches.is_empty() {
+            return;
+        }
+
+        let did_cancel = cancel_flag.load(atomic::Ordering::Acquire);
+        picker
+            .update(cx, |picker, cx| {
+                picker.delegate.set_search_matches(
+                    search_id,
+                    did_cancel,
+                    query.clone(),
+                    matches.into_iter(),
+                    cx,
+                )
+            })
+            .log_err();
     }
 
     fn set_search_matches(
@@ -1033,6 +1359,8 @@ impl FileFinderDelegate {
                     .as_ref()
                     .map(|query| query.path_query());
             let extend_old_matches = self.latest_search_did_cancel && !query_changed;
+            let extend_old_matches =
+                extend_old_matches || (!query_changed && search_id == self.latest_search_id);
 
             let selected_match = if query_changed {
                 None
@@ -1117,9 +1445,8 @@ impl FileFinderDelegate {
             let query_path = query.raw_query.as_str();
             if let Ok(mut query_path) = RelPath::new(Path::new(query_path), path_style) {
                 let available_worktree = self
-                    .project
-                    .read(cx)
                     .visible_worktrees(cx)
+                    .into_iter()
                     .filter(|worktree| !worktree.read(cx).is_single_file())
                     .collect::<Vec<_>>();
                 let worktree_count = available_worktree.len();

@@ -2246,7 +2246,7 @@ pub(crate) fn search_symbols(
                     .map(|(id, symbol)| StringMatchCandidate::new(id, symbol.label.filter_text()))
                     .partition(|candidate| match &symbols[candidate.id].path {
                         SymbolLocation::InProject(project_path) => project
-                            .entry_for_path(project_path, cx)
+                            .entry_for_path(&project_path, cx)
                             .is_some_and(|e| !e.is_ignored),
                         SymbolLocation::OutsideProject { .. } => false,
                     })

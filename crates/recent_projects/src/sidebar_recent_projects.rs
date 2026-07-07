@@ -385,7 +385,7 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                 )
                 .tooltip(move |_, cx| {
                     Tooltip::with_meta(
-                        "Open Project in This Window",
+                        "Open Worktree in This Workspace",
                         None,
                         tooltip_path.clone(),
                         cx,

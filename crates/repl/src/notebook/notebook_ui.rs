@@ -1679,6 +1679,8 @@ impl EventEmitter<()> for NotebookEditor {}
 impl Item for NotebookEditor {
     type Event = ();
 
+    const CONTRIBUTES_PATH_EVIDENCE: bool = true;
+
     fn can_split(&self) -> bool {
         true
     }

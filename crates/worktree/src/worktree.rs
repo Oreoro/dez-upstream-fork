@@ -1,15 +1,15 @@
-mod ignore;
+pub mod ignore;
 mod worktree_settings;
 
-use ::ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ::ignore::gitignore::Gitignore;
 use anyhow::{Context as _, Result, anyhow};
 use chardetng::EncodingDetector;
 use clock::ReplicaId;
 use collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use encoding_rs::Encoding;
 use fs::{
-    Fs, MTime, PathEvent, PathEventKind, RemoveOptions, TrashedEntry, Watcher, copy_recursive,
-    read_dir_items,
+    Fs, MTime, Metadata, PathEvent, PathEventKind, RemoveOptions, TrashedEntry, Watcher,
+    copy_recursive, read_dir_items,
 };
 use futures::{
     FutureExt as _, Stream, StreamExt,
@@ -30,7 +30,6 @@ use gpui::{
     App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Priority,
     Task,
 };
-use ignore::IgnoreStack;
 use language::{ByteContent, DiskState, FILE_ANALYSIS_BYTES, analyze_byte_content};
 
 use async_channel::{self, Sender};
@@ -76,9 +75,162 @@ use util::{
 };
 pub use worktree_settings::WorktreeSettings;
 
-use crate::ignore::IgnoreKind;
+pub use crate::ignore::IgnoreStack;
+use crate::ignore::{IgnoreKind, build_gitignore, build_gitignore_with_root};
 
 pub const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);
+const MAX_DIRECTORY_ENTRIES_PER_SCAN: usize = 10_000;
+
+#[derive(Clone, Default)]
+pub struct SharedFsStore {
+    directories: Arc<Mutex<HashMap<Arc<SanitizedPath>, Arc<SharedDirectoryEntries>>>>,
+    metadata: Arc<Mutex<HashMap<Arc<SanitizedPath>, Option<Metadata>>>>,
+    git_repositories: Arc<Mutex<HashMap<Arc<SanitizedPath>, Arc<SharedGitRepositoryDescriptor>>>>,
+}
+
+struct SharedDirectoryEntries {
+    child_names: Arc<[PathBuf]>,
+    limit_reached: bool,
+}
+
+struct SharedGitRepositoryDescriptor {
+    work_directory_abs_path: Arc<Path>,
+    dot_git_abs_path: Arc<Path>,
+    repository_dir_abs_path: Arc<Path>,
+    common_dir_abs_path: Arc<Path>,
+}
+
+impl SharedFsStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn metadata(&self, fs: &dyn Fs, path: &Path) -> Result<Option<Metadata>> {
+        let key = SanitizedPath::new_arc(path);
+        if let Some(metadata) = self.metadata.lock().get(&key).cloned() {
+            return Ok(metadata);
+        }
+
+        let metadata = fs.metadata(path).await?;
+        self.metadata.lock().insert(key, metadata.clone());
+        Ok(metadata)
+    }
+
+    async fn read_dir_limited(
+        &self,
+        fs: &dyn Fs,
+        path: &Path,
+        limit: usize,
+    ) -> Result<Arc<SharedDirectoryEntries>> {
+        let key_path = fs
+            .canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.to_path_buf());
+        let key = SanitizedPath::new_arc(&key_path);
+        if let Some(entries) = self.directories.lock().get(&key).cloned() {
+            return Ok(entries);
+        }
+
+        let mut directory_entry_count = 0;
+        let mut directory_entry_limit_reached = false;
+        let mut child_names = Vec::new();
+        let mut directory_entries = fs.read_dir(path).await?;
+        while let Some(entry) = directory_entries.next().await {
+            match entry {
+                Ok(entry) => {
+                    if directory_entry_count >= limit {
+                        directory_entry_limit_reached = true;
+                        break;
+                    }
+                    directory_entry_count += 1;
+                    if let Some(file_name) = entry.file_name() {
+                        child_names.push(PathBuf::from(file_name));
+                    }
+                }
+                Err(error) => {
+                    log::error!("error processing entry {:?}", error);
+                }
+            }
+        }
+
+        let entries = Arc::new(SharedDirectoryEntries {
+            child_names: Arc::from(child_names),
+            limit_reached: directory_entry_limit_reached,
+        });
+        Ok(self
+            .directories
+            .lock()
+            .entry(key)
+            .or_insert_with(|| entries.clone())
+            .clone())
+    }
+
+    fn invalidate_path(&self, path: &Path) {
+        let path = SanitizedPath::new(path);
+        self.metadata.lock().retain(|cached_path, _| {
+            cached_path.as_path() != path.as_path() && !cached_path.starts_with(path)
+        });
+        self.directories.lock().retain(|cached_path, _| {
+            cached_path.as_path() != path.as_path() && !cached_path.starts_with(path)
+        });
+
+        if let Some(parent) = path.as_path().parent() {
+            let parent = SanitizedPath::new_arc(parent);
+            self.directories.lock().remove(&parent);
+        }
+
+        self.git_repositories.lock().retain(|_, repository| {
+            !path.starts_with(SanitizedPath::new(repository.dot_git_abs_path.as_ref()))
+                && !path.starts_with(SanitizedPath::new(
+                    repository.repository_dir_abs_path.as_ref(),
+                ))
+                && !path.starts_with(SanitizedPath::new(repository.common_dir_abs_path.as_ref()))
+        });
+    }
+
+    async fn git_repository_descriptor(
+        &self,
+        fs: &dyn Fs,
+        work_directory_abs_path: PathBuf,
+        dot_git_abs_path: Arc<Path>,
+    ) -> Arc<SharedGitRepositoryDescriptor> {
+        let key = SanitizedPath::new_arc(&work_directory_abs_path);
+        if let Some(repository) = self.git_repositories.lock().get(&key).cloned() {
+            return repository;
+        }
+
+        let (repository_dir_abs_path, common_dir_abs_path) =
+            discover_git_paths(&dot_git_abs_path, fs).await;
+        let repository = Arc::new(SharedGitRepositoryDescriptor {
+            work_directory_abs_path: work_directory_abs_path.into(),
+            dot_git_abs_path,
+            repository_dir_abs_path,
+            common_dir_abs_path,
+        });
+        self.git_repositories
+            .lock()
+            .entry(key)
+            .or_insert_with(|| repository.clone())
+            .clone()
+    }
+
+    pub async fn read_dir_paths_limited(
+        &self,
+        fs: &dyn Fs,
+        path: &Path,
+        limit: usize,
+    ) -> Result<(Vec<PathBuf>, bool)> {
+        let entries = self.read_dir_limited(fs, path, limit).await?;
+        Ok((
+            entries
+                .child_names
+                .iter()
+                .map(|child_name| path.join(child_name))
+                .collect(),
+            entries.limit_reached,
+        ))
+    }
+}
 
 /// A set of local or remote files that are being opened as part of a project.
 /// Responsible for tracking related FS (for local)/collab (for remote) events and corresponding updates.
@@ -136,12 +288,14 @@ pub struct LocalWorktree {
     _background_scanner_tasks: Vec<Task<()>>,
     update_observer: Option<UpdateObservationState>,
     fs: Arc<dyn Fs>,
+    shared_fs_store: SharedFsStore,
     fs_case_sensitive: bool,
     visible: bool,
     next_entry_id: Arc<AtomicUsize>,
     settings: WorktreeSettings,
     share_private_files: bool,
     scanning_enabled: bool,
+    track_git_repositories: bool,
     force_defer_watch: bool,
 }
 
@@ -396,12 +550,38 @@ impl Worktree {
         fs: Arc<dyn Fs>,
         next_entry_id: Arc<AtomicUsize>,
         scanning_enabled: bool,
+        track_git_repositories: bool,
+        worktree_id: WorktreeId,
+        cx: &mut AsyncApp,
+    ) -> Result<Entity<Self>> {
+        Self::local_with_shared_store(
+            path,
+            visible,
+            fs,
+            SharedFsStore::new(),
+            next_entry_id,
+            scanning_enabled,
+            track_git_repositories,
+            worktree_id,
+            cx,
+        )
+        .await
+    }
+
+    pub async fn local_with_shared_store(
+        path: impl Into<Arc<Path>>,
+        visible: bool,
+        fs: Arc<dyn Fs>,
+        shared_fs_store: SharedFsStore,
+        next_entry_id: Arc<AtomicUsize>,
+        scanning_enabled: bool,
+        track_git_repositories: bool,
         worktree_id: WorktreeId,
         cx: &mut AsyncApp,
     ) -> Result<Entity<Self>> {
         let abs_path = path.into();
-        let metadata = fs
-            .metadata(&abs_path)
+        let metadata = shared_fs_store
+            .metadata(fs.as_ref(), &abs_path)
             .await
             .context("failed to stat worktree path")?;
 
@@ -505,10 +685,12 @@ impl Worktree {
                 path_prefixes_to_scan_tx,
                 _background_scanner_tasks: Vec::new(),
                 fs,
+                shared_fs_store,
                 fs_case_sensitive,
                 visible,
                 settings,
                 scanning_enabled,
+                track_git_repositories,
                 force_defer_watch: false,
             };
             worktree.start_background_scanner(scan_requests_rx, path_prefixes_to_scan_rx, cx);
@@ -1178,9 +1360,10 @@ impl LocalWorktree {
         let share_private_files = self.share_private_files;
         let next_entry_id = self.next_entry_id.clone();
         let fs = self.fs.clone();
+        let shared_fs_store = self.shared_fs_store.clone();
         let scanning_enabled = self.scanning_enabled;
         let force_defer_watch = self.force_defer_watch;
-        let track_git_repositories = self.visible;
+        let track_git_repositories = self.track_git_repositories;
         let settings = self.settings.clone();
         let (scan_states_tx, mut scan_states_rx) = mpsc::unbounded();
         let background_scanner = cx.background_spawn({
@@ -1222,6 +1405,7 @@ impl LocalWorktree {
                     share_private_files,
                     settings,
                     watcher,
+                    shared_fs_store,
                     track_git_repositories,
                     is_single_file,
                     defer_watch,
@@ -2911,9 +3095,10 @@ impl LocalSnapshot {
 
     #[cfg(feature = "test-support")]
     pub fn expanded_entries(&self) -> impl Iterator<Item = &Entry> {
-        self.entries_by_path
-            .cursor::<()>(())
-            .filter(|entry| entry.kind == EntryKind::Dir && (entry.is_external || entry.is_ignored))
+        self.entries_by_path.cursor::<()>(()).filter(|entry| {
+            matches!(entry.kind, EntryKind::Dir | EntryKind::PartialDir)
+                && (entry.is_external || entry.is_ignored)
+        })
     }
 
     #[cfg(feature = "test-support")]
@@ -3081,10 +3266,16 @@ impl BackgroundScannerState {
         ProjectEntryId::new(next_entry_id)
     }
 
-    async fn insert_entry(&mut self, entry: Entry, fs: &dyn Fs, watcher: &dyn Watcher) -> Entry {
+    async fn insert_entry(
+        &mut self,
+        entry: Entry,
+        fs: &dyn Fs,
+        watcher: &dyn Watcher,
+        shared_fs_store: &SharedFsStore,
+    ) -> Entry {
         let entry = self.snapshot.insert_entry(entry, fs).await;
         if entry.path.file_name() == Some(&DOT_GIT) {
-            self.insert_git_repository(entry.path.clone(), fs, watcher)
+            self.insert_git_repository(entry.path.clone(), fs, watcher, shared_fs_store)
                 .await;
         }
 
@@ -3099,6 +3290,7 @@ impl BackgroundScannerState {
         parent_path: Arc<RelPath>,
         entries: impl IntoIterator<Item = Entry>,
         ignore: Option<Arc<Gitignore>>,
+        is_partial: bool,
     ) {
         let mut parent_entry = if let Some(parent_entry) = self
             .snapshot
@@ -3115,8 +3307,18 @@ impl BackgroundScannerState {
         };
 
         match parent_entry.kind {
-            EntryKind::PendingDir | EntryKind::UnloadedDir => parent_entry.kind = EntryKind::Dir,
-            EntryKind::Dir => {}
+            EntryKind::PendingDir | EntryKind::UnloadedDir | EntryKind::PartialDir => {
+                parent_entry.kind = if is_partial {
+                    EntryKind::PartialDir
+                } else {
+                    EntryKind::Dir
+                };
+            }
+            EntryKind::Dir => {
+                if is_partial {
+                    parent_entry.kind = EntryKind::PartialDir;
+                }
+            }
             _ => return,
         }
 
@@ -3302,6 +3504,7 @@ impl BackgroundScannerState {
         dot_git_path: Arc<RelPath>,
         fs: &dyn Fs,
         watcher: &dyn Watcher,
+        shared_fs_store: &SharedFsStore,
     ) {
         let work_dir_path: Arc<RelPath> = match dot_git_path.parent() {
             Some(parent_dir) => {
@@ -3337,6 +3540,7 @@ impl BackgroundScannerState {
             dot_git_abs_path,
             fs,
             watcher,
+            shared_fs_store,
         )
         .await
         .log_err();
@@ -3348,6 +3552,7 @@ impl BackgroundScannerState {
         dot_git_abs_path: Arc<Path>,
         fs: &dyn Fs,
         watcher: &dyn Watcher,
+        shared_fs_store: &SharedFsStore,
     ) -> Result<LocalRepositoryEntry> {
         let work_dir_entry = self
             .snapshot
@@ -3363,8 +3568,11 @@ impl BackgroundScannerState {
             })?;
         let work_directory_abs_path = self.snapshot.work_directory_abs_path(&work_directory);
 
-        let (repository_dir_abs_path, common_dir_abs_path) =
-            discover_git_paths(&dot_git_abs_path, fs).await;
+        let repository = shared_fs_store
+            .git_repository_descriptor(fs, work_directory_abs_path.clone(), dot_git_abs_path)
+            .await;
+        let repository_dir_abs_path = repository.repository_dir_abs_path.clone();
+        let common_dir_abs_path = repository.common_dir_abs_path.clone();
         watcher
             .add(&common_dir_abs_path)
             .context("failed to add common directory to watcher")
@@ -3389,9 +3597,9 @@ impl BackgroundScannerState {
         let local_repository = LocalRepositoryEntry {
             work_directory_id,
             work_directory,
-            work_directory_abs_path: work_directory_abs_path.as_path().into(),
+            work_directory_abs_path: repository.work_directory_abs_path.clone(),
             git_dir_scan_id: 0,
-            dot_git_abs_path,
+            dot_git_abs_path: repository.dot_git_abs_path.clone(),
             common_dir_abs_path,
             repository_dir_abs_path,
         };
@@ -3421,23 +3629,6 @@ async fn is_dot_git(path: &Path, fs: &dyn Fs) -> bool {
     }
     let config_metadata = fs.metadata(&path.join("config")).await;
     matches!(config_metadata, Ok(Some(_)))
-}
-
-async fn build_gitignore(abs_path: &Path, fs: &dyn Fs) -> Result<Gitignore> {
-    let parent = abs_path.parent().unwrap_or_else(|| Path::new("/"));
-    build_gitignore_with_root(abs_path, parent, fs).await
-}
-
-async fn build_gitignore_with_root(abs_path: &Path, root: &Path, fs: &dyn Fs) -> Result<Gitignore> {
-    let contents = fs
-        .load(abs_path)
-        .await
-        .with_context(|| format!("failed to load gitignore file at {}", abs_path.display()))?;
-    let mut builder = GitignoreBuilder::new(root);
-    for line in contents.lines() {
-        builder.add_line(Some(abs_path.into()), line)?;
-    }
-    Ok(builder.build()?)
 }
 
 impl Deref for Worktree {
@@ -3703,6 +3894,7 @@ pub struct Entry {
 pub enum EntryKind {
     UnloadedDir,
     PendingDir,
+    PartialDir,
     Dir,
     File,
 }
@@ -3876,7 +4068,7 @@ impl EntryKind {
     pub fn is_dir(&self) -> bool {
         matches!(
             self,
-            EntryKind::Dir | EntryKind::PendingDir | EntryKind::UnloadedDir
+            EntryKind::Dir | EntryKind::PendingDir | EntryKind::PartialDir | EntryKind::UnloadedDir
         )
     }
 
@@ -4040,6 +4232,7 @@ struct BackgroundScanner {
     next_entry_id: Arc<AtomicUsize>,
     phase: BackgroundScannerPhase,
     watcher: Arc<dyn Watcher>,
+    shared_fs_store: SharedFsStore,
     settings: WorktreeSettings,
     share_private_files: bool,
     track_git_repositories: bool,
@@ -4108,6 +4301,7 @@ impl BackgroundScanner {
                         ancestor_dot_git.clone().into(),
                         self.fs.as_ref(),
                         self.watcher.as_ref(),
+                        &self.shared_fs_store,
                     )
                     .await
                     .log_err()?;
@@ -4162,7 +4356,12 @@ impl BackgroundScanner {
                     let mut root_entry = root_entry.clone();
                     state.reuse_entry_id(&mut root_entry);
                     state
-                        .insert_entry(root_entry, self.fs.as_ref(), self.watcher.as_ref())
+                        .insert_entry(
+                            root_entry,
+                            self.fs.as_ref(),
+                            self.watcher.as_ref(),
+                            &self.shared_fs_store,
+                        )
                         .await;
                 }
                 if root_entry.is_dir() && state.scanning_enabled {
@@ -4667,7 +4866,7 @@ impl BackgroundScanner {
                 let parent_dir_is_loaded = relative_path.parent().is_none_or(|parent| {
                     snapshot
                         .entry_for_path(parent)
-                        .is_some_and(|entry| entry.kind == EntryKind::Dir)
+                        .is_some_and(|entry| !entry.kind.is_unloaded())
                 });
                 if !parent_dir_is_loaded {
                     log::debug!("filtering event {relative_path:?} within unloaded directory");
@@ -4953,35 +5152,42 @@ impl BackgroundScanner {
         let mut root_canonical_path = None;
         let mut new_entries: Vec<Entry> = Vec::new();
         let mut new_jobs: Vec<Option<ScanJob>> = Vec::new();
-        let mut child_paths = self
-            .fs
-            .read_dir(&job.abs_path)
-            .await?
-            .filter_map(|entry| async {
-                match entry {
-                    Ok(entry) => Some(entry),
-                    Err(error) => {
-                        log::error!("error processing entry {:?}", error);
-                        None
-                    }
-                }
-            })
-            .collect::<Vec<_>>()
-            .await;
+        let directory_entries = self
+            .shared_fs_store
+            .read_dir_limited(
+                self.fs.as_ref(),
+                &job.abs_path,
+                MAX_DIRECTORY_ENTRIES_PER_SCAN,
+            )
+            .await?;
+        let directory_entry_limit_reached = directory_entries.limit_reached;
+        let mut child_names = directory_entries
+            .child_names
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if directory_entry_limit_reached {
+            log::warn!(
+                "directory {:?} has more than {} entries; loading a partial snapshot",
+                job.abs_path,
+                MAX_DIRECTORY_ENTRIES_PER_SCAN
+            );
+        }
 
         // Ensure that .git and .gitignore are processed first.
-        swap_to_front(&mut child_paths, GITIGNORE);
-        swap_to_front(&mut child_paths, DOT_GIT);
+        swap_to_front(&mut child_names, GITIGNORE);
+        swap_to_front(&mut child_names, DOT_GIT);
 
-        if let Some(path) = child_paths.first()
+        if let Some(path) = child_names.first()
             && path.ends_with(DOT_GIT)
         {
             ignore_stack.repo_root = Some(job.abs_path.clone());
         }
 
-        for child_abs_path in child_paths {
-            let child_abs_path: Arc<Path> = child_abs_path.into();
-            let child_name = child_abs_path.file_name().unwrap();
+        for child_name in child_names {
+            let child_name = child_name.as_os_str();
+            let child_abs_path: Arc<Path> = job.abs_path.join(child_name).into();
             let Some(child_path) = child_name
                 .to_str()
                 .and_then(|name| Some(job.path.join(RelPath::unix(name).ok()?)))
@@ -4997,6 +5203,7 @@ impl BackgroundScanner {
                             child_path.clone(),
                             self.fs.as_ref(),
                             self.watcher.as_ref(),
+                            &self.shared_fs_store,
                         )
                         .await;
                 } else if child_name == GITIGNORE {
@@ -5034,7 +5241,11 @@ impl BackgroundScanner {
                 continue;
             }
 
-            let child_metadata = match self.fs.metadata(&child_abs_path).await {
+            let child_metadata = match self
+                .shared_fs_store
+                .metadata(self.fs.as_ref(), &child_abs_path)
+                .await
+            {
                 Ok(Some(metadata)) => metadata,
                 Ok(None) => continue,
                 Err(err) => {
@@ -5163,7 +5374,12 @@ impl BackgroundScanner {
             }
         }
 
-        state.populate_dir(job.path.clone(), new_entries, new_ignore);
+        state.populate_dir(
+            job.path.clone(),
+            new_entries,
+            new_ignore,
+            directory_entry_limit_reached,
+        );
         // For external entries, watch the canonical (resolved) path so OS-level
         // FS events on the real filesystem location are observed. The same
         // canonical path is stored in both `external_canonical_to_relative`
@@ -5227,12 +5443,19 @@ impl BackgroundScanner {
         abs_paths: Vec<PathBuf>,
         scan_queue_tx: Option<Sender<ScanJob>>,
     ) {
+        for abs_path in &abs_paths {
+            self.shared_fs_store.invalidate_path(abs_path);
+        }
+
         // grab metadata for all requested paths
         let metadata = futures::future::join_all(
             abs_paths
                 .iter()
                 .map(|abs_path| async move {
-                    let metadata = self.fs.metadata(abs_path).await?;
+                    let metadata = self
+                        .shared_fs_store
+                        .metadata(self.fs.as_ref(), abs_path)
+                        .await?;
                     if let Some(metadata) = metadata {
                         let canonical_path = self.fs.canonicalize(abs_path).await?;
 
@@ -5333,7 +5556,12 @@ impl BackgroundScanner {
                     }
 
                     state
-                        .insert_entry(fs_entry.clone(), self.fs.as_ref(), self.watcher.as_ref())
+                        .insert_entry(
+                            fs_entry.clone(),
+                            self.fs.as_ref(),
+                            self.watcher.as_ref(),
+                            &self.shared_fs_store,
+                        )
                         .await;
 
                     if path.is_empty()
@@ -5357,6 +5585,7 @@ impl BackgroundScanner {
                                     ancestor_dot_git.into(),
                                     self.fs.as_ref(),
                                     self.watcher.as_ref(),
+                                    &self.shared_fs_store,
                                 )
                                 .await
                                 .log_err();
@@ -5712,6 +5941,7 @@ impl BackgroundScanner {
                                 .into_arc(),
                             self.fs.as_ref(),
                             self.watcher.as_ref(),
+                            &self.shared_fs_store,
                         )
                         .await;
                 }
@@ -5795,7 +6025,7 @@ impl BackgroundScanner {
             && (!entry.is_ignored || entry.is_always_included);
 
         scannable
-            || entry.path.file_name() == Some(DOT_GIT)
+            || (state.scanning_enabled && entry.path.file_name() == Some(DOT_GIT))
             || entry.path.file_name() == Some(local_settings_folder_name())
             || entry.path.file_name() == Some(local_vscode_folder_name())
             || state.scanned_dirs.contains(&entry.id) // If we've ever scanned it, keep scanning
@@ -6628,6 +6858,89 @@ pub async fn discover_root_repo_common_dir(root_abs_path: &Path, fs: &dyn Fs) ->
     let dot_git_path: Arc<Path> = root_dot_git.into();
     let (_, common_dir) = discover_git_paths(&dot_git_path, fs).await;
     Some(common_dir)
+}
+
+pub async fn initial_ignore_stack_for_abs_path(
+    fs: Arc<dyn Fs>,
+    abs_path: &Path,
+    is_dir: bool,
+) -> IgnoreStack {
+    let global_gitignore = if let Some(global_gitignore_path) = paths::global_gitignore_path()
+        && fs.is_file(&global_gitignore_path).await
+    {
+        build_gitignore(&global_gitignore_path, fs.as_ref())
+            .await
+            .ok()
+            .map(Arc::new)
+    } else {
+        None
+    };
+
+    let mut ancestor_ignores = Vec::new();
+    let mut repo_root = None;
+    let mut repo_exclude = None;
+    for (index, ancestor) in abs_path.ancestors().enumerate() {
+        if index != 0 {
+            if ancestor == paths::home_dir() {
+                break;
+            }
+
+            if let Ok(ignore) = build_gitignore(&ancestor.join(GITIGNORE), fs.as_ref()).await {
+                ancestor_ignores.push((Arc::<Path>::from(ancestor), Arc::new(ignore)));
+            }
+        }
+
+        let ancestor_dot_git = ancestor.join(DOT_GIT);
+        if fs
+            .metadata(&ancestor_dot_git)
+            .await
+            .is_ok_and(|metadata| metadata.is_some())
+        {
+            let dot_git_abs_path = if index != 0 {
+                match fs.canonicalize(&ancestor_dot_git).await.log_err() {
+                    Some(path) => path,
+                    None => continue,
+                }
+            } else {
+                ancestor_dot_git.clone()
+            };
+            let dot_git_abs_path: Arc<Path> = dot_git_abs_path.as_path().into();
+            let (_, common_dir_abs_path) = discover_git_paths(&dot_git_abs_path, fs.as_ref()).await;
+            let repo_exclude_abs_path = common_dir_abs_path.join(REPO_EXCLUDE);
+            if let Ok(exclude) =
+                build_gitignore_with_root(&repo_exclude_abs_path, ancestor, fs.as_ref()).await
+            {
+                repo_exclude = Some(Arc::new(exclude));
+            }
+            repo_root = Some(Arc::<Path>::from(ancestor));
+            break;
+        }
+    }
+
+    let mut ignore_stack = if let Some(global_gitignore) = global_gitignore {
+        IgnoreStack::global(global_gitignore)
+    } else {
+        IgnoreStack::none()
+    };
+
+    if let Some(repo_exclude) = repo_exclude {
+        ignore_stack = ignore_stack.append(IgnoreKind::RepoExclude, repo_exclude);
+    }
+    ignore_stack.repo_root = repo_root;
+
+    for (parent_abs_path, ignore) in ancestor_ignores.into_iter().rev() {
+        if ignore_stack.is_abs_path_ignored(&parent_abs_path, true) {
+            ignore_stack = IgnoreStack::all();
+            break;
+        }
+        ignore_stack = ignore_stack.append(IgnoreKind::Gitignore(parent_abs_path), ignore);
+    }
+
+    if ignore_stack.is_abs_path_ignored(abs_path, is_dir) {
+        ignore_stack = IgnoreStack::all();
+    }
+
+    ignore_stack
 }
 
 async fn discover_git_paths(dot_git_abs_path: &Arc<Path>, fs: &dyn Fs) -> (Arc<Path>, Arc<Path>) {

@@ -1,7 +1,7 @@
 use super::{SerializedAxis, SerializedWindowBounds};
 use crate::{
     Member, Pane, PaneAxis, PaneKind, SerializableItemRegistry, Workspace, WorkspaceId,
-    item::ItemHandle, multi_workspace::SerializedProjectGroupState, path_list::PathList,
+    item::ItemHandle, path_list::PathList,
 };
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
@@ -13,18 +13,15 @@ use db::sqlez::{
 use gpui::{AsyncWindowContext, Entity, WeakEntity, WindowId};
 
 use language::{Toolchain, ToolchainScope};
-use project::{
-    Project, ProjectGroupKey, bookmark_store::SerializedBookmark,
-    debugger::breakpoint_store::SourceBreakpoint,
-};
+use project::{Project, bookmark_store::SerializedBookmark, debugger::breakpoint_store::SourceBreakpoint};
 use remote::RemoteConnectionOptions;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
-use util::{ResultExt, path_list::SerializedPathList};
+use util::ResultExt;
 use uuid::Uuid;
 
 #[derive(
@@ -62,66 +59,101 @@ pub struct SessionWorkspace {
     pub window_id: Option<WindowId>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SerializedProjectGroup {
-    pub path_list: SerializedPathList,
-    pub(crate) location: SerializedWorkspaceLocation,
-    #[serde(default = "default_expanded")]
-    pub expanded: bool,
-}
-
-fn default_expanded() -> bool {
-    true
-}
-
-impl SerializedProjectGroup {
-    pub fn from_group(key: &ProjectGroupKey, expanded: bool) -> Self {
-        Self {
-            path_list: key.path_list().serialize(),
-            location: match key.host() {
-                Some(host) => SerializedWorkspaceLocation::Remote(host),
-                None => SerializedWorkspaceLocation::Local,
-            },
-            expanded,
-        }
-    }
-
-    pub fn into_restored_state(self) -> SerializedProjectGroupState {
-        let path_list = PathList::deserialize(&self.path_list);
-        let host = match self.location {
-            SerializedWorkspaceLocation::Local => None,
-            SerializedWorkspaceLocation::Remote(opts) => Some(opts),
-        };
-        SerializedProjectGroupState {
-            key: ProjectGroupKey::new(host, path_list),
-            expanded: self.expanded,
-        }
-    }
-}
-
-impl From<SerializedProjectGroup> for ProjectGroupKey {
-    fn from(value: SerializedProjectGroup) -> Self {
-        value.into_restored_state().key
-    }
-}
-
 /// Per-window state for a MultiWorkspace, persisted to KVP.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MultiWorkspaceState {
     pub active_workspace_id: Option<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_ids: Vec<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_workspace_ids: Vec<WorkspaceId>,
     pub sidebar_open: bool,
-    #[serde(alias = "project_group_keys")]
-    pub project_groups: Vec<SerializedProjectGroup>,
     #[serde(default)]
     pub sidebar_state: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AppSessionState {
+    pub active_workspace_id: Option<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_ids: Vec<WorkspaceId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_workspace_ids: Vec<WorkspaceId>,
+    pub sidebar_open: bool,
+    #[serde(default)]
+    pub sidebar_state: Option<String>,
+}
+
+impl AppSessionState {
+    pub fn normalized(mut self) -> Self {
+        self.normalize();
+        self
+    }
+
+    pub fn normalize(&mut self) {
+        let mut workspace_ids = BTreeSet::new();
+        self.workspace_ids.retain(|id| workspace_ids.insert(*id));
+
+        let mut unresolved_workspace_ids = BTreeSet::new();
+        self.unresolved_workspace_ids
+            .retain(|id| !workspace_ids.contains(id) && unresolved_workspace_ids.insert(*id));
+
+        if let Some(active_workspace_id) = self.active_workspace_id
+            && !workspace_ids.contains(&active_workspace_id)
+            && !unresolved_workspace_ids.contains(&active_workspace_id)
+        {
+            self.workspace_ids.insert(0, active_workspace_id);
+        }
+    }
+
+    pub fn protected_workspace_ids(&self) -> Vec<WorkspaceId> {
+        let mut protected = Vec::new();
+        let mut seen = BTreeSet::new();
+        for workspace_id in self
+            .active_workspace_id
+            .into_iter()
+            .chain(self.workspace_ids.iter().copied())
+            .chain(self.unresolved_workspace_ids.iter().copied())
+        {
+            if seen.insert(workspace_id) {
+                protected.push(workspace_id);
+            }
+        }
+        protected
+    }
+}
+
+impl From<MultiWorkspaceState> for AppSessionState {
+    fn from(state: MultiWorkspaceState) -> Self {
+        Self {
+            active_workspace_id: state.active_workspace_id,
+            workspace_ids: state.workspace_ids,
+            unresolved_workspace_ids: state.unresolved_workspace_ids,
+            sidebar_open: state.sidebar_open,
+            sidebar_state: state.sidebar_state,
+        }
+        .normalized()
+    }
+}
+
+impl From<AppSessionState> for MultiWorkspaceState {
+    fn from(state: AppSessionState) -> Self {
+        Self {
+            active_workspace_id: state.active_workspace_id,
+            workspace_ids: state.workspace_ids,
+            unresolved_workspace_ids: state.unresolved_workspace_ids,
+            sidebar_open: state.sidebar_open,
+            sidebar_state: state.sidebar_state,
+        }
+    }
+}
+
 /// The serialized state of a single MultiWorkspace window from a previous session:
-/// the active workspace to restore plus window-level state (project group keys,
-/// sidebar).
+/// the active workspace to restore plus window-level sidebar state.
 #[derive(Debug, Clone)]
 pub struct SerializedMultiWorkspace {
     pub active_workspace: SessionWorkspace,
+    pub workspaces: Vec<SessionWorkspace>,
     pub state: MultiWorkspaceState,
 }
 

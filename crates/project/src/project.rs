@@ -53,7 +53,7 @@ pub use git_store::{
 };
 pub use manifest_tree::ManifestTree;
 pub use project_search::{Search, SearchResults};
-pub use worktree_store::WorktreePaths;
+pub use worktree_store::{WorktreeLoadBehavior, WorktreePaths};
 
 use anyhow::{Context as _, Result, anyhow};
 use buffer_store::{BufferStore, BufferStoreEvent};
@@ -251,6 +251,8 @@ pub struct Project {
     agent_location: Option<AgentLocation>,
     downloading_files: Arc<Mutex<HashMap<(WorktreeId, String), DownloadingFile>>>,
     last_worktree_paths: WorktreePaths,
+    workspace_visible_worktree_ids: Option<Vec<WorktreeId>>,
+    workspace_active_repository_id: Option<RepositoryId>,
 }
 
 struct DownloadingFile {
@@ -369,6 +371,7 @@ pub enum Event {
     WorktreePathsChanged {
         old_worktree_paths: WorktreePaths,
     },
+    ActiveRepositoryChanged(Option<RepositoryId>),
     DiskBasedDiagnosticsStarted {
         language_server_id: LanguageServerId,
     },
@@ -1372,6 +1375,118 @@ impl Project {
                 agent_location: None,
                 downloading_files: Default::default(),
                 last_worktree_paths: WorktreePaths::default(),
+                workspace_visible_worktree_ids: None,
+                workspace_active_repository_id: None,
+            }
+        })
+    }
+
+    pub fn local_workspace_context(shared_project: Entity<Self>, cx: &mut App) -> Entity<Self> {
+        let (
+            languages,
+            collab_client,
+            user_store,
+            fs,
+            node,
+            worktree_store,
+            buffer_store,
+            image_store,
+            lsp_store,
+            context_server_store,
+            bookmark_store,
+            breakpoint_store,
+            dap_store,
+            git_store,
+            agent_server_store,
+            task_store,
+            settings_observer,
+            snippets,
+            environment,
+            toolchain_store,
+        ) = shared_project.read_with(cx, |project, _| {
+            (
+                project.languages.clone(),
+                project.collab_client.clone(),
+                project.user_store.clone(),
+                project.fs.clone(),
+                project.node.clone(),
+                project.worktree_store.clone(),
+                project.buffer_store.clone(),
+                project.image_store.clone(),
+                project.lsp_store.clone(),
+                project.context_server_store.clone(),
+                project.bookmark_store.clone(),
+                project.breakpoint_store.clone(),
+                project.dap_store.clone(),
+                project.git_store.clone(),
+                project.agent_server_store.clone(),
+                project.task_store.clone(),
+                project.settings_observer.clone(),
+                project.snippets.clone(),
+                project.environment.clone(),
+                project.toolchain_store.clone(),
+            )
+        });
+
+        cx.new(|cx: &mut Context<Self>| {
+            let (tx, rx) = mpsc::unbounded();
+            cx.spawn(async move |this, cx| Self::send_buffer_ordered_messages(this, rx, cx).await)
+                .detach();
+
+            cx.subscribe(&worktree_store, Self::on_worktree_store_event)
+                .detach();
+            cx.subscribe(&buffer_store, Self::on_buffer_store_event)
+                .detach();
+            cx.subscribe(&image_store, Self::on_image_store_event)
+                .detach();
+            cx.subscribe(&lsp_store, Self::on_lsp_store_event).detach();
+            cx.subscribe(&settings_observer, Self::on_settings_observer_event)
+                .detach();
+            cx.subscribe(&dap_store, Self::on_dap_store_event).detach();
+
+            Self {
+                buffer_ordered_messages_tx: tx,
+                collaborators: Default::default(),
+                worktree_store,
+                buffer_store,
+                image_store,
+                lsp_store,
+                context_server_store,
+                join_project_response_message_id: 0,
+                client_state: ProjectClientState::Local,
+                git_store,
+                client_subscriptions: Vec::new(),
+                _subscriptions: vec![cx.on_release(Self::release)],
+                active_entry: None,
+                snippets,
+                languages,
+                collab_client,
+                task_store,
+                user_store,
+                settings_observer,
+                fs,
+                remote_client: None,
+                bookmark_store,
+                breakpoint_store,
+                dap_store,
+                agent_server_store,
+                buffers_needing_diff: Default::default(),
+                git_diff_debouncer: DebouncedDelay::new(),
+                terminals: Terminals {
+                    local_handles: Vec::new(),
+                },
+                node,
+                search_history: Self::new_search_history(),
+                environment,
+                remotely_created_models: Default::default(),
+                search_included_history: Self::new_search_history(),
+                search_excluded_history: Self::new_search_history(),
+                toolchain_store,
+                agent_location: None,
+                downloading_files: Default::default(),
+                last_worktree_paths: WorktreePaths::default(),
+                workspace_visible_worktree_ids: Some(Vec::new()),
+                workspace_active_repository_id: None,
             }
         })
     }
@@ -1614,6 +1729,8 @@ impl Project {
                 agent_location: None,
                 downloading_files: Default::default(),
                 last_worktree_paths: WorktreePaths::default(),
+                workspace_visible_worktree_ids: None,
+                workspace_active_repository_id: None,
             };
 
             // remote server -> local machine handlers
@@ -1902,6 +2019,8 @@ impl Project {
                 agent_location: None,
                 downloading_files: Default::default(),
                 last_worktree_paths: WorktreePaths::default(),
+                workspace_visible_worktree_ids: None,
+                workspace_active_repository_id: None,
             };
             project.set_role(role, cx);
             for worktree in worktrees {
@@ -2041,7 +2160,7 @@ impl Project {
         for path in root_paths {
             let (tree, _): (Entity<Worktree>, _) = project
                 .update(cx, |project, cx| {
-                    project.find_or_create_worktree(path, true, cx)
+                    project.find_or_create_worktree_recursive(path, true, cx)
                 })
                 .await
                 .unwrap();
@@ -2101,7 +2220,7 @@ impl Project {
         for path in root_paths {
             let (tree, _) = project
                 .update(cx, |project, cx| {
-                    project.find_or_create_worktree(path, true, cx)
+                    project.find_or_create_worktree_recursive(path, true, cx)
                 })
                 .await
                 .unwrap();
@@ -2163,6 +2282,20 @@ impl Project {
         self.dap_store.clone()
     }
 
+    pub fn debug_sessions(&self, cx: &App) -> Vec<Entity<Session>> {
+        self.dap_store
+            .read(cx)
+            .sessions()
+            .filter(|session| {
+                session
+                    .read(cx)
+                    .worktree()
+                    .is_some_and(|worktree| self.worktree_id_is_visible(worktree.read(cx).id()))
+            })
+            .cloned()
+            .collect()
+    }
+
     #[inline]
     pub fn bookmark_store(&self) -> Entity<BookmarkStore> {
         self.bookmark_store.clone()
@@ -2192,10 +2325,20 @@ impl Project {
         self.worktree_store.clone()
     }
 
-    /// Returns a future that resolves when all visible worktrees have completed
-    /// their initial scan.
+    /// Returns a future that resolves when this project's visible worktrees
+    /// have completed their initial scan.
     pub fn wait_for_initial_scan(&self, cx: &App) -> impl Future<Output = ()> + use<> {
-        self.worktree_store.read(cx).wait_for_initial_scan()
+        let visible_worktrees_scanned = self
+            .visible_worktrees(cx)
+            .all(|worktree| worktree.read(cx).completed_scan_id() >= 1);
+        let wait_for_shared_scan = (!visible_worktrees_scanned)
+            .then(|| self.worktree_store.read(cx).wait_for_initial_scan());
+
+        async move {
+            if let Some(wait_for_shared_scan) = wait_for_shared_scan {
+                wait_for_shared_scan.await;
+            }
+        }
     }
 
     #[inline]
@@ -2235,7 +2378,18 @@ impl Project {
 
     #[inline]
     pub fn opened_buffers(&self, cx: &App) -> Vec<Entity<Buffer>> {
-        self.buffer_store.read(cx).buffers().collect()
+        self.buffer_store
+            .read(cx)
+            .buffers()
+            .filter(|buffer| {
+                buffer
+                    .read(cx)
+                    .file()
+                    .map_or(!self.is_workspace_scoped(), |file| {
+                        self.worktree_id_is_visible(file.worktree_id(cx))
+                    })
+            })
+            .collect()
     }
 
     #[inline]
@@ -2375,13 +2529,30 @@ impl Project {
         self.collaborators.values().find(|c| c.is_host)
     }
 
-    /// Collect all worktrees, including ones that don't appear in the project panel
+    fn is_workspace_scoped(&self) -> bool {
+        self.workspace_visible_worktree_ids.is_some()
+    }
+
+    fn worktree_id_is_visible(&self, worktree_id: WorktreeId) -> bool {
+        self.workspace_visible_worktree_ids
+            .as_ref()
+            .is_none_or(|visible_worktree_ids| visible_worktree_ids.contains(&worktree_id))
+    }
+
+    fn project_path_is_visible(&self, path: &ProjectPath) -> bool {
+        self.worktree_id_is_visible(path.worktree_id)
+    }
+
+    /// Collect all worktrees in this project context.
     #[inline]
     pub fn worktrees<'a>(
-        &self,
+        &'a self,
         cx: &'a App,
     ) -> impl 'a + DoubleEndedIterator<Item = Entity<Worktree>> {
-        self.worktree_store.read(cx).worktrees()
+        self.worktree_store
+            .read(cx)
+            .worktrees()
+            .filter(move |worktree| self.worktree_id_is_visible(worktree.read(cx).id()))
     }
 
     /// Collect all user-visible worktrees, the ones that appear in the project panel.
@@ -2390,7 +2561,12 @@ impl Project {
         &'a self,
         cx: &'a App,
     ) -> impl 'a + DoubleEndedIterator<Item = Entity<Worktree>> {
-        self.worktree_store.read(cx).visible_worktrees(cx)
+        self.worktree_store
+            .read(cx)
+            .visible_worktrees(cx)
+            .filter(move |worktree| {
+                self.worktree_id_is_visible(worktree.read(cx).id())
+            })
     }
 
     pub(crate) fn default_visible_worktree_paths(
@@ -2417,14 +2593,24 @@ impl Project {
     }
 
     pub fn default_path_list(&self, cx: &App) -> PathList {
-        let worktree_roots =
-            Self::default_visible_worktree_paths(&self.worktree_store.read(cx), cx);
-
-        if worktree_roots.is_empty() {
-            PathList::new(&[paths::home_dir().as_path()])
-        } else {
-            PathList::new(&worktree_roots)
-        }
+        let worktree_roots = self
+            .visible_worktrees(cx)
+            .sorted_by(|left, right| {
+                left.read(cx)
+                    .is_single_file()
+                    .cmp(&right.read(cx).is_single_file())
+            })
+            .filter_map(|worktree| {
+                let worktree = worktree.read(cx);
+                let path = worktree.abs_path();
+                if worktree.is_single_file() {
+                    Some(path.parent()?.to_path_buf())
+                } else {
+                    Some(path.to_path_buf())
+                }
+            })
+            .collect::<Vec<_>>();
+        PathList::new(&worktree_roots)
     }
 
     #[inline]
@@ -2438,6 +2624,34 @@ impl Project {
         if new_worktree_paths != self.last_worktree_paths {
             let old_worktree_paths =
                 std::mem::replace(&mut self.last_worktree_paths, new_worktree_paths);
+            cx.emit(Event::WorktreePathsChanged { old_worktree_paths });
+        }
+    }
+
+    pub fn set_visible_worktree_ids(
+        &mut self,
+        visible_worktree_ids: Vec<WorktreeId>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_visible_worktree_ids.as_deref() == Some(visible_worktree_ids.as_slice()) {
+            return;
+        }
+
+        let old_worktree_paths = self.worktree_paths(cx);
+        self.workspace_visible_worktree_ids = Some(visible_worktree_ids);
+
+        if let Some(active_repository_id) = self.workspace_active_repository_id
+            && self
+                .repository_for_id(active_repository_id, cx)
+                .is_none_or(|repository| !self.repository_is_visible(&repository, cx))
+        {
+            self.workspace_active_repository_id = None;
+            cx.emit(Event::ActiveRepositoryChanged(None));
+        }
+
+        let new_worktree_paths = self.worktree_paths(cx);
+        if new_worktree_paths != old_worktree_paths {
+            self.last_worktree_paths = new_worktree_paths;
             cx.emit(Event::WorktreePathsChanged { old_worktree_paths });
         }
     }
@@ -2515,7 +2729,7 @@ impl Project {
     ) -> Option<bool> {
         let path = SanitizedPath::new(path).as_path();
         let path_style = self.path_style(cx);
-        self.worktrees(cx)
+        self.visible_worktrees(cx)
             .filter_map(|worktree| {
                 let worktree = worktree.read(cx);
                 let abs_path = worktree.abs_path();
@@ -4136,7 +4350,14 @@ impl Project {
         &'a self,
         cx: &'a App,
     ) -> impl DoubleEndedIterator<Item = (LanguageServerId, &'a LanguageServerStatus)> {
-        self.lsp_store.read(cx).language_server_statuses()
+        self.lsp_store
+            .read(cx)
+            .language_server_statuses()
+            .filter(move |(_, status)| {
+                self.workspace_visible_worktree_ids
+                    .as_ref()
+                    .is_none_or(|_| status.worktree.is_some_and(|id| self.worktree_id_is_visible(id)))
+            })
     }
 
     pub fn last_formatting_failure<'a>(&self, cx: &'a App) -> Option<&'a str> {
@@ -4580,12 +4801,12 @@ impl Project {
                     project_search::Search::MAX_SEARCH_RESULT_FILES + 1,
                     (client, remote_id, self.remotely_created_models.clone()),
                 ),
-                None => project_search::Search::local(
+                None => project_search::Search::local_for_worktrees(
                     self.fs.clone(),
                     self.buffer_store.clone(),
                     self.worktree_store.clone(),
+                    self.visible_worktrees(cx).collect(),
                     project_search::Search::MAX_SEARCH_RESULT_FILES + 1,
-                    cx,
                 ),
             }
         };
@@ -4598,6 +4819,33 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> SearchResults<SearchResult> {
         self.search_impl(query, cx).results(cx)
+    }
+
+    pub fn search_worktrees(
+        &mut self,
+        query: SearchQuery,
+        worktrees: Vec<Entity<Worktree>>,
+        cx: &mut Context<Self>,
+    ) -> SearchResults<SearchResult> {
+        if query.is_opened_only() {
+            return project_search::Search::open_buffers_only(
+                self.buffer_store.clone(),
+                self.worktree_store.clone(),
+                project_search::Search::MAX_SEARCH_RESULT_FILES + 1,
+            )
+            .into_handle(query, cx)
+            .results(cx);
+        }
+
+        project_search::Search::local_for_worktrees(
+            self.fs.clone(),
+            self.buffer_store.clone(),
+            self.worktree_store.clone(),
+            worktrees,
+            project_search::Search::MAX_SEARCH_RESULT_FILES + 1,
+        )
+        .into_handle(query, cx)
+        .results(cx)
     }
 
     pub fn request_lsp<R: LspCommand>(
@@ -4681,6 +4929,65 @@ impl Project {
     ) -> Task<Result<(Entity<Worktree>, Arc<RelPath>)>> {
         self.worktree_store.update(cx, |worktree_store, cx| {
             worktree_store.find_or_create_worktree(abs_path, visible, cx)
+        })
+    }
+
+    pub fn find_or_create_worktree_with_behavior(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        visible: bool,
+        load_behavior: WorktreeLoadBehavior,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(Entity<Worktree>, Arc<RelPath>)>> {
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.find_or_create_worktree_with_behavior(
+                abs_path,
+                visible,
+                load_behavior,
+                cx,
+            )
+        })
+    }
+
+    pub fn find_or_create_worktree_recursive(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(Entity<Worktree>, Arc<RelPath>)>> {
+        self.find_or_create_worktree_with_behavior(
+            abs_path,
+            visible,
+            WorktreeLoadBehavior::Recursive,
+            cx,
+        )
+    }
+
+    pub fn find_or_create_worktree_root(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Worktree>>> {
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.find_or_create_worktree_root(abs_path, visible, cx)
+        })
+    }
+
+    pub fn find_or_create_worktree_root_with_behavior(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        visible: bool,
+        load_behavior: WorktreeLoadBehavior,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Worktree>>> {
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.find_or_create_worktree_root_with_behavior(
+                abs_path,
+                visible,
+                load_behavior,
+                cx,
+            )
         })
     }
 
@@ -4967,17 +5274,32 @@ impl Project {
     ) -> impl Iterator<Item = LanguageServerId> + 'a {
         self.lsp_store
             .read(cx)
-            .language_servers_running_disk_based_diagnostics()
+            .language_server_statuses()
+            .filter(move |(_, status)| {
+                status.has_pending_diagnostic_updates
+                    && self
+                        .workspace_visible_worktree_ids
+                        .as_ref()
+                        .is_none_or(|_| status.worktree.is_some_and(|id| self.worktree_id_is_visible(id)))
+            })
+            .map(|(server_id, _)| server_id)
     }
 
     pub fn diagnostic_summary(&self, include_ignored: bool, cx: &App) -> DiagnosticSummary {
-        self.lsp_store
-            .read(cx)
-            .diagnostic_summary(include_ignored, cx)
+        let mut summary = DiagnosticSummary::default();
+        for (_, _, path_summary) in self.diagnostic_summaries(include_ignored, cx) {
+            summary.error_count += path_summary.error_count;
+            summary.warning_count += path_summary.warning_count;
+        }
+        summary
     }
 
     /// Returns a summary of the diagnostics for the provided project path only.
     pub fn diagnostic_summary_for_path(&self, path: &ProjectPath, cx: &App) -> DiagnosticSummary {
+        if !self.project_path_is_visible(path) {
+            return DiagnosticSummary::default();
+        }
+
         self.lsp_store
             .read(cx)
             .diagnostic_summary_for_path(path, cx)
@@ -4991,6 +5313,7 @@ impl Project {
         self.lsp_store
             .read(cx)
             .diagnostic_summaries(include_ignored, cx)
+            .filter(move |(path, _, _)| self.project_path_is_visible(path))
     }
 
     pub fn active_entry(&self) -> Option<ProjectEntryId> {
@@ -6064,23 +6387,26 @@ impl Project {
         let Some(language) = buffer.language().cloned() else {
             return false;
         };
-        self.lsp_store.update(cx, |lsp_store, _| {
-            let relevant_language_servers = lsp_store
-                .languages
-                .lsp_adapters(&language.name())
-                .into_iter()
-                .map(|lsp_adapter| lsp_adapter.name())
-                .collect::<HashSet<_>>();
-            lsp_store
-                .language_server_statuses()
-                .filter_map(|(server_id, server_status)| {
-                    relevant_language_servers
-                        .contains(&server_status.name)
-                        .then_some(server_id)
-                })
-                .filter_map(|server_id| lsp_store.lsp_server_capabilities.get(&server_id))
-                .any(InlayHints::check_capabilities)
-        })
+        let lsp_store = self.lsp_store.read(cx);
+        let relevant_language_servers = lsp_store
+            .languages
+            .lsp_adapters(&language.name())
+            .into_iter()
+            .map(|lsp_adapter| lsp_adapter.name())
+            .collect::<HashSet<_>>();
+        lsp_store
+            .language_server_statuses()
+            .filter_map(|(server_id, server_status)| {
+                let is_visible = self.workspace_visible_worktree_ids.as_ref().is_none_or(|_| {
+                    server_status
+                        .worktree
+                        .is_some_and(|id| self.worktree_id_is_visible(id))
+                });
+                (relevant_language_servers.contains(&server_status.name) && is_visible)
+                    .then_some(server_id)
+            })
+            .filter_map(|server_id| lsp_store.lsp_server_capabilities.get(&server_id))
+            .any(InlayHints::check_capabilities)
     }
 
     pub fn any_language_server_supports_semantic_tokens(
@@ -6101,8 +6427,12 @@ impl Project {
         lsp_store
             .language_server_statuses()
             .filter_map(|(server_id, server_status)| {
-                relevant_language_servers
-                    .contains(&server_status.name)
+                let is_visible = self.workspace_visible_worktree_ids.as_ref().is_none_or(|_| {
+                    server_status
+                        .worktree
+                        .is_some_and(|id| self.worktree_id_is_visible(id))
+                });
+                (relevant_language_servers.contains(&server_status.name) && is_visible)
                     .then_some(server_id)
             })
             .filter_map(|server_id| lsp_store.lsp_server_capabilities.get(&server_id))
@@ -6198,11 +6528,118 @@ impl Project {
     }
 
     pub fn active_repository(&self, cx: &App) -> Option<Entity<Repository>> {
-        self.git_store.read(cx).active_repository()
+        if let Some(active_repository_id) = self.workspace_active_repository_id
+            && let Some(repository) = self.repository_for_id(active_repository_id, cx)
+            && self.repository_is_visible(&repository, cx)
+        {
+            return Some(repository);
+        }
+
+        self.visible_repositories(cx).into_iter().next()
     }
 
-    pub fn repositories<'a>(&self, cx: &'a App) -> &'a HashMap<RepositoryId, Entity<Repository>> {
+    pub fn repositories(&self, cx: &App) -> HashMap<RepositoryId, Entity<Repository>> {
+        self.git_store
+            .read(cx)
+            .repositories()
+            .iter()
+            .filter(|(_, repository)| self.repository_is_visible(repository, cx))
+            .map(|(id, repository)| (*id, repository.clone()))
+            .collect()
+    }
+
+    pub fn shared_repositories<'a>(
+        &self,
+        cx: &'a App,
+    ) -> &'a HashMap<RepositoryId, Entity<Repository>> {
         self.git_store.read(cx).repositories()
+    }
+
+    pub fn visible_repositories(&self, cx: &App) -> Vec<Entity<Repository>> {
+        let mut repositories = self
+            .repositories(cx)
+            .into_values()
+            .collect::<Vec<_>>();
+        repositories.sort_by(|left, right| {
+            left.read(cx)
+                .work_directory_abs_path
+                .cmp(&right.read(cx).work_directory_abs_path)
+        });
+        repositories
+    }
+
+    pub fn repository_for_id(
+        &self,
+        repository_id: RepositoryId,
+        cx: &App,
+    ) -> Option<Entity<Repository>> {
+        self.git_store
+            .read(cx)
+            .repositories()
+            .get(&repository_id)
+            .cloned()
+            .filter(|repository| self.repository_is_visible(repository, cx))
+    }
+
+    pub fn set_active_repository_id(
+        &mut self,
+        repository_id: Option<RepositoryId>,
+        cx: &mut Context<Self>,
+    ) {
+        let repository_id = repository_id.filter(|repository_id| {
+            self.repository_for_id(*repository_id, cx)
+                .is_some_and(|repository| self.repository_is_visible(&repository, cx))
+        });
+
+        if self.workspace_active_repository_id != repository_id {
+            self.workspace_active_repository_id = repository_id;
+            cx.emit(Event::ActiveRepositoryChanged(repository_id));
+        }
+    }
+
+    pub fn set_active_repo_for_path(&mut self, project_path: &ProjectPath, cx: &mut Context<Self>) {
+        let repository_id = self
+            .git_store
+            .read(cx)
+            .repository_and_path_for_project_path(project_path, cx)
+            .map(|(repository, _)| repository.read(cx).id);
+        self.set_active_repository_id(repository_id, cx);
+    }
+
+    pub fn set_active_repo_for_worktree(
+        &mut self,
+        worktree_id: WorktreeId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(worktree) = self.worktree_for_id(worktree_id, cx) else {
+            return;
+        };
+        let worktree_abs_path = worktree.read(cx).abs_path();
+        let repository_id = self
+            .visible_repositories(cx)
+            .into_iter()
+            .filter(|repository| {
+                let repository_path = &repository.read(cx).work_directory_abs_path;
+                worktree_abs_path.starts_with(repository_path.as_ref())
+            })
+            .max_by_key(|repository| {
+                repository
+                    .read(cx)
+                    .work_directory_abs_path
+                    .as_os_str()
+                    .len()
+            })
+            .map(|repository| repository.read(cx).id);
+        self.set_active_repository_id(repository_id, cx);
+    }
+
+    fn repository_is_visible(&self, repository: &Entity<Repository>, cx: &App) -> bool {
+        let repository_path = repository.read(cx).work_directory_abs_path.clone();
+        self.visible_worktrees(cx).any(|worktree| {
+            let worktree_path = worktree.read(cx).abs_path();
+            worktree_path.starts_with(repository_path.as_ref())
+                || repository_path.starts_with(worktree_path.as_ref())
+        })
     }
 
     pub fn status_for_buffer_id(&self, buffer_id: BufferId, cx: &App) -> Option<FileStatus> {
@@ -6266,7 +6703,25 @@ impl Project {
     }
 
     pub fn worktree_paths(&self, cx: &App) -> WorktreePaths {
-        self.worktree_store.read(cx).paths(cx)
+        let (mains, folders): (Vec<PathBuf>, Vec<PathBuf>) = self
+            .visible_worktrees(cx)
+            .map(|worktree| {
+                let snapshot = worktree.read(cx).snapshot();
+                let folder_path = snapshot.abs_path().to_path_buf();
+                let main_path = snapshot
+                    .root_repo_common_dir()
+                    .map(|dir| crate::git_store::repo_identity_path(dir))
+                    .filter(|repo_path| {
+                        *repo_path == folder_path.as_path() || !folder_path.starts_with(*repo_path)
+                    })
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| folder_path.clone());
+                (main_path, folder_path)
+            })
+            .unzip();
+
+        WorktreePaths::from_path_lists(PathList::new(&mains), PathList::new(&folders))
+            .unwrap_or_default()
     }
 
     pub fn project_group_key(&self, cx: &App) -> ProjectGroupKey {

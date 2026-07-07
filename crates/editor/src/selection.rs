@@ -1679,10 +1679,7 @@ impl Editor {
                 data.selections = inmemory_selections;
             });
 
-            if WorkspaceSettings::get(None, cx).restore_on_startup
-                != RestoreOnStartupBehavior::EmptyTab
-                && let Some(workspace_id) = self.workspace_serialization_id(cx)
-            {
+            if let Some(workspace_id) = self.workspace_serialization_id(cx) {
                 let snapshot = self.buffer().read(cx).snapshot(cx);
                 let selections = selections.clone();
                 let background_executor = cx.background_executor().clone();

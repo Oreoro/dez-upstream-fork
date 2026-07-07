@@ -22,17 +22,17 @@ use editor::{
 };
 use futures::{StreamExt, stream::FuturesOrdered};
 use gpui::{
-    Action, AnyElement, App, AsyncApp, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Global, Hsla, InteractiveElement, IntoElement, KeyContext, ParentElement, Point,
-    Render, SharedString, Styled, Subscription, Task, TaskExt, UpdateGlobal, WeakEntity, Window,
-    actions, div,
+    Action, Anchor as PopoverAnchor, AnyElement, App, AsyncApp, Axis, Context, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, Global, Hsla, InteractiveElement, IntoElement,
+    KeyContext, ParentElement, Point, Render, SharedString, Styled, Subscription, Task, TaskExt,
+    UpdateGlobal, WeakEntity, Window, actions, div,
 };
 use itertools::Itertools;
 use language::{Buffer, Language};
 use menu::Confirm;
 use multi_buffer;
 use project::{
-    Project, ProjectPath, SearchResults,
+    Project, ProjectPath, SearchResults, Worktree, WorktreeId,
     search::{SearchInputKind, SearchQuery, SearchResult},
     search_history::SearchHistoryCursor,
 };
@@ -48,8 +48,8 @@ use std::{
     },
 };
 use ui::{
-    CommonAnimationExt, IconButtonShape, KeyBinding, Toggleable, Tooltip, prelude::*,
-    utils::SearchInputWidth,
+    CommonAnimationExt, ContextMenu, IconButtonShape, KeyBinding, PopoverMenu, Toggleable, Tooltip,
+    prelude::*, utils::SearchInputWidth,
 };
 use util::{ResultExt as _, paths::PathMatcher, rel_path::RelPath};
 use workspace::{
@@ -298,6 +298,7 @@ pub struct ProjectSearchView {
     replacement_editor: Entity<Editor>,
     results_editor: Entity<Editor>,
     pub(crate) search_options: SearchOptions,
+    search_scope: ProjectSearchScope,
     panels_with_errors: HashMap<InputPanel, String>,
     active_match_index: Option<usize>,
     search_id: usize,
@@ -315,6 +316,29 @@ pub struct ProjectSearchView {
 pub struct ProjectSearchSettings {
     search_options: SearchOptions,
     filters_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum ProjectSearchScope {
+    #[default]
+    Workspace,
+    Worktree(WorktreeId),
+}
+
+fn retain_workspace_search_worktrees(worktrees: &mut Vec<Entity<Worktree>>, cx: &mut AsyncApp) {
+    let roots = Workspace::dedup_workspace_directories(
+        worktrees
+            .iter()
+            .map(|worktree| worktree.read_with(cx, |worktree, _| worktree.abs_path().to_path_buf()))
+            .collect(),
+    );
+
+    worktrees.retain(|worktree| {
+        worktree.read_with(cx, |worktree, _| {
+            let path = worktree.abs_path();
+            roots.iter().any(|root| root.as_ref() == path.as_ref())
+        })
+    });
 }
 
 pub struct ProjectSearchBar {
@@ -430,10 +454,83 @@ impl ProjectSearch {
         }
     }
 
-    fn search(&mut self, query: SearchQuery, cx: &mut Context<Self>) {
-        let project_search_turning_into_text_finder =
-            Arc::clone(&self.project_search_turning_into_text_finder);
+    fn search(
+        &mut self,
+        query: SearchQuery,
+        worktrees: Option<Vec<Entity<Worktree>>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.record_search_history(&query, cx);
         let search = self.project.update(cx, |project, cx| {
+            if let Some(worktrees) = worktrees {
+                project.search_worktrees(query.clone(), worktrees, cx)
+            } else {
+                project.search(query.clone(), cx)
+            }
+        });
+        let project_search_turning_into_text_finder = self.begin_search(query, cx);
+        self.consume_search_results(search, project_search_turning_into_text_finder, cx);
+    }
+
+    fn search_after_worktree_refresh(
+        &mut self,
+        query: SearchQuery,
+        worktrees: Task<Vec<Entity<Worktree>>>,
+        search_scope: ProjectSearchScope,
+        cx: &mut Context<Self>,
+    ) {
+        self.record_search_history(&query, cx);
+        let project_search_turning_into_text_finder = self.begin_search(query.clone(), cx);
+        let search_id = self.search_id;
+        self.pending_search = Some(cx.spawn(async move |project_search, cx| {
+            project_search
+                .update(cx, |project_search, cx| {
+                    project_search.match_ranges.clear();
+                    project_search
+                        .excerpts
+                        .update(cx, |excerpts, cx| excerpts.clear(cx));
+                })
+                .ok()?;
+
+            let mut worktrees = worktrees.await;
+            match search_scope {
+                ProjectSearchScope::Workspace => {
+                    retain_workspace_search_worktrees(&mut worktrees, cx)
+                }
+                ProjectSearchScope::Worktree(worktree_id) => {
+                    if worktrees.len() > 1 {
+                        worktrees.retain(|worktree| {
+                            worktree.read_with(cx, |worktree, _| worktree.id() == worktree_id)
+                        });
+                    }
+                }
+            }
+            let search = project_search
+                .update(cx, |project_search, cx| {
+                    if project_search.search_id != search_id {
+                        return None;
+                    }
+
+                    Some(project_search.project.update(cx, |project, cx| {
+                        project.search_worktrees(query.clone(), worktrees, cx)
+                    }))
+                })
+                .ok()
+                .flatten()?;
+
+            consume_search_stream(
+                project_search,
+                search,
+                project_search_turning_into_text_finder,
+                cx,
+            )
+            .await
+        }));
+        cx.notify();
+    }
+
+    fn record_search_history(&mut self, query: &SearchQuery, cx: &mut Context<Self>) {
+        self.project.update(cx, |project, _cx| {
             project
                 .search_history_mut(SearchInputKind::Query)
                 .add(&mut self.search_history_cursor, query.as_str().to_string());
@@ -449,13 +546,26 @@ impl ProjectSearch {
                     .search_history_mut(SearchInputKind::Exclude)
                     .add(&mut self.search_excluded_history_cursor, excluded);
             }
-            project.search(query.clone(), cx)
         });
+    }
+
+    fn begin_search(&mut self, query: SearchQuery, cx: &mut Context<Self>) -> Arc<AtomicBool> {
         self.last_search_query_text = Some(query.as_str().to_string());
         self.search_id += 1;
         self.active_query = Some(query);
         self.match_ranges.clear();
         self.search_state = SearchState::Running(SearchActivity::Searching);
+        cx.notify();
+
+        Arc::clone(&self.project_search_turning_into_text_finder)
+    }
+
+    fn consume_search_results(
+        &mut self,
+        search: SearchResults<SearchResult>,
+        project_search_turning_into_text_finder: Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) {
         self.pending_search = Some(cx.spawn(async move |project_search, cx| {
             project_search
                 .update(cx, |project_search, cx| {
@@ -681,6 +791,7 @@ impl Focusable for ProjectSearchView {
 
 impl Item for ProjectSearchView {
     type Event = ViewEvent;
+
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
         let query_text = self.query_editor.read(cx).text(cx);
 
@@ -1028,6 +1139,24 @@ impl ProjectSearchView {
         cx: &mut Context<Self>,
         settings: Option<ProjectSearchSettings>,
     ) -> Self {
+        Self::new_with_scope(
+            workspace,
+            entity,
+            window,
+            cx,
+            settings,
+            ProjectSearchScope::default(),
+        )
+    }
+
+    fn new_with_scope(
+        workspace: WeakEntity<Workspace>,
+        entity: Entity<ProjectSearch>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        settings: Option<ProjectSearchSettings>,
+        search_scope: ProjectSearchScope,
+    ) -> Self {
         let project;
         let excerpts;
         let mut replacement_text = None;
@@ -1177,6 +1306,7 @@ impl ProjectSearchView {
             query_editor,
             results_editor,
             search_options: options,
+            search_scope,
             panels_with_errors: HashMap::default(),
             active_match_index: None,
             included_files_editor,
@@ -1242,7 +1372,7 @@ impl ProjectSearchView {
             .active_item(cx)
             .and_then(|item| item.downcast::<ProjectSearchView>())
         {
-            let new_query = search_view.update(cx, |search_view, cx| {
+            let (new_query, search_scope) = search_view.update(cx, |search_view, cx| {
                 let open_buffers = if search_view.included_opened_only {
                     Some(search_view.open_buffers(cx, workspace))
                 } else {
@@ -1258,18 +1388,32 @@ impl ProjectSearchView {
                     search_view.search_options = SearchOptions::from_query(&old_query);
                     search_view.adjust_query_regex_language(cx);
                 }
-                new_query
+                (new_query, search_view.search_scope.clone())
             });
             if let Some(new_query) = new_query {
+                let project = workspace.project().clone();
+                let worktrees = workspace.refresh_visible_worktrees(cx);
+                let weak_workspace = cx.entity().downgrade();
                 let entity = cx.new(|cx| {
-                    let mut entity = ProjectSearch::new(workspace.project().clone(), cx);
-                    entity.search(new_query, cx);
+                    let mut entity = ProjectSearch::new(project, cx);
+                    entity.search_after_worktree_refresh(
+                        new_query,
+                        worktrees,
+                        search_scope.clone(),
+                        cx,
+                    );
                     entity
                 });
-                let weak_workspace = cx.entity().downgrade();
                 workspace.add_item_to_active_pane(
                     Box::new(cx.new(|cx| {
-                        ProjectSearchView::new(weak_workspace, entity, window, cx, None)
+                        ProjectSearchView::new_with_scope(
+                            weak_workspace,
+                            entity,
+                            window,
+                            cx,
+                            None,
+                            search_scope,
+                        )
                     })),
                     None,
                     true,
@@ -1454,12 +1598,36 @@ impl ProjectSearchView {
             None
         };
         if let Some(query) = self.build_search_query(cx, open_buffers) {
-            self.entity.update(cx, |model, cx| model.search(query, cx));
+            if let Some(workspace) = self.workspace.upgrade() {
+                let worktrees =
+                    workspace.update(cx, |workspace, cx| workspace.refresh_visible_worktrees(cx));
+                let search_scope = self.search_scope.clone();
+                self.entity.update(cx, |model, cx| {
+                    model.search_after_worktree_refresh(query, worktrees, search_scope, cx)
+                });
+            } else {
+                self.entity
+                    .update(cx, |model, cx| model.search(query, Some(Vec::new()), cx));
+            }
         }
     }
 
     pub fn search_query_text(&self, cx: &App) -> String {
         self.query_editor.read(cx).text(cx)
+    }
+
+    fn visible_worktree_count(&self, cx: &App) -> usize {
+        self.workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).visible_worktrees(cx).count())
+            .unwrap_or_else(|| {
+                self.entity
+                    .read(cx)
+                    .project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .count()
+            })
     }
 
     fn build_search_query(
@@ -1524,14 +1692,7 @@ impl ProjectSearchView {
         // include/exclude patterns against full paths to allow them to be
         // disambiguated. For single worktree projects we use worktree relative
         // paths for convenience.
-        let match_full_paths = self
-            .entity
-            .read(cx)
-            .project
-            .read(cx)
-            .visible_worktrees(cx)
-            .count()
-            > 1;
+        let match_full_paths = self.visible_worktree_count(cx) > 1;
 
         let query = match self.search_options.build_query(
             text,
@@ -2340,6 +2501,90 @@ impl Render for ProjectSearchBar {
             .unwrap_or_else(|| "0/0".to_string());
 
         let query_focus = search.query_editor.focus_handle(cx);
+        let search_scope_selector = {
+            let active_project_search = self.active_project_search.clone();
+            let search_scope = search.search_scope.clone();
+            let workspace = search.workspace.upgrade();
+            let mut entries = vec![(
+                ProjectSearchScope::Workspace,
+                SharedString::new_static("Workspace"),
+            )];
+            if let Some(workspace) = workspace.as_ref() {
+                entries.extend(workspace.read_with(cx, |workspace, cx| {
+                    workspace
+                        .visible_worktrees(cx)
+                        .map(|worktree| {
+                            let worktree = worktree.read(cx);
+                            (
+                                ProjectSearchScope::Worktree(worktree.id()),
+                                SharedString::from(worktree.root_name().as_unix_str().to_string()),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            if let ProjectSearchScope::Worktree(worktree_id) = &search_scope
+                && !entries
+                    .iter()
+                    .any(|(scope, _)| *scope == ProjectSearchScope::Worktree(*worktree_id))
+            {
+                let label = project_search
+                    .project
+                    .read(cx)
+                    .worktree_for_id(*worktree_id, cx)
+                    .map(|worktree| {
+                        SharedString::from(worktree.read(cx).root_name().as_unix_str().to_string())
+                    })
+                    .unwrap_or_else(|| SharedString::new_static("Selected Worktree"));
+                entries.push((ProjectSearchScope::Worktree(*worktree_id), label));
+            }
+            let is_scoped_to_worktree = matches!(search_scope, ProjectSearchScope::Worktree(_));
+            let has_multiple_worktrees = entries.len().saturating_sub(1) > 1;
+            let show_scope_selector = has_multiple_worktrees || is_scoped_to_worktree;
+
+            show_scope_selector.then(|| {
+                PopoverMenu::new("project-search-scope-selector")
+                    .trigger(
+                        IconButton::new("project-search-scope-trigger", IconName::Folder)
+                            .shape(IconButtonShape::Square)
+                            .icon_color(if is_scoped_to_worktree {
+                                Color::Accent
+                            } else {
+                                Color::Default
+                            })
+                            .selected_icon_color(Color::Accent)
+                            .tooltip(Tooltip::text("Search Scope")),
+                    )
+                    .menu(move |window, cx| {
+                        let active_project_search = active_project_search.clone();
+                        let entries = entries.clone();
+                        let search_scope = search_scope.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for (scope, label) in entries {
+                                let active_project_search = active_project_search.clone();
+                                let selected = scope == search_scope;
+                                menu = menu.toggleable_entry(
+                                    label,
+                                    selected,
+                                    IconPosition::End,
+                                    None,
+                                    move |_window, cx| {
+                                        if let Some(search) = active_project_search.as_ref() {
+                                            search.update(cx, |search, cx| {
+                                                search.search_scope = scope.clone();
+                                                search.search(cx);
+                                            });
+                                        }
+                                    },
+                                );
+                            }
+                            menu
+                        }))
+                    })
+                    .anchor(PopoverAnchor::TopLeft)
+                    .into_any_element()
+            })
+        };
 
         let query_column = input_base_styles(InputPanel::Query)
             .on_action(cx.listener(|this, action, window, cx| this.confirm(action, window, cx)))
@@ -2436,6 +2681,7 @@ impl Render for ProjectSearchBar {
         let mode_column = h_flex()
             .gap_1()
             .min_w_64()
+            .children(search_scope_selector)
             .child(
                 IconButton::new("project-search-filter-button", IconName::Filter)
                     .shape(IconButtonShape::Square)

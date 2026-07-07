@@ -5,7 +5,7 @@ use gpui::{
     KeyContext, ModifiersChangedEvent, MouseButton, ParentElement, Rems, Render, Styled,
     Subscription, WeakEntity, Window, actions, rems,
 };
-use project::git_store::Repository;
+use project::{Event as ProjectEvent, Project, git_store::Repository};
 use ui::{
     FluentBuilder, ToggleButtonGroup, ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip,
     prelude::*,
@@ -13,6 +13,7 @@ use ui::{
 use workspace::{ModalView, Workspace, pane};
 
 use crate::branch_picker::{self, BranchList, DeleteBranch, FilterRemotes, ForceDeleteBranch};
+use crate::repository_selector::repository_selector_menu_default;
 use crate::stash_picker::{self, DropStashItem, ShowStashItem, StashList};
 
 actions!(git_picker, [ActivateBranchesTab, ActivateStashTab,]);
@@ -36,6 +37,7 @@ impl Display for GitPickerTab {
 pub struct GitPicker {
     tab: GitPickerTab,
     workspace: WeakEntity<Workspace>,
+    project: Option<Entity<Project>>,
     repository: Option<Entity<Repository>>,
     width: Rems,
     branch_list: Option<Entity<BranchList>>,
@@ -47,17 +49,28 @@ pub struct GitPicker {
 impl GitPicker {
     pub fn new(
         workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
         repository: Option<Entity<Repository>>,
         initial_tab: GitPickerTab,
         width: Rems,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_internal(workspace, repository, initial_tab, width, false, window, cx)
+        Self::new_internal(
+            workspace,
+            project,
+            repository,
+            initial_tab,
+            width,
+            false,
+            window,
+            cx,
+        )
     }
 
     fn new_internal(
         workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
         repository: Option<Entity<Repository>>,
         initial_tab: GitPickerTab,
         width: Rems,
@@ -65,9 +78,11 @@ impl GitPicker {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let project_for_subscription = project.clone();
         let mut this = Self {
             tab: initial_tab,
             workspace,
+            project: Some(project),
             repository,
             width,
             branch_list: None,
@@ -75,6 +90,23 @@ impl GitPicker {
             _subscriptions: Vec::new(),
             popover_style,
         };
+
+        this._subscriptions.push(cx.subscribe_in(
+            &project_for_subscription,
+            window,
+            |this, project, event, window, cx| {
+                if !matches!(event, ProjectEvent::ActiveRepositoryChanged(_)) {
+                    return;
+                }
+
+                this.repository = project.read(cx).active_repository(cx);
+                this.branch_list = None;
+                this.stash_list = None;
+                this.ensure_active_picker(window, cx);
+                this.focus_active_picker(window, cx);
+                cx.notify();
+            },
+        ));
 
         this.ensure_active_picker(window, cx);
         this
@@ -101,6 +133,7 @@ impl GitPicker {
             let branch_list = cx.new(|cx| {
                 branch_picker::create_embedded(
                     self.workspace.clone(),
+                    self.project.clone(),
                     self.repository.clone(),
                     self.width,
                     show_footer,
@@ -190,55 +223,64 @@ impl GitPicker {
         let focus_handle = self.focus_handle(cx);
         let branches_focus_handle = focus_handle.clone();
         let stash_focus_handle = focus_handle;
+        let repository_selector = self.project.as_ref().and_then(|project| {
+            repository_selector_menu_default("git-picker-repository-selector", project, cx)
+        });
 
-        h_flex().p_2().pb_0p5().w_full().child(
-            ToggleButtonGroup::single_row(
-                "git-picker-tabs",
-                [
-                    ToggleButtonSimple::new(
-                        GitPickerTab::Branches.to_string(),
-                        cx.listener(|this, _, window, cx| {
-                            this.tab = GitPickerTab::Branches;
-                            this.ensure_active_picker(window, cx);
-                            this.focus_active_picker(window, cx);
-                            cx.notify();
-                        }),
-                    )
-                    .tooltip(move |_, cx| {
-                        Tooltip::for_action_in(
-                            "Toggle Branch Picker",
-                            &ActivateBranchesTab,
-                            &branches_focus_handle,
-                            cx,
+        h_flex()
+            .p_2()
+            .pb_0p5()
+            .w_full()
+            .gap_2()
+            .child(
+                ToggleButtonGroup::single_row(
+                    "git-picker-tabs",
+                    [
+                        ToggleButtonSimple::new(
+                            GitPickerTab::Branches.to_string(),
+                            cx.listener(|this, _, window, cx| {
+                                this.tab = GitPickerTab::Branches;
+                                this.ensure_active_picker(window, cx);
+                                this.focus_active_picker(window, cx);
+                                cx.notify();
+                            }),
                         )
-                    }),
-                    ToggleButtonSimple::new(
-                        GitPickerTab::Stashes.to_string(),
-                        cx.listener(|this, _, window, cx| {
-                            this.tab = GitPickerTab::Stashes;
-                            this.ensure_active_picker(window, cx);
-                            this.focus_active_picker(window, cx);
-                            cx.notify();
+                        .tooltip(move |_, cx| {
+                            Tooltip::for_action_in(
+                                "Toggle Branch Picker",
+                                &ActivateBranchesTab,
+                                &branches_focus_handle,
+                                cx,
+                            )
                         }),
-                    )
-                    .tooltip(move |_, cx| {
-                        Tooltip::for_action_in(
-                            "Toggle Stash Picker",
-                            &ActivateStashTab,
-                            &stash_focus_handle,
-                            cx,
+                        ToggleButtonSimple::new(
+                            GitPickerTab::Stashes.to_string(),
+                            cx.listener(|this, _, window, cx| {
+                                this.tab = GitPickerTab::Stashes;
+                                this.ensure_active_picker(window, cx);
+                                this.focus_active_picker(window, cx);
+                                cx.notify();
+                            }),
                         )
-                    }),
-                ],
+                        .tooltip(move |_, cx| {
+                            Tooltip::for_action_in(
+                                "Toggle Stash Picker",
+                                &ActivateStashTab,
+                                &stash_focus_handle,
+                                cx,
+                            )
+                        }),
+                    ],
+                )
+                .label_size(LabelSize::Default)
+                .style(ToggleButtonGroupStyle::Outlined)
+                .auto_width()
+                .selected_index(match self.tab {
+                    GitPickerTab::Branches => 0,
+                    GitPickerTab::Stashes => 1,
+                }),
             )
-            .label_size(LabelSize::Default)
-            .style(ToggleButtonGroupStyle::Outlined)
-            .auto_width()
-            .selected_index(match self.tab {
-                GitPickerTab::Branches => 0,
-                GitPickerTab::Stashes => 1,
-            }),
-        )
+            .children(repository_selector)
     }
 
     fn render_active_picker(
@@ -457,10 +499,19 @@ fn open_with_tab(
     cx: &mut Context<Workspace>,
 ) {
     let workspace_handle = workspace.weak_handle();
-    let repository = workspace.project().read(cx).active_repository(cx);
+    let project = workspace.project().clone();
+    let repository = project.read(cx).active_repository(cx);
 
     workspace.toggle_modal(window, cx, |window, cx| {
-        GitPicker::new(workspace_handle, repository, tab, rems(34.), window, cx)
+        GitPicker::new(
+            workspace_handle,
+            project,
+            repository,
+            tab,
+            rems(34.),
+            window,
+            cx,
+        )
     })
 }
 
@@ -473,8 +524,35 @@ pub fn popover(
     cx: &mut App,
 ) -> Entity<GitPicker> {
     cx.new(|cx| {
-        let picker =
-            GitPicker::new_internal(workspace, repository, initial_tab, width, true, window, cx);
+        let project = workspace
+            .read_with(cx, |workspace, _| workspace.project().clone())
+            .ok();
+        let picker = if let Some(project) = project {
+            GitPicker::new_internal(
+                workspace,
+                project,
+                repository,
+                initial_tab,
+                width,
+                true,
+                window,
+                cx,
+            )
+        } else {
+            let mut picker = GitPicker {
+                tab: initial_tab,
+                workspace,
+                project: None,
+                repository,
+                width,
+                branch_list: None,
+                stash_list: None,
+                _subscriptions: Vec::new(),
+                popover_style: true,
+            };
+            picker.ensure_active_picker(window, cx);
+            picker
+        };
         picker.focus_handle(cx).focus(window, cx);
         picker
     })

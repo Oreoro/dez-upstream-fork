@@ -300,8 +300,6 @@ actions!(
         ToggleSearch,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).
         ImportThreadsFromOtherChannels,
-        /// Starts a new terminal thread.
-        NewTerminalThread,
     ]
 );
 
@@ -636,7 +634,6 @@ pub fn init(
     register_serializable_item::<AgentThreadItem>(cx);
     context_server_configuration::init(language_registry.clone(), fs.clone(), cx);
     thread_metadata_store::init(cx);
-    terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);
@@ -839,7 +836,6 @@ fn update_command_palette_filter(cx: &mut App) {
             TypeId::of::<zed_actions::assistant::OpenSkillCreator>(),
             TypeId::of::<zed_actions::assistant::CreateSkillFromUrl>(),
         ];
-
         if disable_ai {
             filter.hide_namespace("agent");
             filter.hide_namespace("agents");
@@ -1044,10 +1040,6 @@ mod tests {
                 "NewThread should be visible by default"
             );
             assert!(
-                !filter.is_hidden(&NewTerminalThread),
-                "NewTerminalThread should be visible by default"
-            );
-            assert!(
                 !filter.is_hidden(&zed_actions::assistant::OpenSkillCreator),
                 "OpenSkillCreator should be visible by default"
             );
@@ -1081,10 +1073,6 @@ mod tests {
             assert!(
                 filter.is_hidden(&NewThread),
                 "NewThread should be hidden when agent is disabled"
-            );
-            assert!(
-                filter.is_hidden(&NewTerminalThread),
-                "NewTerminalThread should be hidden when agent is disabled"
             );
             assert!(
                 filter.is_hidden(&zed_actions::assistant::OpenGlobalAgentsMdRules),

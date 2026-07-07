@@ -100,6 +100,7 @@ pub struct GitStore {
     buffer_store: Entity<BufferStore>,
     worktree_store: Entity<WorktreeStore>,
     repositories: HashMap<RepositoryId, Entity<Repository>>,
+    repositories_by_work_directory_abs_path: HashMap<Arc<Path>, RepositoryId>,
     worktree_ids: HashMap<RepositoryId, HashSet<WorktreeId>>,
     active_repo_id: Option<RepositoryId>,
     #[allow(clippy::type_complexity)]
@@ -642,6 +643,7 @@ impl GitStore {
             buffer_store,
             worktree_store,
             repositories: HashMap::default(),
+            repositories_by_work_directory_abs_path: HashMap::default(),
             worktree_ids: HashMap::default(),
             active_repo_id: None,
             _subscriptions,
@@ -1722,7 +1724,10 @@ impl GitStore {
                     .any(|repo_id| self.active_repo_id == Some(*repo_id));
 
                 for repo_id in repos_without_worktree {
-                    self.repositories.remove(&repo_id);
+                    if let Some(repository) = self.repositories.remove(&repo_id) {
+                        self.repositories_by_work_directory_abs_path
+                            .remove(&repository.read(cx).work_directory_abs_path);
+                    }
                     self.worktree_ids.remove(&repo_id);
                     if let Some(updates_tx) =
                         downstream.as_ref().map(|downstream| &downstream.updates_tx)
@@ -1818,15 +1823,22 @@ impl GitStore {
     ) {
         let mut removed_ids = Vec::new();
         for update in updated_git_repositories.iter() {
-            if let Some((id, existing)) = self.repositories.iter().find(|(_, repo)| {
-                let existing_work_directory_abs_path =
-                    repo.read(cx).work_directory_abs_path.clone();
-                Some(&existing_work_directory_abs_path)
-                    == update.old_work_directory_abs_path.as_ref()
-                    || Some(&existing_work_directory_abs_path)
-                        == update.new_work_directory_abs_path.as_ref()
-            }) {
-                let repo_id = *id;
+            let existing_repo_id = update
+                .old_work_directory_abs_path
+                .as_ref()
+                .and_then(|path| self.repositories_by_work_directory_abs_path.get(path))
+                .copied()
+                .or_else(|| {
+                    update
+                        .new_work_directory_abs_path
+                        .as_ref()
+                        .and_then(|path| self.repositories_by_work_directory_abs_path.get(path))
+                        .copied()
+                });
+
+            if let Some((repo_id, existing)) = existing_repo_id
+                .and_then(|id| self.repositories.get(&id).cloned().map(|repo| (id, repo)))
+            {
                 if let Some(new_work_directory_abs_path) =
                     update.new_work_directory_abs_path.clone()
                 {
@@ -1836,6 +1848,16 @@ impl GitStore {
                         .insert(worktree_id);
                     let path_changed = update.old_work_directory_abs_path.as_ref()
                         != update.new_work_directory_abs_path.as_ref();
+                    if path_changed {
+                        if let Some(old_work_directory_abs_path) =
+                            update.old_work_directory_abs_path.as_ref()
+                        {
+                            self.repositories_by_work_directory_abs_path
+                                .remove(old_work_directory_abs_path);
+                        }
+                        self.repositories_by_work_directory_abs_path
+                            .insert(new_work_directory_abs_path.clone(), repo_id);
+                    }
                     if path_changed
                         && let Some(dot_git_abs_path) = update.dot_git_abs_path.clone()
                         && let Some(repository_dir_abs_path) =
@@ -1926,6 +1948,8 @@ impl GitStore {
                 self._subscriptions
                     .push(cx.subscribe(&repo, Self::on_jobs_updated));
                 self.repositories.insert(id, repo);
+                self.repositories_by_work_directory_abs_path
+                    .insert(work_directory_abs_path.clone(), id);
                 self.worktree_ids.insert(id, HashSet::from([worktree_id]));
                 cx.emit(GitStoreEvent::RepositoryAdded);
                 self.active_repo_id.get_or_insert_with(|| {
@@ -1940,7 +1964,10 @@ impl GitStore {
                 self.active_repo_id = None;
                 cx.emit(GitStoreEvent::ActiveRepositoryChanged(None));
             }
-            self.repositories.remove(&id);
+            if let Some(repository) = self.repositories.remove(&id) {
+                self.repositories_by_work_directory_abs_path
+                    .remove(&repository.read(cx).work_directory_abs_path);
+            }
             if let Some(updates_tx) = updates_tx.as_ref() {
                 updates_tx
                     .unbounded_send(DownstreamUpdate::RemoveRepository(id))
@@ -2354,10 +2381,17 @@ impl GitStore {
             });
             this._subscriptions.extend(repo_subscription);
 
+            let old_work_directory_abs_path = repo.read(cx).work_directory_abs_path.clone();
             repo.update(cx, {
                 let update = update.clone();
                 |repo, cx| repo.apply_remote_update(update, cx)
             })?;
+            if repo.read(cx).work_directory_abs_path != old_work_directory_abs_path {
+                this.repositories_by_work_directory_abs_path
+                    .remove(&old_work_directory_abs_path);
+            }
+            this.repositories_by_work_directory_abs_path
+                .insert(repo.read(cx).work_directory_abs_path.clone(), id);
 
             this.active_repo_id.get_or_insert_with(|| {
                 cx.emit(GitStoreEvent::ActiveRepositoryChanged(Some(id)));
@@ -2380,7 +2414,10 @@ impl GitStore {
         this.update(&mut cx, |this, cx| {
             let mut update = envelope.payload;
             let id = RepositoryId::from_proto(update.id);
-            this.repositories.remove(&id);
+            if let Some(repository) = this.repositories.remove(&id) {
+                this.repositories_by_work_directory_abs_path
+                    .remove(&repository.read(cx).work_directory_abs_path);
+            }
             if let Some((client, project_id)) = this.downstream_client() {
                 update.project_id = project_id.to_proto();
                 client.send(update).log_err();

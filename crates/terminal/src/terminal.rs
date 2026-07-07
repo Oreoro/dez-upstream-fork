@@ -653,6 +653,7 @@ pub enum Event {
     CloseTerminal,
     Bell,
     Wakeup,
+    WorkingDirectoryChanged,
     BlinkChanged(bool),
     SelectionsChanged,
     NewNavigationTarget(Option<MaybeNavigationTarget>),

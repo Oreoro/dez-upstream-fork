@@ -4892,7 +4892,7 @@ fn default_render_tab_bar_buttons(
                         menu.action("New File", NewFile.boxed_clone())
                             .action("Open File", ToggleFileFinder::default().boxed_clone())
                             .separator()
-                            .action("Search Project", DeploySearch::default().boxed_clone())
+                            .action("Search Workspace", DeploySearch::default().boxed_clone())
                             .action("Search Symbols", ToggleProjectSymbols.boxed_clone())
                             .separator()
                             .action("New Terminal", NewTerminal::default().boxed_clone())

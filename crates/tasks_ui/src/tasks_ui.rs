@@ -285,6 +285,7 @@ pub fn task_contexts(
                 .worktree_for_id(*worktree_id, cx)
                 .is_some_and(|worktree| is_visible_directory(&worktree, cx))
         })
+        .or_else(|| workspace.active_context().worktree_id())
         .or_else(|| {
             workspace
                 .visible_worktrees(cx)

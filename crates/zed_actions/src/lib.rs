@@ -163,6 +163,34 @@ pub enum OpenSettingsAtTarget {
     Project { worktree_id: usize },
 }
 
+/// Opens worktree-specific settings for an explicit worktree.
+#[derive(PartialEq, Clone, Debug, Action)]
+#[action(namespace = zed, no_json, no_register)]
+pub struct OpenWorktreeSettings {
+    pub worktree_id: usize,
+}
+
+/// Opens the worktree settings file for an explicit worktree.
+#[derive(PartialEq, Clone, Debug, Action)]
+#[action(namespace = zed, no_json, no_register)]
+pub struct OpenWorktreeSettingsFile {
+    pub worktree_id: usize,
+}
+
+/// Opens the worktree tasks configuration for an explicit worktree.
+#[derive(PartialEq, Clone, Debug, Action)]
+#[action(namespace = zed, no_json, no_register)]
+pub struct OpenWorktreeTasks {
+    pub worktree_id: usize,
+}
+
+/// Opens the worktree debug configuration for an explicit worktree.
+#[derive(PartialEq, Clone, Debug, Action)]
+#[action(namespace = zed, no_json, no_register)]
+pub struct OpenWorktreeDebugTasks {
+    pub worktree_id: usize,
+}
+
 /// Resets the buffer font size to the default value.
 #[derive(PartialEq, Clone, Default, Debug, Deserialize, JsonSchema, Action)]
 #[action(namespace = zed)]
@@ -627,6 +655,13 @@ pub mod assistant {
     #[serde(deny_unknown_fields)]
     pub struct InlineAssist {
         pub prompt: Option<String>,
+    }
+
+    /// Opens the worktree AGENTS.md rules file for an explicit worktree.
+    #[derive(Clone, Debug, PartialEq, Action)]
+    #[action(namespace = assistant, no_json, no_register)]
+    pub struct OpenWorktreeAgentsMdRules {
+        pub worktree_id: usize,
     }
 }
 

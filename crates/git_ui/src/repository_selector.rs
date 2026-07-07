@@ -1,14 +1,238 @@
 use crate::git_status_icon;
 use git::status::{FileStatus, StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode};
-use gpui::{App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Task, WeakEntity};
+use gpui::{
+    Action, Anchor, App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, Task, WeakEntity,
+};
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
-use project::{Project, git_store::Repository};
+use project::{Project, Worktree, git_store::Repository};
 use std::sync::Arc;
-use ui::{ListItem, ListItemSpacing, prelude::*};
+use ui::{ButtonLike, ContextMenu, ListItem, ListItemSpacing, PopoverMenu, Tooltip, prelude::*};
 use workspace::{ModalView, Workspace};
 
 pub fn register(workspace: &mut Workspace) {
     workspace.register_action(open);
+}
+
+pub fn repository_selector_button(
+    id: impl Into<ElementId>,
+    project: &Entity<Project>,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    let project_ref = project.read(cx);
+    if project_ref.visible_repositories(cx).len() <= 1 {
+        return None;
+    }
+
+    let active_repository = project_ref.active_repository(cx)?;
+    let label = SharedString::from(Arc::from(
+        active_repository
+            .read(cx)
+            .display_name()
+            .trim_end_matches('/'),
+    ));
+
+    Some(
+        repository_selector_trigger(id, label, LabelSize::Small)
+            .on_click(|_, window, cx| {
+                window.dispatch_action(zed_actions::git::SelectRepo.boxed_clone(), cx);
+            })
+            .into_any_element(),
+    )
+}
+
+pub fn repository_selector_menu(
+    id: impl Into<ElementId>,
+    project: &Entity<Project>,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    repository_selector_menu_with_label_size(id, project, LabelSize::Small, cx)
+}
+
+pub fn repository_selector_menu_default(
+    id: impl Into<ElementId>,
+    project: &Entity<Project>,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    repository_selector_menu_with_label_size(id, project, LabelSize::Default, cx)
+}
+
+fn repository_selector_menu_with_label_size(
+    id: impl Into<ElementId>,
+    project: &Entity<Project>,
+    label_size: LabelSize,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    let id = id.into();
+    let project_ref = project.read(cx);
+    let entries = worktree_repository_entries(project_ref, cx);
+    if entries.is_empty() {
+        return None;
+    }
+
+    let active_repository = project_ref.active_repository(cx);
+    let label = SharedString::from(Arc::from(
+        active_repository
+            .as_ref()
+            .map(|repository| repository.read(cx).display_name())
+            .unwrap_or_else(|| entries[0].label.clone())
+            .trim_end_matches('/'),
+    ));
+
+    if entries.len() <= 1 {
+        return Some(repository_selector_label(label, label_size, false).into_any_element());
+    }
+
+    let trigger = repository_selector_trigger("repository-selector-trigger", label, label_size);
+    let project = project.clone();
+
+    Some(
+        PopoverMenu::new(id)
+            .trigger(trigger)
+            .menu(move |window, cx| {
+                let active_repository = project.read(cx).active_repository(cx);
+                let active_repository_id = active_repository
+                    .as_ref()
+                    .map(|repository| repository.read(cx).id);
+                let entries = worktree_repository_entries(project.read(cx), cx);
+                let project_for_context_menu = project.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, cx| {
+                    for entry in entries {
+                        let selected = entry.repository.as_ref().is_some_and(|repository| {
+                            Some(repository.read(cx).id) == active_repository_id
+                        });
+                        if let Some(repository) = entry.repository {
+                            let repository_id = repository.read(cx).id;
+                            let label = entry.label.clone();
+                            let project = project_for_context_menu.clone();
+                            menu = menu.custom_entry(
+                                move |_window, _cx| {
+                                    worktree_repository_menu_row(label.clone(), selected, false)
+                                },
+                                move |_window, cx| {
+                                    project.update(cx, |project, cx| {
+                                        project.set_active_repository_id(Some(repository_id), cx);
+                                    });
+                                },
+                            );
+                        } else {
+                            let label = entry.label.clone();
+                            menu = menu
+                                .custom_row(move |_window, _cx| {
+                                    worktree_repository_menu_row(label.clone(), false, true)
+                                })
+                                .selectable(false);
+                        }
+                    }
+                    menu
+                }))
+            })
+            .anchor(Anchor::TopLeft)
+            .into_any_element(),
+    )
+}
+
+struct WorktreeRepositoryEntry {
+    label: SharedString,
+    repository: Option<Entity<Repository>>,
+}
+
+fn worktree_repository_entries(project: &Project, cx: &App) -> Vec<WorktreeRepositoryEntry> {
+    let repositories = project.visible_repositories(cx);
+    project
+        .visible_worktrees(cx)
+        .map(|worktree| WorktreeRepositoryEntry {
+            label: SharedString::from(worktree.read(cx).root_name().as_unix_str().to_string()),
+            repository: repository_for_worktree(&worktree, &repositories, cx),
+        })
+        .collect()
+}
+
+fn repository_for_worktree(
+    worktree: &Entity<Worktree>,
+    repositories: &[Entity<Repository>],
+    cx: &App,
+) -> Option<Entity<Repository>> {
+    let worktree_abs_path = worktree.read(cx).abs_path();
+    repositories
+        .iter()
+        .filter(|repository| {
+            worktree_abs_path.starts_with(repository.read(cx).work_directory_abs_path.as_ref())
+        })
+        .max_by_key(|repository| {
+            repository
+                .read(cx)
+                .work_directory_abs_path
+                .as_os_str()
+                .len()
+        })
+        .cloned()
+}
+
+fn worktree_repository_menu_row(label: SharedString, selected: bool, disabled: bool) -> AnyElement {
+    h_flex()
+        .id(SharedString::from(format!(
+            "worktree-repository-menu-row-{}",
+            label
+        )))
+        .w_full()
+        .justify_between()
+        .gap_2()
+        .child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Icon::new(IconName::Folder)
+                        .size(IconSize::Small)
+                        .color(if disabled {
+                            Color::Disabled
+                        } else {
+                            Color::Muted
+                        }),
+                )
+                .child(Label::new(label).when(disabled, |this| this.color(Color::Disabled))),
+        )
+        .when(selected, |this| {
+            this.child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Accent),
+            )
+        })
+        .when(disabled, |this| {
+            this.tooltip(Tooltip::text("Not a Git repository"))
+        })
+        .into_any_element()
+}
+
+fn repository_selector_trigger(
+    id: impl Into<ElementId>,
+    label: SharedString,
+    label_size: LabelSize,
+) -> ButtonLike {
+    ButtonLike::new(id).child(repository_selector_label(label, label_size, true))
+}
+
+fn repository_selector_label(
+    label: SharedString,
+    label_size: LabelSize,
+    show_chevron: bool,
+) -> impl IntoElement {
+    h_flex()
+        .gap_0p5()
+        .child(
+            Icon::new(IconName::Folder)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .child(Label::new(label).size(label_size))
+        .when(show_chevron, |this| {
+            this.child(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+        })
 }
 
 pub fn open(
@@ -34,28 +258,28 @@ impl RepositorySelector {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let git_store = project_handle.read(cx).git_store().clone();
-        let repository_entries = git_store.update(cx, |git_store, _cx| {
-            let mut repos: Vec<_> = git_store.repositories().values().cloned().collect();
+        let repository_entries = project_handle.update(cx, |project, cx| {
+            let mut repos = project.visible_repositories(cx);
 
             repos.sort_by(|a, b| {
-                a.read(_cx)
+                a.read(cx)
                     .display_name()
                     .to_lowercase()
-                    .cmp(&b.read(_cx).display_name().to_lowercase())
+                    .cmp(&b.read(cx).display_name().to_lowercase())
             });
 
             repos
         });
         let filtered_repositories = repository_entries.clone();
 
-        let active_repository = git_store.read(cx).active_repository();
+        let active_repository = project_handle.read(cx).active_repository(cx);
         let selected_index = active_repository
             .as_ref()
             .and_then(|active| filtered_repositories.iter().position(|repo| repo == active))
             .unwrap_or(0);
         let delegate = RepositorySelectorDelegate {
             repository_selector: cx.entity().downgrade(),
+            project: project_handle,
             repository_entries,
             filtered_repositories,
             active_repository,
@@ -123,6 +347,7 @@ impl ModalView for RepositorySelector {}
 
 pub struct RepositorySelectorDelegate {
     repository_selector: WeakEntity<RepositorySelector>,
+    project: Entity<Project>,
     repository_entries: Vec<Entity<Repository>>,
     filtered_repositories: Vec<Entity<Repository>>,
     active_repository: Option<Entity<Repository>>,
@@ -233,8 +458,9 @@ impl PickerDelegate for RepositorySelectorDelegate {
         let Some(selected_repo) = self.filtered_repositories.get(self.selected_index) else {
             return;
         };
-        selected_repo.update(cx, |selected_repo, cx| {
-            selected_repo.set_as_active_repository(cx)
+        let repository_id = selected_repo.read(cx).id;
+        self.project.update(cx, |project, cx| {
+            project.set_active_repository_id(Some(repository_id), cx);
         });
         self.dismissed(window, cx);
     }

@@ -460,6 +460,8 @@ impl EventEmitter<ImageViewEvent> for ImageView {}
 impl Item for ImageView {
     type Event = ImageViewEvent;
 
+    const CONTRIBUTES_PATH_EVIDENCE: bool = true;
+
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(workspace::item::ItemEvent)) {
         match event {
             ImageViewEvent::TitleChanged => {

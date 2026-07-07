@@ -178,6 +178,8 @@ pub enum ItemBufferKind {
 pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     type Event;
 
+    const CONTRIBUTES_PATH_EVIDENCE: bool = false;
+
     /// Returns the tab contents.
     ///
     /// By default this returns a [`Label`] that displays that text from
@@ -299,6 +301,10 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
             result = item.project_path(cx);
         });
         result
+    }
+
+    fn workspace_directory(&self, _cx: &App) -> Option<std::path::PathBuf> {
+        None
     }
 
     fn set_nav_history(&mut self, _: ItemNavHistory, _window: &mut Window, _: &mut Context<Self>) {}
@@ -542,6 +548,8 @@ pub trait ItemHandle: 'static + Send {
         cx: &App,
     ) -> AnyElement;
     fn project_path(&self, cx: &App) -> Option<ProjectPath>;
+    fn contributes_path_evidence(&self) -> bool;
+    fn workspace_directory(&self, cx: &App) -> Option<std::path::PathBuf>;
     fn project_entry_ids(&self, cx: &App) -> SmallVec<[ProjectEntryId; 3]>;
     fn project_paths(&self, cx: &App) -> SmallVec<[ProjectPath; 3]>;
     fn project_item_model_ids(&self, cx: &App) -> SmallVec<[EntityId; 3]>;
@@ -728,6 +736,14 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn project_path(&self, cx: &App) -> Option<ProjectPath> {
         <T as Item>::active_project_path(self.read(cx), cx)
+    }
+
+    fn contributes_path_evidence(&self) -> bool {
+        T::CONTRIBUTES_PATH_EVIDENCE
+    }
+
+    fn workspace_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
+        self.read(cx).workspace_directory(cx)
     }
 
     fn workspace_settings<'a>(&self, cx: &'a App) -> &'a WorkspaceSettings {

@@ -25,7 +25,6 @@
       "ctrl-shift-w": "workspace::CloseWindow",
       "shift-escape": "workspace::ToggleZoom",
       "ctrl-o": "workspace::OpenFiles",
-      "ctrl-k ctrl-o": "workspace::Open",
       "ctrl-=": ["zed::IncreaseBufferFontSize", { "persist": false }],
       "ctrl-shift-=": ["zed::IncreaseBufferFontSize", { "persist": false }],
       "ctrl--": ["zed::DecreaseBufferFontSize", { "persist": false }],
@@ -626,12 +625,6 @@
     "context": "Workspace",
     "use_key_equivalents": true,
     "bindings": {
-      // Change the default action on `menu::Confirm` by setting the parameter
-      // "ctrl-alt-o": ["projects::OpenRecent", { "create_new_window": true }],
-      "ctrl-r": "projects::OpenRecent",
-      // Change to open path modal for existing remote connection by setting the parameter
-      // "ctrl-shift-alt-o": ["projects::OpenRemote", { "from_existing_connection": true }],
-      "ctrl-shift-alt-o": ["projects::OpenRemote", { "from_existing_connection": false }],
       "shift-alt-b": "branches::OpenRecent",
       "shift-alt-w": "git::Worktree",
       "shift-alt-enter": "toast::RunAction",
@@ -640,7 +633,6 @@
       "ctrl-k ctrl-shift-s": "workspace::SaveWithoutFormat",
       "ctrl-shift-s": "workspace::SaveAs",
       "ctrl-n": "workspace::NewFile",
-      "ctrl-shift-n": "workspace::NewWindow",
       "ctrl-`": "workspace::NewTerminal",
       "f10": ["app_menu::OpenApplicationMenu", "Zed"],
       "alt-1": ["workspace::ActivatePane", 0],
@@ -1191,9 +1183,7 @@
     "use_key_equivalents": true,
     "bindings": {
       "ctrl-k": "recent_projects::ToggleActionsMenu",
-      "ctrl-shift-a": "workspace::AddFolderToProject",
       "shift-backspace": "recent_projects::RemoveSelected",
-      "ctrl-shift-enter": "recent_projects::AddToWorkspace",
     },
   },
   {
@@ -1410,11 +1400,6 @@
       "ctrl-+": ["zed::IncreaseUiFontSize", { "persist": false }],
       "ctrl--": ["zed::DecreaseUiFontSize", { "persist": false }],
       "ctrl-0": ["zed::ResetUiFontSize", { "persist": false }],
-      "ctrl-1": ["welcome::OpenRecentProject", 0],
-      "ctrl-2": ["welcome::OpenRecentProject", 1],
-      "ctrl-3": ["welcome::OpenRecentProject", 2],
-      "ctrl-4": ["welcome::OpenRecentProject", 3],
-      "ctrl-5": ["welcome::OpenRecentProject", 4],
     },
   },
   {

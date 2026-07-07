@@ -1,4 +1,6 @@
-use ignore::gitignore::Gitignore;
+use ::ignore::gitignore::{Gitignore, GitignoreBuilder};
+use anyhow::{Context as _, Result};
+use fs::Fs;
 use std::{ffi::OsStr, path::Path, sync::Arc};
 
 #[derive(Clone, Debug)]
@@ -95,20 +97,20 @@ impl IgnoreStack {
                     abs_path
                 };
                 match ignore.matched(abs_path, is_dir) {
-                    ignore::Match::None => false,
-                    ignore::Match::Ignore(_) => true,
-                    ignore::Match::Whitelist(_) => false,
+                    ::ignore::Match::None => false,
+                    ::ignore::Match::Ignore(_) => true,
+                    ::ignore::Match::Whitelist(_) => false,
                 }
             }
             IgnoreStackEntry::RepoExclude { ignore, parent } => {
                 match ignore.matched(abs_path, is_dir) {
-                    ignore::Match::None => IgnoreStack {
+                    ::ignore::Match::None => IgnoreStack {
                         repo_root: self.repo_root.clone(),
                         top: parent.clone(),
                     }
                     .is_abs_path_ignored(abs_path, is_dir),
-                    ignore::Match::Ignore(_) => true,
-                    ignore::Match::Whitelist(_) => false,
+                    ::ignore::Match::Ignore(_) => true,
+                    ::ignore::Match::Whitelist(_) => false,
                 }
             }
             IgnoreStackEntry::Some {
@@ -116,14 +118,35 @@ impl IgnoreStack {
                 ignore,
                 parent: prev,
             } => match ignore.matched(abs_path.strip_prefix(abs_base_path).unwrap(), is_dir) {
-                ignore::Match::None => IgnoreStack {
+                ::ignore::Match::None => IgnoreStack {
                     repo_root: self.repo_root.clone(),
                     top: prev.clone(),
                 }
                 .is_abs_path_ignored(abs_path, is_dir),
-                ignore::Match::Ignore(_) => true,
-                ignore::Match::Whitelist(_) => false,
+                ::ignore::Match::Ignore(_) => true,
+                ::ignore::Match::Whitelist(_) => false,
             },
         }
     }
+}
+
+pub async fn build_gitignore(abs_path: &Path, fs: &dyn Fs) -> Result<Gitignore> {
+    let parent = abs_path.parent().unwrap_or_else(|| Path::new("/"));
+    build_gitignore_with_root(abs_path, parent, fs).await
+}
+
+pub async fn build_gitignore_with_root(
+    abs_path: &Path,
+    root: &Path,
+    fs: &dyn Fs,
+) -> Result<Gitignore> {
+    let contents = fs
+        .load(abs_path)
+        .await
+        .with_context(|| format!("failed to load gitignore file at {}", abs_path.display()))?;
+    let mut builder = GitignoreBuilder::new(root);
+    for line in contents.lines() {
+        builder.add_line(Some(abs_path.into()), line)?;
+    }
+    Ok(builder.build()?)
 }

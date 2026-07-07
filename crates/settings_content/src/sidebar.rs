@@ -124,12 +124,6 @@ pub struct SidebarSettingsContent {
     ///
     /// Default: true
     pub show_project_pane_button: Option<bool>,
-    /// Whether to show git status indicators on the branch icon in the sidebar.
-    /// When enabled, the branch icon changes to reflect the current repository
-    /// status (e.g. modified, added, deleted, or conflict).
-    ///
-    /// Default: false
-    pub show_branch_status_icon: Option<bool>,
     /// Whether to show onboarding banners in the sidebar.
     ///
     /// Default: true
@@ -138,14 +132,6 @@ pub struct SidebarSettingsContent {
     ///
     /// Default: true
     pub show_user_picture: Option<bool>,
-    /// Whether to show the branch name button in the sidebar.
-    ///
-    /// Default: true
-    pub show_branch_name: Option<bool>,
-    /// Whether to show the project host and name in the sidebar.
-    ///
-    /// Default: true
-    pub show_project_items: Option<bool>,
     /// Whether to show the sign in button in the sidebar.
     ///
     /// Default: true

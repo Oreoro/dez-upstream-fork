@@ -107,36 +107,75 @@ pub struct CommandInterceptItem {
 /// The result of intercepting a command palette command.
 #[derive(Default, Debug)]
 pub struct CommandInterceptResult {
-    /// The items
+    /// The items to show before normal command matches.
     pub results: Vec<CommandInterceptItem>,
+    /// The items to show after normal command matches.
+    pub append_results: Vec<CommandInterceptItem>,
     /// Whether or not to continue to show the normal matches
     pub exclusive: bool,
 }
 
-/// An interceptor for the command palette.
+type CommandPaletteInterceptor =
+    Rc<dyn Fn(&str, WeakEntity<Workspace>, &mut App) -> Task<CommandInterceptResult>>;
+
+struct DefaultCommandPaletteInterceptor;
+
+/// Interceptors for the command palette.
 #[derive(Clone)]
-pub struct GlobalCommandPaletteInterceptor(
-    Rc<dyn Fn(&str, WeakEntity<Workspace>, &mut App) -> Task<CommandInterceptResult>>,
-);
+pub struct GlobalCommandPaletteInterceptor(Vec<(TypeId, CommandPaletteInterceptor)>);
 
 impl Global for GlobalCommandPaletteInterceptor {}
 
 impl GlobalCommandPaletteInterceptor {
-    /// Sets the global interceptor.
+    /// Sets the default interceptor.
     ///
-    /// This will override the previous interceptor, if it exists.
+    /// This will override the previous default interceptor, if it exists.
     pub fn set(
         cx: &mut App,
         interceptor: impl Fn(&str, WeakEntity<Workspace>, &mut App) -> Task<CommandInterceptResult>
         + 'static,
     ) {
-        cx.set_global(Self(Rc::new(interceptor)));
+        Self::set_for_type::<DefaultCommandPaletteInterceptor>(cx, interceptor);
     }
 
-    /// Clears the global interceptor.
+    /// Clears the default interceptor.
     pub fn clear(cx: &mut App) {
+        Self::clear_for_type::<DefaultCommandPaletteInterceptor>(cx);
+    }
+
+    /// Sets the interceptor for a specific owner type.
+    ///
+    /// This will override the previous interceptor for the same owner type, if
+    /// it exists, without affecting interceptors owned by other integrations.
+    pub fn set_for_type<T: 'static>(
+        cx: &mut App,
+        interceptor: impl Fn(&str, WeakEntity<Workspace>, &mut App) -> Task<CommandInterceptResult>
+        + 'static,
+    ) {
+        let type_id = TypeId::of::<T>();
         if cx.has_global::<Self>() {
-            cx.remove_global::<Self>();
+            cx.update_global(|this: &mut Self, _| {
+                this.0
+                    .retain(|(existing_type_id, _)| *existing_type_id != type_id);
+                this.0.push((type_id, Rc::new(interceptor)));
+            });
+        } else {
+            cx.set_global(Self(vec![(type_id, Rc::new(interceptor))]));
+        }
+    }
+
+    /// Clears the interceptor for a specific owner type.
+    pub fn clear_for_type<T: 'static>(cx: &mut App) {
+        let type_id = TypeId::of::<T>();
+        if cx.has_global::<Self>() {
+            let is_empty = cx.update_global(|this: &mut Self, _| {
+                this.0
+                    .retain(|(existing_type_id, _)| *existing_type_id != type_id);
+                this.0.is_empty()
+            });
+            if is_empty {
+                cx.remove_global::<Self>();
+            }
         }
     }
 
@@ -146,8 +185,21 @@ impl GlobalCommandPaletteInterceptor {
         workspace: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> Option<Task<CommandInterceptResult>> {
-        let interceptor = cx.try_global::<Self>()?;
-        let handler = interceptor.0.clone();
-        Some(handler(query, workspace, cx))
+        let interceptors = cx.try_global::<Self>()?.0.clone();
+        let query = query.to_owned();
+        let tasks = interceptors
+            .into_iter()
+            .map(|(_, handler)| handler(&query, workspace.clone(), cx))
+            .collect::<Vec<_>>();
+        Some(cx.spawn(async move |_| {
+            let mut result = CommandInterceptResult::default();
+            for task in tasks {
+                let intercepted = task.await;
+                result.results.extend(intercepted.results);
+                result.append_results.extend(intercepted.append_results);
+                result.exclusive |= intercepted.exclusive;
+            }
+            result
+        }))
     }
 }

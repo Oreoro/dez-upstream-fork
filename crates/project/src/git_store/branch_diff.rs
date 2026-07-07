@@ -42,7 +42,7 @@ pub struct BranchDiff {
     tree_diff: Option<TreeDiff>,
     tree_diff_update_needed: bool,
     tree_diff_base_task: Option<Task<()>>,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
     update_needed: postage::watch::Sender<()>,
     _task: Task<()>,
 }
@@ -62,15 +62,13 @@ impl BranchDiff {
         cx: &mut Context<Self>,
     ) -> Self {
         let git_store = project.read(cx).git_store().clone();
-        let repo = git_store.read(cx).active_repository();
+        let repo = project.read(cx).active_repository(cx);
         let git_store_subscription = cx.subscribe_in(
             &git_store,
             window,
             move |this, _git_store, event, _window, cx| {
                 let should_update = match event {
-                    GitStoreEvent::ActiveRepositoryChanged(new_repo_id) => {
-                        this.repo.is_none() && new_repo_id.is_some()
-                    }
+                    GitStoreEvent::ActiveRepositoryChanged(_) => false,
                     GitStoreEvent::RepositoryUpdated(
                         event_repo_id,
                         RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
@@ -86,6 +84,18 @@ impl BranchDiff {
                     cx.emit(BranchDiffEvent::FileListChanged);
                     *this.update_needed.borrow_mut() = ();
                 }
+            },
+        );
+        let project_subscription = cx.subscribe_in(
+            &project,
+            window,
+            move |this, _project, event, _window, cx| match event {
+                crate::Event::ActiveRepositoryChanged(_) => {
+                    this.repo = this.project.read(cx).active_repository(cx);
+                    cx.emit(BranchDiffEvent::FileListChanged);
+                    *this.update_needed.borrow_mut() = ();
+                }
+                _ => {}
             },
         );
 
@@ -104,7 +114,7 @@ impl BranchDiff {
             tree_diff_base_task: None,
             base_commit: None,
             head_commit: None,
-            _subscription: git_store_subscription,
+            _subscriptions: vec![git_store_subscription, project_subscription],
             _task: worker,
             update_needed: send,
         }
@@ -165,12 +175,7 @@ impl BranchDiff {
                 this.tree_diff_update_needed = false;
 
                 if this.repo.is_none() {
-                    let active_repo = this
-                        .project
-                        .read(cx)
-                        .git_store()
-                        .read(cx)
-                        .active_repository();
+                    let active_repo = this.project.read(cx).active_repository(cx);
                     if active_repo.is_some() {
                         this.repo = active_repo;
                         needs_update = true;

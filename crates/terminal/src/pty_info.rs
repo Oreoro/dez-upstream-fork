@@ -198,15 +198,30 @@ impl PtyProcessInfo {
         if self.task.lock().is_some() {
             return;
         }
+        let previous_cwd = self
+            .current
+            .read()
+            .as_ref()
+            .map(|process| process.cwd.clone());
         let this = self.clone();
         let refresh = cx.background_executor().spawn(async move {
             this.load();
         });
         let this = Arc::downgrade(self);
-        *self.task.lock() = Some(cx.spawn(async move |_term, _cx| {
+        *self.task.lock() = Some(cx.spawn(async move |terminal, cx| {
             refresh.await;
             if let Some(this) = this.upgrade() {
+                let current_cwd = this
+                    .current
+                    .read()
+                    .as_ref()
+                    .map(|process| process.cwd.clone());
                 this.task.lock().take();
+                if current_cwd != previous_cwd {
+                    terminal
+                        .update(cx, |_, cx| cx.emit(crate::Event::WorkingDirectoryChanged))
+                        .ok();
+                }
             }
         }));
     }

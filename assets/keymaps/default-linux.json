@@ -24,9 +24,7 @@
       "ctrl-alt-enter": ["picker::ConfirmInput", { "secondary": true }],
       "ctrl-shift-w": "workspace::CloseWindow",
       "shift-escape": "workspace::ToggleZoom",
-      "open": "workspace::Open",
       "ctrl-o": "workspace::OpenFiles",
-      "ctrl-k ctrl-o": "workspace::Open",
       "ctrl-=": ["zed::IncreaseBufferFontSize", { "persist": false }],
       "ctrl-+": ["zed::IncreaseBufferFontSize", { "persist": false }],
       "ctrl--": ["zed::DecreaseBufferFontSize", { "persist": false }],
@@ -628,15 +626,6 @@
   {
     "context": "Workspace",
     "bindings": {
-      "alt-open": "projects::OpenRecent",
-      // Change the default action on `menu::Confirm` by setting the parameter
-      // "alt-ctrl-o": ["projects::OpenRecent", { "create_new_window": true }],
-      "alt-ctrl-o": "projects::OpenRecent",
-      "ctrl-r": "projects::OpenRecent",
-      "alt-shift-open": ["projects::OpenRemote", { "from_existing_connection": false }],
-      // Change to open path modal for existing remote connection by setting the parameter
-      // "alt-ctrl-shift-o": ["projects::OpenRemote", { "from_existing_connection": true }],
-      "alt-ctrl-shift-o": ["projects::OpenRemote", { "from_existing_connection": false }],
       "alt-ctrl-shift-b": "branches::OpenRecent",
       "alt-ctrl-shift-w": "git::Worktree",
       "alt-shift-enter": "toast::RunAction",
@@ -648,8 +637,6 @@
       "ctrl-shift-s": "workspace::SaveAs",
       "new": "workspace::NewFile",
       "ctrl-n": "workspace::NewFile",
-      "shift-new": "workspace::NewWindow",
-      "ctrl-shift-n": "workspace::NewWindow",
       "ctrl-`": "workspace::NewTerminal",
       "f10": ["app_menu::OpenApplicationMenu", "Zed"],
       "alt-1": ["workspace::ActivatePane", 0],
@@ -1181,9 +1168,7 @@
     "context": "RecentProjects || (RecentProjects > Picker > Editor)",
     "bindings": {
       "ctrl-k": "recent_projects::ToggleActionsMenu",
-      "ctrl-shift-a": "workspace::AddFolderToProject",
       "shift-backspace": "recent_projects::RemoveSelected",
-      "ctrl-shift-enter": "recent_projects::AddToWorkspace",
     },
   },
   {
@@ -1385,11 +1370,6 @@
       "ctrl-+": ["zed::IncreaseUiFontSize", { "persist": false }],
       "ctrl--": ["zed::DecreaseUiFontSize", { "persist": false }],
       "ctrl-0": ["zed::ResetUiFontSize", { "persist": false }],
-      "ctrl-1": ["welcome::OpenRecentProject", 0],
-      "ctrl-2": ["welcome::OpenRecentProject", 1],
-      "ctrl-3": ["welcome::OpenRecentProject", 2],
-      "ctrl-4": ["welcome::OpenRecentProject", 3],
-      "ctrl-5": ["welcome::OpenRecentProject", 4],
     },
   },
   {

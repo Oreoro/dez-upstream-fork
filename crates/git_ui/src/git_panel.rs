@@ -5,11 +5,10 @@ use crate::commit_view::CommitView;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
+use crate::repository_selector::repository_selector_menu;
 use crate::solo_diff_view::SoloDiffView;
-use crate::{branch_picker, picker_prompt, render_remote_button};
-use crate::{
-    git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
-};
+use crate::{git_panel_settings::GitPanelSettings, git_status_icon};
+use crate::{picker_prompt, render_remote_button};
 use agent_settings::{AgentSettings, UserAgentsMd};
 use anyhow::Context as _;
 use askpass::AskPassDelegate;
@@ -78,8 +77,8 @@ use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
 use ui::{
     ButtonLike, Checkbox, ContextMenu, ContextMenuEntry, Divider, ElevationIndex,
-    IndentGuideColors, KeyBinding, PopoverMenu, ProjectEmptyState, RenderedIndentGuide, ScrollAxes,
-    Scrollbars, SplitButton, Tab, TintColor, Tooltip, WithScrollbar, prelude::*,
+    IndentGuideColors, PopoverMenu, ProjectEmptyState, RenderedIndentGuide, ScrollAxes, Scrollbars,
+    SplitButton, Tab, TintColor, Tooltip, WithScrollbar, prelude::*,
 };
 use util::paths::PathStyle;
 use util::{ResultExt, TryFutureExt, markdown::MarkdownInlineCode, maybe, rel_path::RelPath};
@@ -993,20 +992,42 @@ impl GitPanel {
             .detach();
 
             cx.subscribe_in(
+                &project,
+                window,
+                move |this, _project, event, window, cx| match event {
+                    project::Event::ActiveRepositoryChanged(_)
+                    | project::Event::WorktreePathsChanged { .. } => {
+                        this.schedule_update(window, cx);
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+
+            cx.subscribe_in(
                 &git_store,
                 window,
                 move |this, _git_store, event, window, cx| match event {
                     GitStoreEvent::RepositoryUpdated(
-                        _,
+                        repository_id,
                         RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
-                        true,
-                    )
-                    | GitStoreEvent::RepositoryAdded
+                        _,
+                    ) => {
+                        let is_active_repository = this
+                            .project
+                            .read(cx)
+                            .active_repository(cx)
+                            .is_some_and(|repository| repository.read(cx).id == *repository_id);
+                        if is_active_repository {
+                            this.schedule_update(window, cx);
+                        }
+                    }
+                    GitStoreEvent::RepositoryAdded
                     | GitStoreEvent::RepositoryRemoved(_)
-                    | GitStoreEvent::GlobalConfigurationUpdated
-                    | GitStoreEvent::ActiveRepositoryChanged(_) => {
+                    | GitStoreEvent::GlobalConfigurationUpdated => {
                         this.schedule_update(window, cx);
                     }
+                    GitStoreEvent::ActiveRepositoryChanged(_) => {}
                     GitStoreEvent::IndexWriteError(error) => {
                         this.workspace
                             .update(cx, |workspace, cx| {
@@ -6168,20 +6189,8 @@ impl GitPanel {
                 .into_any_element()
         } else if worktree_count == 0 {
             let focus_handle = self.focus_handle.clone();
-            ProjectEmptyState::new(
-                "Git Panel",
-                focus_handle.clone(),
-                KeyBinding::for_action_in(&workspace::Open::default(), &focus_handle, cx),
-            )
-            .on_open_project(|_, window, cx| {
-                telemetry::event!("Git Panel Add Project Clicked");
-                window.dispatch_action(workspace::Open::default().boxed_clone(), cx);
-            })
-            .on_clone_repo(|_, window, cx| {
-                telemetry::event!("Git Panel Clone Repo Clicked");
-                window.dispatch_action(git::Clone.boxed_clone(), cx);
-            })
-            .into_any_element()
+            ProjectEmptyState::new("No repository detected", focus_handle.clone())
+                .into_any_element()
         } else {
             Empty.into_any_element()
         }
@@ -7522,8 +7531,8 @@ impl Render for GitPanelMessageTooltip {
 #[derive(IntoElement, RegisterComponent)]
 pub struct PanelRepoFooter {
     active_repository: SharedString,
-    branch: Option<Branch>,
-    head_commit: Option<CommitDetails>,
+    _branch: Option<Branch>,
+    _head_commit: Option<CommitDetails>,
 
     // Getting a GitPanel in previews will be difficult.
     //
@@ -7540,8 +7549,8 @@ impl PanelRepoFooter {
     ) -> Self {
         Self {
             active_repository,
-            branch,
-            head_commit,
+            _branch: branch,
+            _head_commit: head_commit,
             git_panel,
         }
     }
@@ -7549,8 +7558,8 @@ impl PanelRepoFooter {
     pub fn new_preview(active_repository: SharedString, branch: Option<Branch>) -> Self {
         Self {
             active_repository,
-            branch,
-            head_commit: None,
+            _branch: branch,
+            _head_commit: None,
             git_panel: None,
         }
     }
@@ -7558,130 +7567,28 @@ impl PanelRepoFooter {
 
 impl RenderOnce for PanelRepoFooter {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let project = self
-            .git_panel
-            .as_ref()
-            .map(|panel| panel.read(cx).project.clone());
-
-        let (workspace, repo) = self
-            .git_panel
-            .as_ref()
-            .map(|panel| {
-                let panel = panel.read(cx);
-                (panel.workspace.clone(), panel.active_repository.clone())
-            })
-            .unzip();
-
-        let single_repo = project
-            .as_ref()
-            .map(|project| project.read(cx).git_store().read(cx).repositories().len() == 1)
-            .unwrap_or(true);
-
-        const MAX_SHORT_SHA_LEN: usize = 8;
-        let branch_name = self
-            .branch
-            .as_ref()
-            .map(|branch| branch.name().to_owned())
-            .or_else(|| {
-                self.head_commit.as_ref().map(|commit| {
-                    commit
-                        .sha
-                        .chars()
-                        .take(MAX_SHORT_SHA_LEN)
-                        .collect::<String>()
-                })
-            })
-            .unwrap_or_else(|| " (no branch)".to_owned());
-        let show_separator = self.branch.is_some() || self.head_commit.is_some();
-
-        let active_repo_name = self.active_repository.clone();
-
-        let repo_selector = PopoverMenu::new("repository-switcher")
-            .menu({
-                let project = project;
-                move |window, cx| {
-                    let project = project.clone()?;
-                    Some(cx.new(|cx| RepositorySelector::new(project, rems(20.), window, cx)))
-                }
-            })
-            .trigger_with_tooltip(
-                Button::new("repo-selector", active_repo_name)
-                    .size(ButtonSize::None)
-                    .label_size(LabelSize::Small)
-                    .truncate(true),
-                move |_, cx| {
-                    if single_repo {
-                        cx.new(|_| Empty).into()
-                    } else {
-                        Tooltip::simple("Switch Active Repository", cx)
-                    }
-                },
-            )
-            .anchor(Anchor::BottomLeft)
-            .offset(gpui::Point {
-                x: px(0.0),
-                y: px(-2.0),
-            })
-            .into_any_element();
-
-        let branch_selector_button = Button::new("branch-selector", branch_name)
-            .size(ButtonSize::None)
-            .label_size(LabelSize::Small)
-            .truncate(true)
-            .on_click(|_, window, cx| {
-                window.dispatch_action(zed_actions::git::Switch.boxed_clone(), cx);
-            });
-
-        let branch_selector = PopoverMenu::new("popover-button")
-            .menu(move |window, cx| {
-                let workspace = workspace.clone()?;
-                let repo = repo.clone().flatten();
-                Some(branch_picker::popover(workspace, false, repo, window, cx))
-            })
-            .trigger_with_tooltip(
-                branch_selector_button,
-                Tooltip::for_action_title("Switch Branch", &zed_actions::git::Switch),
-            )
-            .anchor(Anchor::BottomLeft)
-            .offset(gpui::Point {
-                x: px(0.0),
-                y: px(-2.0),
-            });
+        let git_panel = self.git_panel.clone();
+        let repository_selector = git_panel.as_ref().and_then(|git_panel| {
+            let project = git_panel.read(cx).project.clone();
+            repository_selector_menu("git-panel-repository-selector", &project, cx)
+        });
+        let remote_button = git_panel.and_then(|git_panel| {
+            git_panel.update(cx, |git_panel, cx| git_panel.render_remote_button(cx))
+        });
 
         h_flex()
-            .h_9()
             .w_full()
-            .px_2()
             .justify_between()
-            .gap_1()
-            .child(
-                h_flex()
-                    .flex_1()
-                    .overflow_hidden()
-                    .gap_px()
-                    .child(Icon::new(IconName::GitBranch).size(IconSize::Small).color(
-                        if single_repo {
-                            Color::Disabled
-                        } else {
-                            Color::Muted
-                        },
-                    ))
-                    .when(!single_repo, |this| {
-                        this.child(div().child(repo_selector).min_w_0()).when(
-                            show_separator,
-                            |this| {
-                                this.child(Label::new("/").size(LabelSize::Small).color(
-                                    Color::Custom(cx.theme().colors().text_muted.opacity(0.4)),
-                                ))
-                            },
-                        )
-                    })
-                    .child(div().child(branch_selector).min_w_0()),
-            )
-            .children(if let Some(git_panel) = self.git_panel {
-                git_panel.update(cx, |git_panel, cx| git_panel.render_remote_button(cx))
-            } else {
-                None
+            .gap_2()
+            .pl_2()
+            .child(repository_selector.unwrap_or_else(|| {
+                Label::new(self.active_repository)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element()
+            }))
+            .when_some(remote_button, |this, remote_button| {
+                this.h_9().px_2().child(remote_button)
             })
     }
 }

@@ -6,8 +6,7 @@ use serde::Deserialize;
 use settings::CommandAliasTarget;
 pub use settings::{
     AutosaveSetting, EncodingDisplayOptions, InactiveOpacity, PaneSplitDirectionHorizontal,
-    PaneSplitDirectionVertical, RegisterSetting, RestoreOnStartupBehavior, Settings,
-    SidebarDockPosition, SidebarSide,
+    PaneSplitDirectionVertical, RegisterSetting, Settings, SidebarDockPosition, SidebarSide,
 };
 
 #[derive(RegisterSetting)]
@@ -20,7 +19,6 @@ pub struct WorkspaceSettings {
     pub confirm_quit: bool,
     pub show_call_status_icon: bool,
     pub autosave: AutosaveSetting,
-    pub restore_on_startup: settings::RestoreOnStartupBehavior,
     pub cli_default_open_behavior: settings::CliDefaultOpenBehavior,
     pub default_open_behavior: settings::DefaultOpenBehavior,
     pub restore_on_file_reopen: bool,
@@ -122,7 +120,6 @@ impl Settings for WorkspaceSettings {
             confirm_quit: workspace.confirm_quit.unwrap(),
             show_call_status_icon: workspace.show_call_status_icon.unwrap(),
             autosave: workspace.autosave.unwrap(),
-            restore_on_startup: workspace.restore_on_startup.unwrap(),
             cli_default_open_behavior: workspace.cli_default_open_behavior.unwrap(),
             default_open_behavior: workspace.default_open_behavior.unwrap(),
             restore_on_file_reopen: workspace.restore_on_file_reopen.unwrap(),

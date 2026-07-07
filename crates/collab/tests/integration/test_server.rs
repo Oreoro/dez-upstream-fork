@@ -331,14 +331,27 @@ impl TestServer {
         let workspace_store = cx.new(|cx| WorkspaceStore::new(client.clone(), cx));
         let language_registry = Arc::new(LanguageRegistry::test(cx.executor()));
         let session = cx.new(|cx| AppSession::new(Session::test(), cx));
+        let node_runtime = NodeRuntime::unavailable();
+        let shared_project_store = cx.new(|cx| {
+            workspace::SharedProjectStore::new(
+                client.clone(),
+                node_runtime.clone(),
+                user_store.clone(),
+                language_registry.clone(),
+                fs.clone(),
+                None,
+                cx,
+            )
+        });
         let app_state = Arc::new(workspace::AppState {
             client: client.clone(),
             user_store: user_store.clone(),
             workspace_store,
+            shared_project_store,
             languages: language_registry,
             fs: fs.clone(),
             build_window_options: |_, _| Default::default(),
-            node_runtime: NodeRuntime::unavailable(),
+            node_runtime,
             session,
         });
 

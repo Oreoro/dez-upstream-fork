@@ -1,6 +1,7 @@
 mod persistence;
 
 use std::{
+    any::TypeId,
     cmp::{self, Reverse},
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -30,6 +31,23 @@ use zed_actions::{OpenZedUrl, command_palette::Toggle};
 
 pub fn init(cx: &mut App) {
     command_palette_hooks::init(cx);
+    CommandPaletteFilter::update_global(cx, |filter, _cx| {
+        filter.hide_action_types(&[
+            TypeId::of::<workspace::Open>(),
+            TypeId::of::<workspace::AddFolderToProject>(),
+            TypeId::of::<zed_actions::OpenRecent>(),
+            TypeId::of::<zed_actions::OpenRemote>(),
+            TypeId::of::<zed_actions::OpenDevContainer>(),
+            TypeId::of::<zed_actions::SwitchWorktree>(),
+            TypeId::of::<zed_actions::OpenWorktreeInNewWindow>(),
+        ]);
+
+        #[cfg(target_os = "windows")]
+        filter.hide_action_types(&[
+            TypeId::of::<zed_actions::wsl_actions::OpenFolderInWsl>(),
+            TypeId::of::<zed_actions::wsl_actions::OpenWsl>(),
+        ]);
+    });
     cx.observe_new(CommandPalette::register).detach();
 }
 
@@ -304,32 +322,21 @@ impl CommandPaletteDelegate {
 
         let mut new_matches = Vec::new();
 
-        for CommandInterceptItem {
-            action,
-            string,
-            positions,
-        } in intercept_result.results
-        {
-            if let Some(idx) = matches
-                .iter()
-                .position(|m| commands[m.candidate_id].action.partial_eq(&*action))
-            {
-                matches.remove(idx);
-            }
-            commands.push(Command {
-                name: string.clone(),
-                action,
-            });
-            new_matches.push(StringMatch {
-                candidate_id: commands.len() - 1,
-                string: string.into(),
-                positions,
-                score: 0.0,
-            })
-        }
+        push_intercept_matches(
+            intercept_result.results,
+            &mut commands,
+            &mut matches,
+            &mut new_matches,
+        );
         if !intercept_result.exclusive {
             new_matches.append(&mut matches);
         }
+        push_intercept_matches(
+            intercept_result.append_results,
+            &mut commands,
+            &mut matches,
+            &mut new_matches,
+        );
         self.commands = commands;
         self.matches = new_matches;
         if self.matches.is_empty() {
@@ -370,6 +377,37 @@ impl CommandPaletteDelegate {
     #[cfg(any(test, feature = "test-support"))]
     pub fn seed_history(&mut self, queries: &[&str]) {
         self.query_history.history = Some(queries.iter().map(|s| s.to_string()).collect());
+    }
+}
+
+fn push_intercept_matches(
+    intercept_items: Vec<CommandInterceptItem>,
+    commands: &mut Vec<Command>,
+    matches: &mut Vec<StringMatch>,
+    new_matches: &mut Vec<StringMatch>,
+) {
+    for CommandInterceptItem {
+        action,
+        string,
+        positions,
+    } in intercept_items
+    {
+        if let Some(idx) = matches
+            .iter()
+            .position(|m| commands[m.candidate_id].action.partial_eq(&*action))
+        {
+            matches.remove(idx);
+        }
+        commands.push(Command {
+            name: string.clone(),
+            action,
+        });
+        new_matches.push(StringMatch {
+            candidate_id: commands.len() - 1,
+            string: string.into(),
+            positions,
+            score: 0.0,
+        })
     }
 }
 
@@ -499,6 +537,7 @@ impl PickerDelegate for CommandPaletteDelegate {
                             positions: vec![],
                         }],
                         exclusive: false,
+                        ..Default::default()
                     }
                 } else if let Some(task) = intercept_task {
                     task.await

@@ -51,7 +51,7 @@ use workspace::{
 };
 use zed_actions::{
     AGENT_SKILLS_SETTINGS_PATH, OpenProjectSettings, OpenSettings, OpenSettingsAt,
-    OpenSettingsAtTarget,
+    OpenSettingsAtTarget, OpenWorktreeSettings,
 };
 
 use crate::components::{
@@ -456,17 +456,28 @@ pub fn init(cx: &mut App) {
             })
             .register_action(|workspace, _: &OpenProjectSettings, window, cx| {
                 let window_handle = window.window_handle().downcast::<MultiWorkspace>();
-                let target_worktree_id = workspace
-                    .project()
-                    .read(cx)
-                    .visible_worktrees(cx)
-                    .find_map(|tree| {
-                        tree.read(cx)
-                            .root_entry()?
-                            .is_dir()
-                            .then_some(tree.read(cx).id())
-                    });
+                let target_worktree_id = workspace.active_context().worktree_id().or_else(|| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .find_map(|tree| {
+                            tree.read(cx)
+                                .root_entry()?
+                                .is_dir()
+                                .then_some(tree.read(cx).id())
+                        })
+                });
                 open_settings_editor(None, target_worktree_id, window_handle, cx);
+            })
+            .register_action(|_, action: &OpenWorktreeSettings, window, cx| {
+                let window_handle = window.window_handle().downcast::<MultiWorkspace>();
+                open_settings_editor(
+                    None,
+                    Some(WorktreeId::from_usize(action.worktree_id)),
+                    window_handle,
+                    cx,
+                );
             })
             .register_action(
                 |_, _: &zed_actions::assistant::OpenSkillCreator, window, cx| {
@@ -520,7 +531,6 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<SharedString>(render_text_field)
         .add_basic_renderer::<settings::SaturatingBool>(render_toggle_button)
         .add_basic_renderer::<settings::CursorShape>(render_dropdown)
-        .add_basic_renderer::<settings::RestoreOnStartupBehavior>(render_dropdown)
         .add_basic_renderer::<settings::OnLastWindowClosed>(render_dropdown)
         .add_basic_renderer::<settings::CliDefaultOpenBehavior>(render_dropdown)
         .add_basic_renderer::<settings::DefaultOpenBehavior>(render_dropdown)
@@ -2826,7 +2836,7 @@ impl SettingsWindow {
                                         }),
                                     )
                                     .style(DropdownStyle::Subtle)
-                                    .trigger_tooltip(Tooltip::text("View Other Projects"))
+                                    .trigger_tooltip(Tooltip::text("View Other Worktrees"))
                                     .trigger_icon(IconName::ChevronDown)
                                     .attach(gpui::Anchor::BottomLeft)
                                     .offset(gpui::Point {
@@ -4469,25 +4479,21 @@ pub(crate) fn all_projects(
     cx: &App,
 ) -> impl Iterator<Item = Entity<Project>> {
     let mut seen_project_ids = std::collections::HashSet::new();
-    let app_state = workspace::AppState::global(cx);
-    app_state
-        .workspace_store
-        .read(cx)
-        .workspaces()
-        .filter_map(|weak| weak.upgrade())
-        .map(|workspace: Entity<Workspace>| workspace.read(cx).project().clone())
-        .chain(
-            window
-                .and_then(|handle| handle.read(cx).ok())
-                .into_iter()
-                .flat_map(|multi_workspace| {
-                    multi_workspace
-                        .workspaces()
-                        .map(|workspace| workspace.read(cx).project().clone())
-                        .collect::<Vec<_>>()
-                }),
-        )
-        .filter(move |project| seen_project_ids.insert(project.entity_id()))
+    let mut projects = Vec::new();
+    let multi_workspace = window.and_then(|handle| handle.read(cx).ok()).or_else(|| {
+        workspace::singleton_multi_workspace_window(cx).and_then(|window| window.read(cx).ok())
+    });
+
+    if let Some(multi_workspace) = multi_workspace {
+        for workspace in multi_workspace.workspaces() {
+            let project = workspace.read(cx).project().clone();
+            if seen_project_ids.insert(project.entity_id()) {
+                projects.push(project);
+            }
+        }
+    }
+
+    projects.into_iter()
 }
 
 fn open_user_settings_in_workspace(

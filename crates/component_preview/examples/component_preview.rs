@@ -63,12 +63,24 @@ fn main() {
             .block_on(Session::new(session_id, kvp));
         let session = cx.new(|cx| AppSession::new(session, cx));
         let node_runtime = NodeRuntime::unavailable();
+        let shared_project_store = cx.new(|cx| {
+            workspace::SharedProjectStore::new(
+                client.clone(),
+                node_runtime.clone(),
+                user_store.clone(),
+                languages.clone(),
+                fs.clone(),
+                None,
+                cx,
+            )
+        });
 
         let app_state = Arc::new(AppState {
             languages,
             client,
             user_store,
             workspace_store,
+            shared_project_store,
             fs,
             build_window_options: |_, _| Default::default(),
             node_runtime,

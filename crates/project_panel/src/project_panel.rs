@@ -62,8 +62,8 @@ use std::{
 use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
-    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    IndentGuideLayout, Indicator, ListItem, ListItemSpacing, ProjectEmptyState, ScrollAxes,
+    ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -91,6 +91,7 @@ use crate::{
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
 const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
+const MAX_VISIBLE_DIRECTORY_PREFETCHES: usize = 64;
 
 struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
@@ -152,6 +153,8 @@ pub struct ProjectPanel {
     clipboard: Option<ClipboardEntry>,
     _dragged_entry_destination: Option<Arc<Path>>,
     workspace: WeakEntity<Workspace>,
+    visible_worktree_ids: HashSet<WorktreeId>,
+    pending_directory_loads: HashSet<(WorktreeId, ProjectEntryId)>,
     diagnostics: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticSeverity>,
     diagnostic_counts: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticCount>,
     diagnostic_summary_update: Task<()>,
@@ -355,8 +358,6 @@ actions!(
         Duplicate,
         /// Reveals the selected item in the system file manager.
         RevealInFileManager,
-        /// Removes the selected folder from the project.
-        RemoveFromProject,
         /// Cuts the selected file or directory.
         Cut,
         /// Pastes the previously cut or copied item.
@@ -649,6 +650,16 @@ impl ProjectPanel {
         let project = workspace.project().clone();
         let git_store = project.read(cx).git_store().clone();
         let path_style = project.read(cx).path_style(cx);
+        let workspace_handle = cx.entity();
+        let presentation_worktree_ids = workspace.presentation_worktree_ids(cx);
+        let visible_worktree_ids = if presentation_worktree_ids.is_empty() {
+            workspace
+                .visible_worktrees(cx)
+                .map(|worktree| worktree.read(cx).id())
+                .collect::<HashSet<_>>()
+        } else {
+            presentation_worktree_ids.into_iter().collect::<HashSet<_>>()
+        };
         let project_panel = cx.new(|cx| {
             let focus_handle = cx.focus_handle();
             cx.on_focus(&focus_handle, window, Self::focus_in).detach();
@@ -668,29 +679,34 @@ impl ProjectPanel {
             )
             .detach();
 
+            cx.subscribe_in(&workspace_handle, window, {
+                let project = project.clone();
+                move |this, _, event, window, cx| match event {
+                    workspace::Event::ActiveItemChanged => match project.read(cx).active_entry() {
+                        Some(entry_id) => {
+                            if ProjectPanelSettings::get_global(cx).auto_reveal_entries {
+                                this.reveal_entry(project.clone(), entry_id, true, window, cx)
+                                    .ok();
+                            }
+                        }
+                        None => {
+                            this.marked_entries.clear();
+                        }
+                    },
+                    workspace::Event::PathEvidenceChanged(worktree_ids) => {
+                        this.visible_worktree_ids = worktree_ids.iter().copied().collect();
+                        this.update_visible_entries(None, false, false, window, cx);
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            })
+            .detach();
+
             cx.subscribe_in(
                 &project,
                 window,
                 |this, project, event, window, cx| match event {
-                    project::Event::ActiveEntryChanged(Some(entry_id)) => {
-                        if ProjectPanelSettings::get_global(cx).auto_reveal_entries {
-                            this.reveal_entry(project.clone(), *entry_id, true, window, cx)
-                                .ok();
-                        }
-                    }
-                    project::Event::ActiveEntryChanged(None) => {
-                        let is_active_item_file_diff_view = this
-                            .workspace
-                            .upgrade()
-                            .and_then(|ws| ws.read(cx).active_item(cx))
-                            .map(|item| {
-                                item.act_as_type(TypeId::of::<FileDiffView>(), cx).is_some()
-                            })
-                            .unwrap_or(false);
-                        if !is_active_item_file_diff_view {
-                            this.marked_entries.clear();
-                        }
-                    }
                     project::Event::RevealInProjectPanel(entry_id) => {
                         if let Some(()) = this
                             .reveal_entry(project.clone(), *entry_id, false, window, cx)
@@ -721,12 +737,18 @@ impl ProjectPanel {
                     }
                     project::Event::WorktreeRemoved(id) => {
                         this.state.expanded_dir_ids.remove(id);
+                        this.pending_directory_loads
+                            .retain(|(worktree_id, _)| worktree_id != id);
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }
-                    project::Event::WorktreeUpdatedEntries(_, _)
-                    | project::Event::WorktreeAdded(_)
-                    | project::Event::WorktreeOrderChanged => {
+                    project::Event::WorktreeUpdatedEntries(worktree_id, _) => {
+                        this.pending_directory_loads
+                            .retain(|(pending_worktree_id, _)| pending_worktree_id != worktree_id);
+                        this.update_visible_entries(None, false, false, window, cx);
+                        cx.notify();
+                    }
+                    project::Event::WorktreeAdded(_) | project::Event::WorktreeOrderChanged => {
                         this.update_visible_entries(None, false, false, window, cx);
                         cx.notify();
                     }
@@ -845,6 +867,8 @@ impl ProjectPanel {
                 clipboard: None,
                 _dragged_entry_destination: None,
                 workspace: workspace.weak_handle(),
+                visible_worktree_ids,
+                pending_directory_loads: Default::default(),
                 diagnostics: Default::default(),
                 diagnostic_counts: Default::default(),
                 diagnostic_summary_update: Task::ready(()),
@@ -961,6 +985,14 @@ impl ProjectPanel {
         project_panel
     }
 
+    fn visible_worktrees(&self, cx: &App) -> Vec<Entity<Worktree>> {
+        self.project
+            .read(cx)
+            .visible_worktrees(cx)
+            .filter(|worktree| self.visible_worktree_ids.contains(&worktree.read(cx).id()))
+            .collect()
+    }
+
     pub async fn load(
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
@@ -1075,12 +1107,11 @@ impl ProjectPanel {
             let is_unfoldable = auto_fold_dirs && self.is_unfoldable(entry, worktree);
             let is_read_only = project.is_read_only(cx);
             let is_remote = project.is_remote();
-            let is_collab = project.is_via_collab();
             let is_local = project.is_local() || project.is_via_wsl_with_host_interop(cx);
             let is_markdown = !is_dir && MarkdownPreviewView::is_markdown_path(&*entry.path);
 
             let settings = ProjectPanelSettings::get_global(cx);
-            let visible_worktrees_count = project.visible_worktrees(cx).count();
+            let visible_worktrees_count = self.visible_worktrees(cx).len();
             let should_hide_rename = is_root
                 && (cfg!(target_os = "windows")
                     || (settings.hide_root && visible_worktrees_count == 1));
@@ -1195,14 +1226,6 @@ impl ProjectPanel {
                             })
                             .when(!is_root, |menu| {
                                 menu.action("Delete", Box::new(Delete { skip_prompt: false }))
-                            })
-                            .when(!is_collab && is_root, |menu| {
-                                menu.separator()
-                                    .action(
-                                        "Add Folders to Project…",
-                                        Box::new(workspace::AddFolderToProject),
-                                    )
-                                    .action("Remove from Project", Box::new(RemoveFromProject))
                             })
                             .when(is_dir && !is_root, |menu| {
                                 menu.separator()
@@ -1404,7 +1427,7 @@ impl ProjectPanel {
         root_id: ProjectEntryId,
         cx: &App,
     ) {
-        let single_worktree = self.project.read(cx).visible_worktrees(cx).count() == 1;
+        let single_worktree = self.visible_worktrees(cx).len() == 1;
         if let Some(expanded_dir_ids) = self.state.expanded_dir_ids.get_mut(&worktree_id) {
             if single_worktree {
                 expanded_dir_ids.retain(|id| id == &root_id);
@@ -1415,9 +1438,8 @@ impl ProjectPanel {
     }
 
     fn all_worktree_roots(&self, cx: &App) -> Vec<(WorktreeId, ProjectEntryId)> {
-        self.project
-            .read(cx)
-            .visible_worktrees(cx)
+        self.visible_worktrees(cx)
+            .into_iter()
             .filter_map(|worktree| {
                 let worktree = worktree.read(cx);
                 Some((worktree.id(), worktree.root_entry()?.id))
@@ -2263,8 +2285,7 @@ impl ProjectPanel {
 
                 if Some(entry) == worktree.read(cx).root_entry() {
                     let settings = ProjectPanelSettings::get_global(cx);
-                    let visible_worktrees_count =
-                        self.project.read(cx).visible_worktrees(cx).count();
+                    let visible_worktrees_count = self.visible_worktrees(cx).len();
                     if settings.hide_root && visible_worktrees_count == 1 {
                         return;
                     }
@@ -3660,19 +3681,6 @@ impl ProjectPanel {
         }
     }
 
-    fn remove_from_project(
-        &mut self,
-        _: &RemoveFromProject,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        for entry in self.effective_entries().iter() {
-            let worktree_id = entry.worktree_id;
-            self.project
-                .update(cx, |project, cx| project.remove_worktree(worktree_id, cx));
-        }
-    }
-
     fn file_abs_paths_to_diff(&self, cx: &Context<Self>) -> Option<(PathBuf, PathBuf)> {
         let mut selections_abs_path = self
             .marked_entries
@@ -3777,7 +3785,7 @@ impl ProjectPanel {
                 }
             };
 
-            let include_root = self.project.read(cx).visible_worktrees(cx).count() > 1;
+            let include_root = self.visible_worktrees(cx).len() > 1;
             let dir_path = if include_root {
                 worktree.read(cx).root_name().join(&dir_path)
             } else {
@@ -4157,15 +4165,16 @@ impl ProjectPanel {
         let old_ancestors = self.state.ancestors.clone();
         let temporary_unfolded_pending_state = self.state.temporarily_unfolded_pending_state.take();
         let mut new_state = State::derive(&self.state);
-        new_state.last_worktree_root_id = project
-            .visible_worktrees(cx)
+        let visible_worktrees = self.visible_worktrees(cx);
+        new_state.last_worktree_root_id = visible_worktrees
+            .iter()
             .next_back()
             .and_then(|worktree| worktree.read(cx).root_entry())
             .map(|entry| entry.id);
         let mut max_width_item = None;
 
-        let visible_worktrees: Vec<_> = project
-            .visible_worktrees(cx)
+        let visible_worktrees: Vec<_> = visible_worktrees
+            .into_iter()
             .map(|worktree| worktree.read(cx).snapshot())
             .collect();
         let hide_root = settings.hide_root && visible_worktrees.len() == 1;
@@ -4424,6 +4433,8 @@ impl ProjectPanel {
                         entry_id,
                     });
                 }
+                this.request_expanded_directory_loads(cx);
+                this.request_visible_directory_prefetches(cx);
                 let elapsed = now.elapsed();
                 if this.last_reported_update.elapsed() > Duration::from_secs(3600) {
                     telemetry::event!(
@@ -4458,6 +4469,90 @@ impl ProjectPanel {
                 || self.update_visible_entries_task.focus_filename_editor,
             autoscroll: autoscroll || self.update_visible_entries_task.autoscroll,
         };
+    }
+
+    fn request_expanded_directory_loads(&mut self, cx: &mut Context<Self>) {
+        let mut entries_to_load = Vec::new();
+        {
+            let project = self.project.read(cx);
+            for (worktree_id, expanded_dir_ids) in &self.state.expanded_dir_ids {
+                let Some(worktree) = project.worktree_for_id(*worktree_id, cx) else {
+                    continue;
+                };
+                let worktree = worktree.read(cx);
+                for entry_id in expanded_dir_ids {
+                    if worktree
+                        .entry_for_id(*entry_id)
+                        .is_some_and(|entry| entry.kind.is_unloaded())
+                        && !self
+                            .pending_directory_loads
+                            .contains(&(*worktree_id, *entry_id))
+                    {
+                        entries_to_load.push((*worktree_id, *entry_id));
+                    }
+                }
+            }
+        }
+
+        if entries_to_load.is_empty() {
+            return;
+        }
+
+        self.pending_directory_loads
+            .extend(entries_to_load.iter().copied());
+        self.project.update(cx, |project, cx| {
+            for (worktree_id, entry_id) in entries_to_load {
+                project.expand_entry(worktree_id, entry_id, cx);
+            }
+        });
+    }
+
+    fn request_visible_directory_prefetches(&mut self, cx: &mut Context<Self>) {
+        let mut entries_to_prefetch = Vec::new();
+        {
+            let project = self.project.read(cx);
+            'worktrees: for visible_worktree in &self.state.visible_entries {
+                for entry in &visible_worktree.entries {
+                    if entries_to_prefetch.len() >= MAX_VISIBLE_DIRECTORY_PREFETCHES {
+                        break 'worktrees;
+                    }
+                    if self
+                        .state
+                        .expanded_dir_ids
+                        .get(&visible_worktree.worktree_id)
+                        .is_some_and(|expanded| expanded.binary_search(&entry.id).is_ok())
+                    {
+                        continue;
+                    }
+                    let Some(worktree) = project.worktree_for_id(visible_worktree.worktree_id, cx)
+                    else {
+                        continue;
+                    };
+                    let worktree = worktree.read(cx);
+                    if worktree
+                        .entry_for_id(entry.id)
+                        .is_some_and(|entry| entry.kind.is_unloaded())
+                        && !self
+                            .pending_directory_loads
+                            .contains(&(visible_worktree.worktree_id, entry.id))
+                    {
+                        entries_to_prefetch.push((visible_worktree.worktree_id, entry.id));
+                    }
+                }
+            }
+        }
+
+        if entries_to_prefetch.is_empty() {
+            return;
+        }
+
+        self.pending_directory_loads
+            .extend(entries_to_prefetch.iter().copied());
+        self.project.update(cx, |project, cx| {
+            for (worktree_id, entry_id) in entries_to_prefetch {
+                project.expand_entry(worktree_id, entry_id, cx);
+            }
+        });
     }
 
     fn expand_entry(
@@ -6887,7 +6982,6 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::new_search_in_directory))
                 .on_action(cx.listener(Self::unfold_directory))
                 .on_action(cx.listener(Self::fold_directory))
-                .on_action(cx.listener(Self::remove_from_project))
                 .on_action(cx.listener(Self::compare_marked_files))
                 .when(cx.has_flag::<ProjectPanelUndoRedoFeatureFlag>(), |el| {
                     el.on_action(cx.listener(Self::undo))
@@ -7334,37 +7428,15 @@ impl Render for ProjectPanel {
                 }))
         } else {
             let focus_handle = self.focus_handle(cx);
-            let workspace = self.workspace.clone();
-            let workspace_clone = self.workspace.clone();
 
             v_flex()
                 .id("empty-project_panel-wrapper")
                 .size_full()
                 .bg(cx.theme().colors().editor_background)
-                .child(
-                    ProjectEmptyState::new(
-                        "Project Panel",
-                        focus_handle.clone(),
-                        KeyBinding::for_action_in(&workspace::Open::default(), &focus_handle, cx),
-                    )
-                    .on_open_project(move |_, window, cx| {
-                        telemetry::event!("Project Panel Add Project Clicked");
-                        workspace
-                            .update(cx, |_, cx| {
-                                window
-                                    .dispatch_action(workspace::Open::default().boxed_clone(), cx);
-                            })
-                            .log_err();
-                    })
-                    .on_clone_repo(move |_, window, cx| {
-                        telemetry::event!("Project Panel Clone Repo Clicked");
-                        workspace_clone
-                            .update(cx, |_, cx| {
-                                window.dispatch_action(git::Clone.boxed_clone(), cx);
-                            })
-                            .log_err();
-                    }),
-                )
+                .child(ProjectEmptyState::new(
+                    "No worktree detected",
+                    focus_handle.clone(),
+                ))
                 .when(is_local, |div| {
                     div.when(panel_settings.drag_and_drop, |div| {
                         div.drag_over::<ExternalPaths>(|style, _, _, cx| {
@@ -7488,8 +7560,7 @@ impl Panel for ProjectPanel {
             return false;
         }
 
-        let project = &self.project.read(cx);
-        project.visible_worktrees(cx).any(|tree| {
+        self.visible_worktrees(cx).into_iter().any(|tree| {
             tree.read(cx)
                 .root_entry()
                 .is_some_and(|entry| entry.is_dir())

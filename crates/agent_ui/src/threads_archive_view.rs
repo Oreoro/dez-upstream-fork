@@ -1060,11 +1060,6 @@ impl Render for ProjectPickerModal {
         v_flex()
             .key_context("ProjectPickerModal")
             .elevation_3(cx)
-            .on_action(cx.listener(|this, _: &workspace::Open, window, cx| {
-                this.picker.update(cx, |picker, cx| {
-                    picker.delegate.open_local_folder(window, cx)
-                })
-            }))
             .child(self.picker.clone())
     }
 }
@@ -1123,33 +1118,6 @@ impl ProjectPickerDelegate {
             ProjectPickerEntry::Workspace(hit) => Some(hit),
             ProjectPickerEntry::Header(_) => None,
         }
-    }
-
-    fn open_local_folder(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let paths_receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: None,
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths_receiver.await else {
-                return;
-            };
-            if paths.is_empty() {
-                return;
-            }
-
-            let work_dirs = PathList::new(&paths);
-
-            this.update_in(cx, |this, window, cx| {
-                this.delegate
-                    .update_working_directories_and_unarchive(work_dirs, window, cx);
-                cx.emit(DismissEvent);
-            })
-            .log_err();
-        })
-        .detach();
     }
 }
 
@@ -1487,8 +1455,6 @@ impl PickerDelegate for ProjectPickerDelegate {
 
     fn render_footer(&self, _: &mut Window, cx: &mut Context<Picker<Self>>) -> Option<AnyElement> {
         let has_selection = self.selected_match().is_some();
-        let focus_handle = self.focus_handle.clone();
-
         Some(
             h_flex()
                 .flex_1()
@@ -1498,20 +1464,13 @@ impl PickerDelegate for ProjectPickerDelegate {
                 .border_t_1()
                 .border_color(cx.theme().colors().border_variant)
                 .child(
-                    Button::new("open_local_folder", "Choose from Local Folders")
-                        .key_binding(KeyBinding::for_action_in(
-                            &workspace::Open::default(),
-                            &focus_handle,
-                            cx,
-                        ))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.delegate.open_local_folder(window, cx);
-                        })),
-                )
-                .child(
                     Button::new("select_project", "Select")
                         .disabled(!has_selection)
-                        .key_binding(KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx))
+                        .key_binding(KeyBinding::for_action_in(
+                            &menu::Confirm,
+                            &self.focus_handle,
+                            cx,
+                        ))
                         .on_click(cx.listener(move |picker, _, window, cx| {
                             picker.delegate.confirm(false, window, cx);
                         })),

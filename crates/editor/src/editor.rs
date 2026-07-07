@@ -262,8 +262,8 @@ use ui_input::ErasedEditor;
 use util::{RangeExt, ResultExt, TryFutureExt, maybe, post_inc};
 use workspace::{
     CollaboratorId, Item as WorkspaceItem, ItemId, ItemNavHistory, NavigationEntry, OpenInTerminal,
-    OpenTerminal, Pane, RestoreOnStartupBehavior, SERIALIZATION_THROTTLE_TIME, SplitDirection,
-    TabBarSettings, Toast, ViewId, Workspace, WorkspaceId, WorkspaceSettings,
+    OpenTerminal, Pane, SERIALIZATION_THROTTLE_TIME, SplitDirection, TabBarSettings, Toast, ViewId,
+    Workspace, WorkspaceId,
     item::{ItemBufferKind, ItemHandle, PreviewTabsSettings, SaveOptions},
     notifications::{DetachAndPromptErr, NotificationId, NotifyResultExt, NotifyTaskExt},
     searchable::SearchEvent,
@@ -10525,11 +10525,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        if self.buffer_kind(cx) == ItemBufferKind::Singleton
-            && !self.mode.is_minimap()
-            && WorkspaceSettings::get(None, cx).restore_on_startup
-                != RestoreOnStartupBehavior::EmptyTab
-        {
+        if self.buffer_kind(cx) == ItemBufferKind::Singleton && !self.mode.is_minimap() {
             let buffer_snapshot = OnceCell::new();
 
             // Get file path for path-based fold lookup
