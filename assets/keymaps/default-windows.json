@@ -629,12 +629,9 @@
       "f6": "workspace::FocusNextPart",
       "shift-f6": "workspace::FocusPreviousPart",
       "ctrl-f6": "workspace::FocusNextPart",
-      // Change the default action on `menu::Confirm` by setting the parameter
-      // "ctrl-alt-o": ["projects::OpenRecent", { "create_new_window": true }],
       "ctrl-r": "projects::OpenRecent",
       // Change to open path modal for existing remote connection by setting the parameter
-      // "ctrl-shift-alt-o": ["projects::OpenRemote", { "from_existing_connection": true }],
-      "ctrl-shift-alt-o": ["projects::OpenRemote", { "from_existing_connection": false }],
+      "ctrl-shift-alt-o": "hosts::ConnectSshHost",
       "shift-alt-b": "branches::OpenRecent",
       "shift-alt-w": "git::Worktree",
       "shift-alt-enter": "toast::RunAction",
@@ -643,7 +640,6 @@
       "ctrl-k ctrl-shift-s": "workspace::SaveWithoutFormat",
       "ctrl-shift-s": "workspace::SaveAs",
       "ctrl-n": "workspace::NewFile",
-      "ctrl-shift-n": "workspace::NewWindow",
       "ctrl-`": "terminal_panel::Toggle",
       "f10": ["app_menu::OpenApplicationMenu", "Zed"],
       "alt-1": ["workspace::ActivatePane", 0],

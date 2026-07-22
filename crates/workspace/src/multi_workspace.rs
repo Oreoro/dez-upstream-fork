@@ -1,6 +1,4 @@
 use anyhow::Result;
-use fs::Fs;
-
 use gpui::{
     AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, Tiling, WeakEntity,
@@ -8,7 +6,7 @@ use gpui::{
 };
 pub use project::ProjectGroupKey;
 use project::{DisableAiSettings, Project};
-use remote::RemoteConnectionOptions;
+use remote::{RemoteClientEvent, RemoteConnectionOptions};
 use settings::Settings;
 pub use settings::SidebarSide;
 use std::cell::Cell;
@@ -26,11 +24,10 @@ use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
-use crate::open_remote_project_with_existing_connection;
 use crate::{
-    CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
-    Panel, Workspace, WorkspaceId, client_side_decorations,
-    persistence::model::MultiWorkspaceState,
+    CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, HostId, HostSessionClient,
+    Item, ModalView, OpenMode, Panel, Workspace, WorkspaceId, client_side_decorations,
+    notifications::DetachAndPromptErr, persistence::model::MultiWorkspaceState,
 };
 
 actions!(
@@ -52,8 +49,6 @@ actions!(
         PreviousThread,
         /// Creates a new thread in the current workspace.
         NewThread,
-        /// Moves the active project to a new window.
-        MoveProjectToNewWindow,
     ]
 );
 
@@ -303,6 +298,16 @@ pub struct MultiWorkspace {
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
+    mode: MultiWorkspaceMode,
+}
+
+enum MultiWorkspaceMode {
+    #[cfg(any(test, feature = "test-support"))]
+    Standard,
+    HostSessions {
+        sessions: Vec<Entity<HostSessionClient>>,
+        active: Entity<HostSessionClient>,
+    },
 }
 
 impl EventEmitter<MultiWorkspaceEvent> for MultiWorkspace {}
@@ -321,7 +326,34 @@ impl MultiWorkspace {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(workspace: Entity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_mode(workspace, MultiWorkspaceMode::Standard, window, cx)
+    }
+
+    pub fn new_for_host(
+        workspace: Entity<Workspace>,
+        host_session: Entity<HostSessionClient>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_mode(
+            workspace,
+            MultiWorkspaceMode::HostSessions {
+                sessions: vec![host_session.clone()],
+                active: host_session,
+            },
+            window,
+            cx,
+        )
+    }
+
+    fn new_with_mode(
+        workspace: Entity<Workspace>,
+        mode: MultiWorkspaceMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let release_subscription = cx.on_release(|this: &mut MultiWorkspace, _cx| {
             if let Some(task) = this._serialize_task.take() {
                 task.detach();
@@ -366,7 +398,165 @@ impl MultiWorkspace {
                 settings_subscription,
             ],
             previous_focus_handle: None,
+            mode,
         }
+    }
+
+    pub fn host_session(&self) -> Option<&Entity<HostSessionClient>> {
+        match &self.mode {
+            #[cfg(any(test, feature = "test-support"))]
+            MultiWorkspaceMode::Standard => None,
+            MultiWorkspaceMode::HostSessions { active, .. } => Some(active),
+        }
+    }
+
+    pub fn host_sessions(&self) -> &[Entity<HostSessionClient>] {
+        match &self.mode {
+            #[cfg(any(test, feature = "test-support"))]
+            MultiWorkspaceMode::Standard => &[],
+            MultiWorkspaceMode::HostSessions { sessions, .. } => sessions,
+        }
+    }
+
+    pub fn host_session_for_id(
+        &self,
+        host_id: &HostId,
+        cx: &App,
+    ) -> Option<Entity<HostSessionClient>> {
+        self.host_sessions()
+            .iter()
+            .find(|session| session.read(cx).host_id() == host_id)
+            .cloned()
+    }
+
+    pub(crate) fn attach_host_session(
+        &mut self,
+        host_session: Entity<HostSessionClient>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let host_id = host_session.read(cx).host_id().clone();
+        let sessions = match &mut self.mode {
+            MultiWorkspaceMode::HostSessions { sessions, .. } => sessions,
+            #[cfg(any(test, feature = "test-support"))]
+            MultiWorkspaceMode::Standard => {
+                anyhow::bail!("cannot attach a host session to a standard test shell")
+            }
+        };
+        anyhow::ensure!(
+            sessions
+                .iter()
+                .all(|session| session.read(cx).host_id() != &host_id),
+            "host session {host_id:?} is already connected"
+        );
+        sessions.push(host_session.clone());
+
+        if host_id != HostId::Local {
+            let remote_client = host_session.read(cx).remote_client().clone();
+            self._subscriptions.push(cx.subscribe_in(
+                &remote_client,
+                window,
+                move |this, _, event: &RemoteClientEvent, window, cx| {
+                    if matches!(event, RemoteClientEvent::Disconnected { .. }) {
+                        this.disconnect_host(&host_id, window, cx);
+                    }
+                },
+            ));
+        }
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn disconnect_host(
+        &mut self,
+        host_id: &HostId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if host_id == &HostId::Local {
+            log::error!("the mandatory local Super Zed host cannot be disconnected");
+            return;
+        }
+        let (sessions, active) = match &mut self.mode {
+            MultiWorkspaceMode::HostSessions { sessions, active } => (sessions, active),
+            #[cfg(any(test, feature = "test-support"))]
+            MultiWorkspaceMode::Standard => return,
+        };
+        let Some(index) = sessions
+            .iter()
+            .position(|session| session.read(cx).host_id() == host_id)
+        else {
+            return;
+        };
+        let disconnected = sessions.remove(index);
+        let fallback_session = sessions
+            .iter()
+            .find(|session| session.read(cx).host_id() == &HostId::Local)
+            .cloned();
+        if active == &disconnected
+            && let Some(fallback_session) = fallback_session.as_ref()
+        {
+            *active = fallback_session.clone();
+        }
+
+        let removed = self
+            .workspaces()
+            .filter(|workspace| {
+                workspace
+                    .read(cx)
+                    .host_workspace_identity()
+                    .is_some_and(|identity| &identity.host_id == host_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for workspace in &removed {
+            cx.emit(MultiWorkspaceEvent::WorkspaceRemoved(workspace.entity_id()));
+            workspace.update(cx, |workspace, _| {
+                workspace._schedule_serialize_workspace.take();
+                workspace._serialize_workspace_task.take();
+            });
+        }
+        self.retained_workspaces
+            .retain(|workspace| !removed.iter().any(|removed| removed == workspace));
+
+        if removed
+            .iter()
+            .any(|workspace| workspace == &self.active_workspace)
+            && let Some(fallback_session) = fallback_session
+            && let Some(fallback) = fallback_session
+                .read(cx)
+                .projection(fallback_session.read(cx).snapshot().active_workspace_id)
+                .map(|projection| projection.workspace.clone())
+        {
+            self.activate(fallback, None, window, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn host_workspace_identity(
+        &self,
+        workspace: &Entity<Workspace>,
+        cx: &App,
+    ) -> Option<crate::HostWorkspaceIdentity> {
+        workspace.read(cx).host_workspace_identity().cloned()
+    }
+
+    pub fn create_superzed_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host_session) = self.host_session().cloned() else {
+            log::error!("cannot create a Super Zed workspace without a host session");
+            return;
+        };
+        let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
+            log::error!("Super Zed workspace window has an unexpected view type");
+            return;
+        };
+        crate::HostSessionClient::create_workspace(
+            &host_session,
+            window_handle,
+            superzed_session::ProjectSpec::default(),
+            cx,
+        )
+        .detach_and_prompt_err("Failed to create workspace", window, cx, |_, _, _| None);
     }
 
     pub fn register_sidebar<T: Sidebar>(&mut self, sidebar: Entity<T>, cx: &mut Context<Self>) {
@@ -408,8 +598,8 @@ impl MultiWorkspace {
             .map_or(false, |s| s.is_threads_list_view_active(cx))
     }
 
-    pub fn multi_workspace_enabled(&self, cx: &App) -> bool {
-        !DisableAiSettings::get_global(cx).disable_ai && AgentSettings::get_global(cx).enabled
+    pub fn multi_workspace_enabled(&self, _cx: &App) -> bool {
+        true
     }
 
     pub fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1089,50 +1279,6 @@ impl MultiWorkspace {
         )
     }
 
-    /// Goes through sqlite: serialize -> close -> open new window
-    /// This avoids issues with pending tasks having the wrong window
-    pub fn open_project_group_in_new_window(
-        &mut self,
-        key: &ProjectGroupKey,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
-        let paths: Vec<PathBuf> = key.path_list().ordered_paths().cloned().collect();
-        if paths.is_empty() {
-            return Task::ready(Ok(()));
-        }
-
-        let app_state = self.workspace().read(cx).app_state().clone();
-
-        let workspaces: Vec<_> = self
-            .workspaces_for_project_group(key, cx)
-            .unwrap_or_default();
-        let mut serialization_tasks = Vec::new();
-        for workspace in &workspaces {
-            serialization_tasks.push(workspace.update(cx, |workspace, inner_cx| {
-                workspace.flush_serialization(window, inner_cx)
-            }));
-        }
-
-        let remove_task = self.remove_project_group(key, window, cx);
-
-        cx.spawn(async move |_this, cx| {
-            futures::future::join_all(serialization_tasks).await;
-
-            let removed = remove_task.await?;
-            if !removed {
-                return Ok(());
-            }
-
-            cx.update(|cx| {
-                Workspace::new_local(paths, app_state, None, None, None, OpenMode::NewWindow, cx)
-            })
-            .await?;
-
-            Ok(())
-        })
-    }
-
     /// Finds an existing workspace whose root paths and host exactly match.
     pub fn workspace_for_paths(
         &self,
@@ -1215,7 +1361,7 @@ impl MultiWorkspace {
         paths: PathList,
         host: Option<RemoteConnectionOptions>,
         provisional_project_group_key: Option<ProjectGroupKey>,
-        connect_remote: impl FnOnce(
+        _connect_remote: impl FnOnce(
             RemoteConnectionOptions,
             &mut Window,
             &mut Context<Self>,
@@ -1235,7 +1381,7 @@ impl MultiWorkspace {
             return Task::ready(Ok(workspace));
         }
 
-        let Some(connection_options) = host else {
+        let Some(_connection_options) = host else {
             return self.find_or_create_local_workspace_with_source_workspace(
                 paths,
                 provisional_project_group_key,
@@ -1248,77 +1394,9 @@ impl MultiWorkspace {
             );
         };
 
-        let app_state = self.workspace().read(cx).app_state().clone();
-        let window_handle = window.window_handle().downcast::<MultiWorkspace>();
-        let connect_task = connect_remote(connection_options.clone(), window, cx);
-        let paths_vec = paths.paths().to_vec();
-
-        cx.spawn(async move |_this, cx| {
-            let session = connect_task
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Remote connection was cancelled"))?;
-
-            let new_project = cx.update(|cx| {
-                Project::remote(
-                    session,
-                    app_state.client.clone(),
-                    app_state.node_runtime.clone(),
-                    app_state.user_store.clone(),
-                    app_state.languages.clone(),
-                    app_state.fs.clone(),
-                    true,
-                    cx,
-                )
-            });
-
-            let effective_paths_vec =
-                if let Some(project_group) = provisional_project_group_key.as_ref() {
-                    let resolve_tasks = cx.update(|cx| {
-                        let project = new_project.read(cx);
-                        paths_vec
-                            .iter()
-                            .map(|path| project.resolve_abs_path(&path.to_string_lossy(), cx))
-                            .collect::<Vec<_>>()
-                    });
-                    let resolved = futures::future::join_all(resolve_tasks).await;
-                    // `resolve_abs_path` returns `None` for both "definitely
-                    // absent" and transport errors (it swallows the error via
-                    // `log_err`). This is a weaker guarantee than the local
-                    // `Ok(None)` check, but it matches how the rest of the
-                    // codebase consumes this API.
-                    let all_paths_missing =
-                        !paths_vec.is_empty() && resolved.iter().all(|resolved| resolved.is_none());
-
-                    if all_paths_missing {
-                        project_group.path_list().paths().to_vec()
-                    } else {
-                        paths_vec
-                    }
-                } else {
-                    paths_vec
-                };
-
-            let window_handle =
-                window_handle.ok_or_else(|| anyhow::anyhow!("Window is not a MultiWorkspace"))?;
-
-            open_remote_project_with_existing_connection(
-                connection_options,
-                new_project,
-                effective_paths_vec,
-                app_state,
-                window_handle,
-                provisional_project_group_key,
-                source_workspace,
-                cx,
-            )
-            .await?;
-
-            window_handle.update(cx, |multi_workspace, window, cx| {
-                let workspace = multi_workspace.workspace().clone();
-                multi_workspace.add(workspace.clone(), window, cx);
-                workspace
-            })
-        })
+        Task::ready(Err(anyhow::anyhow!(
+            "SSH host sessions are not available until Milestone 1 Checkpoint 5"
+        )))
     }
 
     /// Finds an existing workspace in this multi-workspace whose paths match,
@@ -1353,7 +1431,7 @@ impl MultiWorkspace {
     pub fn find_or_create_local_workspace_with_source_workspace(
         &mut self,
         path_list: PathList,
-        project_group: Option<ProjectGroupKey>,
+        _project_group: Option<ProjectGroupKey>,
         excluding: &[Entity<Workspace>],
         init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
         open_mode: OpenMode,
@@ -1367,76 +1445,18 @@ impl MultiWorkspace {
             return Task::ready(Ok(workspace));
         }
 
-        let paths = path_list.paths().to_vec();
         let app_state = self.workspace().read(cx).app_state().clone();
         let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
-        let fs = <dyn Fs>::global(cx);
-        let excluding = excluding.to_vec();
-
-        cx.spawn(async move |_this, cx| {
-            let effective_path_list = if let Some(project_group) = project_group {
-                let metadata_tasks: Vec<_> = paths
-                    .iter()
-                    .map(|path| fs.metadata(path.as_path()))
-                    .collect();
-                let metadata_results = futures::future::join_all(metadata_tasks).await;
-                // Only fall back when every path is definitely absent; real
-                // filesystem errors should not be treated as "missing".
-                let all_paths_missing = !paths.is_empty()
-                    && metadata_results
-                        .into_iter()
-                        // Ok(None) means the path is definitely absent
-                        .all(|result| matches!(result, Ok(None)));
-
-                if all_paths_missing {
-                    project_group.path_list().clone()
-                } else {
-                    PathList::new(&paths)
-                }
-            } else {
-                PathList::new(&paths)
-            };
-
-            if let Some(requesting_window) = requesting_window
-                && let Some(workspace) = requesting_window
-                    .update(cx, |multi_workspace, window, cx| {
-                        multi_workspace
-                            .workspace_for_paths_excluding(
-                                &effective_path_list,
-                                None,
-                                &excluding,
-                                cx,
-                            )
-                            .inspect(|workspace| {
-                                multi_workspace.activate(
-                                    workspace.clone(),
-                                    source_workspace.clone(),
-                                    window,
-                                    cx,
-                                );
-                            })
-                    })
-                    .ok()
-                    .flatten()
-            {
-                return Ok(workspace);
-            }
-
-            let result = cx
-                .update(|cx| {
-                    Workspace::new_local(
-                        effective_path_list.paths().to_vec(),
-                        app_state,
-                        requesting_window,
-                        None,
-                        init,
-                        open_mode,
-                        cx,
-                    )
-                })
-                .await?;
-            Ok(result.workspace)
-        })
+        let task = Workspace::new_local(
+            path_list.paths().to_vec(),
+            app_state,
+            requesting_window,
+            None,
+            init,
+            open_mode,
+            cx,
+        );
+        cx.spawn(async move |_, _| Ok(task.await?.workspace))
     }
 
     pub fn workspace(&self) -> &Entity<Workspace> {
@@ -1469,6 +1489,114 @@ impl MultiWorkspace {
             "Workspace Added",
             workspace_count = self.retained_workspaces.len()
         );
+        cx.notify();
+    }
+
+    pub(crate) fn reconcile_host_projections(
+        &mut self,
+        host_id: &HostId,
+        ordered_workspaces: Vec<Entity<Workspace>>,
+        active_workspace: Entity<Workspace>,
+        activate_host: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        assert!(
+            matches!(self.mode, MultiWorkspaceMode::HostSessions { .. }),
+            "host projections require a host-session MultiWorkspace"
+        );
+        assert!(
+            ordered_workspaces
+                .iter()
+                .any(|workspace| workspace == &active_workspace),
+            "active host workspace must be in the reconciled projection set"
+        );
+
+        let previous_workspaces = self
+            .workspaces()
+            .filter(|workspace| {
+                workspace
+                    .read(cx)
+                    .host_workspace_identity()
+                    .is_some_and(|identity| &identity.host_id == host_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for workspace in &ordered_workspaces {
+            if !previous_workspaces
+                .iter()
+                .any(|previous| previous == workspace)
+            {
+                self.register_workspace(workspace, window, cx);
+                cx.emit(MultiWorkspaceEvent::WorkspaceAdded(workspace.clone()));
+            }
+        }
+
+        for workspace in previous_workspaces.iter().filter(|workspace| {
+            !ordered_workspaces
+                .iter()
+                .any(|desired| desired == *workspace)
+        }) {
+            cx.emit(MultiWorkspaceEvent::WorkspaceRemoved(workspace.entity_id()));
+            workspace.update(cx, |workspace, _| {
+                workspace._schedule_serialize_workspace.take();
+                workspace._serialize_workspace_task.take();
+            });
+        }
+
+        let first_host_index = self.retained_workspaces.iter().position(|workspace| {
+            workspace
+                .read(cx)
+                .host_workspace_identity()
+                .is_some_and(|identity| &identity.host_id == host_id)
+        });
+        self.retained_workspaces.retain(|workspace| {
+            !workspace
+                .read(cx)
+                .host_workspace_identity()
+                .is_some_and(|identity| &identity.host_id == host_id)
+        });
+        let insertion_index = first_host_index
+            .unwrap_or(self.retained_workspaces.len())
+            .min(self.retained_workspaces.len());
+        self.retained_workspaces.splice(
+            insertion_index..insertion_index,
+            ordered_workspaces.iter().cloned(),
+        );
+        let host_was_active = self
+            .host_session()
+            .is_some_and(|session| session.read(cx).host_id() == host_id);
+        if host_was_active || activate_host {
+            if let MultiWorkspaceMode::HostSessions { sessions, active } = &mut self.mode
+                && let Some(session) = sessions
+                    .iter()
+                    .find(|session| session.read(cx).host_id() == host_id)
+            {
+                *active = session.clone();
+            }
+            if self.active_workspace != active_workspace {
+                self.activate(active_workspace, None, window, cx);
+            } else {
+                self.active_workspace_id
+                    .set(self.active_workspace.entity_id());
+            }
+        }
+        self.retained_workspaces.retain(|workspace| {
+            workspace
+                .read(cx)
+                .host_workspace_identity()
+                .is_none_or(|identity| {
+                    &identity.host_id != host_id
+                        || ordered_workspaces
+                            .iter()
+                            .any(|desired| desired == workspace)
+                })
+        });
+        self.project_groups.clear();
+        for workspace in self.retained_workspaces.clone() {
+            let key = workspace.read(cx).project_group_key(cx);
+            self.ensure_project_group_state(key);
+        }
         cx.notify();
     }
 
@@ -1505,6 +1633,18 @@ impl MultiWorkspace {
         }
 
         self.active_workspace = workspace;
+        if let Some(host_id) = self
+            .active_workspace
+            .read(cx)
+            .host_workspace_identity()
+            .map(|identity| identity.host_id.clone())
+            && let MultiWorkspaceMode::HostSessions { sessions, active } = &mut self.mode
+            && let Some(session) = sessions
+                .iter()
+                .find(|session| session.read(cx).host_id() == &host_id)
+        {
+            *active = session.clone();
+        }
         // Publish the new active workspace before anyone reads the shared cell
         // to decide who owns the window chrome.
         self.active_workspace_id
@@ -1636,6 +1776,9 @@ impl MultiWorkspace {
     }
 
     pub fn serialize(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.mode, MultiWorkspaceMode::HostSessions { .. }) {
+            return;
+        }
         self._serialize_task = Some(cx.spawn(async move |this, cx| {
             let Some((window_id, state)) = this
                 .read_with(cx, |this, cx| {
@@ -2023,6 +2166,25 @@ impl MultiWorkspace {
         })
     }
 
+    pub fn remove_prepared_workspace(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        fallback: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.is_workspace_retained(workspace) {
+            return false;
+        }
+        if self.workspace() == workspace {
+            self.activate(fallback, None, window, cx);
+        }
+        self.detach_workspace(workspace, cx);
+        self.serialize(cx);
+        cx.notify();
+        true
+    }
+
     pub fn open_project(
         &mut self,
         paths: Vec<PathBuf>,
@@ -2030,6 +2192,31 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
+        if self.host_session().is_some() {
+            let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "host workspace is not attached to a MultiWorkspace window"
+                )));
+            };
+            let Some(target) = self.workspace().read(cx).host_workspace_identity().cloned() else {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "active workspace has no host identity"
+                )));
+            };
+            let open = crate::open_superzed_paths(
+                target,
+                &paths,
+                &paths,
+                crate::OpenOptions {
+                    requesting_window: Some(window_handle),
+                    open_mode,
+                    ..Default::default()
+                },
+                cx,
+            );
+            return cx.spawn(async move |_, _| Ok(open.await?.workspace));
+        }
+
         if self.multi_workspace_enabled(cx) {
             let empty_workspace = if self
                 .active_workspace
@@ -2228,23 +2415,13 @@ impl Render for MultiWorkspace {
                             sidebar.cycle_thread(true, window, cx);
                         }
                     }))
-                    .on_action(
-                        cx.listener(|this: &mut Self, _: &PreviousThread, window, cx| {
+                    .on_action(cx.listener(
+                        |this: &mut Self, _: &PreviousThread, window, cx| {
                             if let Some(sidebar) = &this.sidebar {
                                 sidebar.cycle_thread(false, window, cx);
                             }
-                        }),
-                    )
-                    .when(self.project_group_keys().len() >= 2, |el| {
-                        el.on_action(cx.listener(
-                            |this: &mut Self, _: &MoveProjectToNewWindow, window, cx| {
-                                let key =
-                                    this.project_group_key_for_workspace(this.workspace(), cx);
-                                this.open_project_group_in_new_window(&key, window, cx)
-                                    .detach_and_log_err(cx);
-                            },
-                        ))
-                    })
+                        },
+                    ))
                 })
                 .when(
                     self.sidebar_open() && self.multi_workspace_enabled(cx),

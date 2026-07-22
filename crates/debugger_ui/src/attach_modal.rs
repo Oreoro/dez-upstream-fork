@@ -365,11 +365,12 @@ fn get_processes_for_project(project: &Entity<Project>, cx: &mut App) -> Task<Ar
 
     if let Some(remote_client) = project.remote_client() {
         let proto_client = remote_client.read(cx).proto_client();
+        let project_id = project
+            .remote_id()
+            .unwrap_or(proto::REMOTE_SERVER_PROJECT_ID);
         cx.background_spawn(async move {
             let response = proto_client
-                .request(proto::GetProcesses {
-                    project_id: proto::REMOTE_SERVER_PROJECT_ID,
-                })
+                .request(proto::GetProcesses { project_id })
                 .await
                 .unwrap_or_else(|_| proto::GetProcessesResponse {
                     processes: Vec::new(),

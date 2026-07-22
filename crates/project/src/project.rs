@@ -8,6 +8,7 @@ pub mod context_server_store;
 pub mod debounced_delay;
 pub mod debugger;
 pub mod git_store;
+pub mod host_resource_registry;
 pub mod image_store;
 pub mod lsp_command;
 pub mod lsp_store;
@@ -26,7 +27,7 @@ pub mod worktree_store;
 
 mod environment;
 use buffer_diff::BufferDiff;
-use context_server_store::ContextServerStore;
+use context_server_store::{ContextServerStore, HostContextServerRegistry};
 pub use environment::ProjectEnvironmentEvent;
 use git::repository::get_git_committer;
 use git_store::{Repository, RepositoryId};
@@ -39,6 +40,7 @@ use itertools::{Either, Itertools};
 use crate::{
     bookmark_store::BookmarkStore,
     git_store::GitStore,
+    host_resource_registry::HostResourceRegistry,
     lsp_store::{SymbolLocation, log_store::LogKind},
     project_search::SearchResultsHandle,
     trusted_worktrees::{PathTrust, RemoteHostLocation, TrustedWorktrees},
@@ -224,8 +226,6 @@ pub struct Project {
     task_store: Entity<TaskStore>,
     user_store: Entity<UserStore>,
     fs: Arc<dyn Fs>,
-    remote_client: Option<Entity<RemoteClient>>,
-    // todo lw explain the client_state x remote_client matrix, its super confusing
     client_state: ProjectClientState,
     git_store: Entity<GitStore>,
     collaborators: HashMap<proto::PeerId, Collaborator>,
@@ -320,6 +320,10 @@ enum ProjectClientState {
         capability: Capability,
         remote_id: u64,
         replica_id: ReplicaId,
+    },
+    RemoteServer {
+        project_id: u64,
+        host_client: Entity<RemoteClient>,
     },
 }
 
@@ -1181,13 +1185,44 @@ impl Project {
         flags: LocalProjectFlags,
         cx: &mut App,
     ) -> Entity<Self> {
+        Self::local_with_host_resources(
+            client,
+            node,
+            user_store,
+            languages,
+            fs,
+            env,
+            flags,
+            HostResourceRegistry::default(),
+            cx,
+        )
+    }
+
+    fn local_with_host_resources(
+        client: Arc<Client>,
+        node: NodeRuntime,
+        user_store: Entity<UserStore>,
+        languages: Arc<LanguageRegistry>,
+        fs: Arc<dyn Fs>,
+        env: Option<HashMap<String, String>>,
+        flags: LocalProjectFlags,
+        host_resource_registry: HostResourceRegistry,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let host_context_servers = host_resource_registry.context_servers();
         cx.new(|cx: &mut Context<Self>| {
             let (tx, rx) = mpsc::unbounded();
             cx.spawn(async move |this, cx| Self::send_buffer_ordered_messages(this, rx, cx).await)
                 .detach();
             let snippets = SnippetProvider::new(fs.clone(), BTreeSet::from_iter([]), cx);
-            let worktree_store =
-                cx.new(|cx| WorktreeStore::local(false, fs.clone(), WorktreeIdCounter::get(cx)));
+            let worktree_store = cx.new(|cx| {
+                WorktreeStore::local_with_host_resources(
+                    false,
+                    fs.clone(),
+                    WorktreeIdCounter::get(cx),
+                    host_resource_registry,
+                )
+            });
             if flags.init_worktree_trust {
                 trusted_worktrees::track_worktree_trust(
                     worktree_store.clone(),
@@ -1206,12 +1241,20 @@ impl Project {
                     worktree_store.clone(),
                     Some(weak_self.clone()),
                     false,
+                    host_context_servers,
                     cx,
                 )
             });
 
             let environment = cx.new(|cx| {
-                ProjectEnvironment::new(env, worktree_store.downgrade(), None, false, cx)
+                ProjectEnvironment::new(
+                    env,
+                    worktree_store.downgrade(),
+                    None,
+                    REMOTE_SERVER_PROJECT_ID,
+                    false,
+                    cx,
+                )
             });
             let manifest_tree = ManifestTree::new(worktree_store.clone(), cx);
             let toolchain_store = cx.new(|cx| {
@@ -1348,7 +1391,6 @@ impl Project {
                 user_store,
                 settings_observer,
                 fs,
-                remote_client: None,
                 bookmark_store,
                 breakpoint_store,
                 dap_store,
@@ -1386,6 +1428,34 @@ impl Project {
         init_worktree_trust: bool,
         cx: &mut App,
     ) -> Entity<Self> {
+        Self::remote_for_project(
+            remote,
+            client,
+            node,
+            user_store,
+            languages,
+            fs,
+            REMOTE_SERVER_PROJECT_ID,
+            init_worktree_trust,
+            HostContextServerRegistry::default(),
+            cx,
+        )
+    }
+
+    pub fn remote_for_project(
+        remote: Entity<RemoteClient>,
+        client: Arc<Client>,
+        node: NodeRuntime,
+        user_store: Entity<UserStore>,
+        languages: Arc<LanguageRegistry>,
+        fs: Arc<dyn Fs>,
+        project_id: u64,
+        init_worktree_trust: bool,
+        host_context_servers: HostContextServerRegistry,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let register_remote_handlers =
+            remote.update(cx, |remote, _| remote.take_project_handler_registration());
         cx.new(|cx: &mut Context<Self>| {
             let (tx, rx) = mpsc::unbounded();
             cx.spawn(async move |this, cx| Self::send_buffer_ordered_messages(this, rx, cx).await)
@@ -1404,7 +1474,7 @@ impl Project {
                 WorktreeStore::remote(
                     false,
                     remote_proto.clone(),
-                    REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     path_style,
                     WorktreeIdCounter::get(cx),
                 )
@@ -1417,7 +1487,7 @@ impl Project {
                     worktree_store.clone(),
                     Some(RemoteHostLocation::from(connection_options)),
                     None,
-                    Some((remote_proto.clone(), ProjectId(REMOTE_SERVER_PROJECT_ID))),
+                    Some((remote_proto.clone(), ProjectId(project_id))),
                     cx,
                 );
             }
@@ -1428,7 +1498,7 @@ impl Project {
                 BufferStore::remote(
                     worktree_store.clone(),
                     remote.read(cx).proto_client(),
-                    REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     cx,
                 )
             });
@@ -1436,7 +1506,7 @@ impl Project {
                 ImageStore::remote(
                     worktree_store.clone(),
                     remote.read(cx).proto_client(),
-                    REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     cx,
                 )
             });
@@ -1444,7 +1514,7 @@ impl Project {
                 .detach();
             let toolchain_store = cx.new(|cx| {
                 ToolchainStore::remote(
-                    REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     worktree_store.clone(),
                     remote.read(cx).proto_client(),
                     cx,
@@ -1453,10 +1523,11 @@ impl Project {
 
             let context_server_store = cx.new(|cx| {
                 ContextServerStore::remote(
-                    rpc::proto::REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     remote.clone(),
                     worktree_store.clone(),
                     Some(weak_self.clone()),
+                    host_context_servers,
                     cx,
                 )
             });
@@ -1466,6 +1537,7 @@ impl Project {
                     None,
                     worktree_store.downgrade(),
                     Some(remote.downgrade()),
+                    project_id,
                     false,
                     cx,
                 )
@@ -1477,7 +1549,7 @@ impl Project {
                     worktree_store.clone(),
                     languages.clone(),
                     remote_proto.clone(),
-                    REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     cx,
                 )
             });
@@ -1488,7 +1560,7 @@ impl Project {
 
             let breakpoint_store = cx.new(|_| {
                 BreakpointStore::remote(
-                    REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     remote_proto.clone(),
                     buffer_store.clone(),
                     worktree_store.clone(),
@@ -1497,7 +1569,7 @@ impl Project {
 
             let dap_store = cx.new(|cx| {
                 DapStore::new_remote(
-                    REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     remote.clone(),
                     breakpoint_store.clone(),
                     worktree_store.clone(),
@@ -1513,7 +1585,7 @@ impl Project {
                     &worktree_store,
                     buffer_store.clone(),
                     remote_proto.clone(),
-                    REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     cx,
                 )
             });
@@ -1524,7 +1596,7 @@ impl Project {
                     worktree_store.clone(),
                     toolchain_store.read(cx).as_language_toolchain_store(),
                     remote.read(cx).proto_client(),
-                    REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     git_store.clone(),
                     cx,
                 )
@@ -1536,6 +1608,7 @@ impl Project {
                     worktree_store.clone(),
                     task_store.clone(),
                     Some(remote_proto.clone()),
+                    project_id,
                     false,
                     cx,
                 )
@@ -1544,11 +1617,7 @@ impl Project {
                 .detach();
 
             let agent_server_store = cx.new(|_| {
-                AgentServerStore::remote(
-                    REMOTE_SERVER_PROJECT_ID,
-                    remote.clone(),
-                    worktree_store.clone(),
-                )
+                AgentServerStore::remote(project_id, remote.clone(), worktree_store.clone())
             });
 
             cx.subscribe(&remote, Self::on_remote_client_event).detach();
@@ -1565,17 +1634,22 @@ impl Project {
                 breakpoint_store,
                 dap_store,
                 join_project_response_message_id: 0,
-                client_state: ProjectClientState::Local,
+                client_state: ProjectClientState::RemoteServer {
+                    project_id,
+                    host_client: remote.clone(),
+                },
                 git_store,
                 agent_server_store,
                 client_subscriptions: Vec::new(),
                 _subscriptions: vec![
                     cx.on_release(Self::release),
                     cx.on_app_quit(|this, cx| {
-                        let shutdown = this.remote_client.take().and_then(|client| {
+                        let shutdown = this.take_remote_server_client().and_then(|client| {
                             client.update(cx, |client, cx| {
+                                let shutdown_request = (!client.is_persistent_host())
+                                    .then_some(proto::ShutdownRemoteServer {});
                                 client.shutdown_processes(
-                                    Some(proto::ShutdownRemoteServer {}),
+                                    shutdown_request,
                                     cx.background_executor().clone(),
                                 )
                             })
@@ -1596,7 +1670,6 @@ impl Project {
                 user_store,
                 settings_observer,
                 fs,
-                remote_client: Some(remote.clone()),
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
@@ -1617,44 +1690,67 @@ impl Project {
             };
 
             // remote server -> local machine handlers
-            remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &cx.entity());
-            remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.buffer_store);
-            remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.worktree_store);
-            remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.lsp_store);
-            remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.dap_store);
-            remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.breakpoint_store);
-            remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.settings_observer);
-            remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.git_store);
-            remote_proto.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &this.agent_server_store);
+            remote_proto.subscribe_to_entity(project_id, &cx.entity());
+            remote_proto.subscribe_to_entity(project_id, &this.buffer_store);
+            remote_proto.subscribe_to_entity(project_id, &this.worktree_store);
+            remote_proto.subscribe_to_entity(project_id, &this.lsp_store);
+            remote_proto.subscribe_to_entity(project_id, &this.dap_store);
+            remote_proto.subscribe_to_entity(project_id, &this.breakpoint_store);
+            remote_proto.subscribe_to_entity(project_id, &this.settings_observer);
+            remote_proto.subscribe_to_entity(project_id, &this.git_store);
+            remote_proto.subscribe_to_entity(project_id, &this.agent_server_store);
 
-            remote_proto.add_entity_message_handler(Self::handle_create_buffer_for_peer);
-            remote_proto.add_entity_message_handler(Self::handle_create_image_for_peer);
-            remote_proto.add_entity_message_handler(Self::handle_create_file_for_peer);
-            remote_proto.add_entity_message_handler(Self::handle_update_worktree);
-            remote_proto.add_entity_message_handler(Self::handle_update_project);
-            remote_proto.add_entity_message_handler(Self::handle_toast);
-            remote_proto.add_entity_message_handler(Self::handle_telemetry_event);
-            remote_proto.add_entity_request_handler(Self::handle_language_server_prompt_request);
-            remote_proto.add_entity_message_handler(Self::handle_hide_toast);
-            remote_proto.add_entity_request_handler(Self::handle_update_buffer_from_remote_server);
-            remote_proto.add_entity_request_handler(Self::handle_trust_worktrees);
-            remote_proto.add_entity_request_handler(Self::handle_restrict_worktrees);
-            remote_proto.add_entity_request_handler(Self::handle_find_search_candidates_chunk);
+            if register_remote_handlers {
+                remote_proto.add_entity_message_handler(Self::handle_create_buffer_for_peer);
+                remote_proto.add_entity_message_handler(Self::handle_create_image_for_peer);
+                remote_proto.add_entity_message_handler(Self::handle_create_file_for_peer);
+                remote_proto.add_entity_message_handler(Self::handle_update_worktree);
+                remote_proto.add_entity_message_handler(Self::handle_update_project);
+                remote_proto.add_entity_message_handler(Self::handle_toast);
+                remote_proto.add_entity_message_handler(Self::handle_telemetry_event);
+                remote_proto
+                    .add_entity_request_handler(Self::handle_language_server_prompt_request);
+                remote_proto.add_entity_message_handler(Self::handle_hide_toast);
+                remote_proto
+                    .add_entity_request_handler(Self::handle_update_buffer_from_remote_server);
+                remote_proto.add_entity_request_handler(Self::handle_trust_worktrees);
+                remote_proto.add_entity_request_handler(Self::handle_restrict_worktrees);
+                remote_proto.add_entity_request_handler(Self::handle_find_search_candidates_chunk);
 
-            remote_proto.add_entity_message_handler(Self::handle_find_search_candidates_cancel);
-            BufferStore::init(&remote_proto);
-            WorktreeStore::init_remote(&remote_proto);
-            LspStore::init(&remote_proto);
-            SettingsObserver::init(&remote_proto);
-            TaskStore::init(Some(&remote_proto));
-            ToolchainStore::init(&remote_proto);
-            DapStore::init(&remote_proto, cx);
-            BreakpointStore::init(&remote_proto);
-            GitStore::init(&remote_proto);
-            AgentServerStore::init_remote(&remote_proto);
+                remote_proto.add_entity_message_handler(Self::handle_find_search_candidates_cancel);
+                BufferStore::init(&remote_proto);
+                WorktreeStore::init_remote(&remote_proto);
+                LspStore::init(&remote_proto);
+                SettingsObserver::init(&remote_proto);
+                TaskStore::init(Some(&remote_proto));
+                ToolchainStore::init(&remote_proto);
+                DapStore::init(&remote_proto, cx);
+                BreakpointStore::init(&remote_proto);
+                GitStore::init(&remote_proto);
+                AgentServerStore::init_remote(&remote_proto);
+            }
 
             this
         })
+    }
+
+    pub async fn initialize_superzed_project(this: Entity<Self>, cx: &mut AsyncApp) -> Result<()> {
+        let (remote_client, project_id) = this.read_with(cx, |this, _| {
+            this.remote_server()
+                .map(|(project_id, host_client)| (host_client.clone(), project_id))
+                .context("Super Zed project is not server-owned")
+        })?;
+        let client = remote_client.read_with(cx, |client, _| client.proto_client());
+        let response = client
+            .request(proto::InitializeSuperzedProject { project_id })
+            .await?;
+        this.update(cx, |this, cx| {
+            this.set_worktrees_from_proto(response.worktrees, cx)
+        })?;
+        client
+            .request(proto::ResyncSuperzedProject { project_id })
+            .await?;
+        Ok(())
     }
 
     pub async fn in_room(
@@ -1743,8 +1839,9 @@ impl Project {
             ImageStore::remote(worktree_store.clone(), client.clone().into(), remote_id, cx)
         });
 
-        let environment =
-            cx.new(|cx| ProjectEnvironment::new(None, worktree_store.downgrade(), None, true, cx));
+        let environment = cx.new(|cx| {
+            ProjectEnvironment::new(None, worktree_store.downgrade(), None, remote_id, true, cx)
+        });
 
         let bookmark_store =
             cx.new(|_| BookmarkStore::new(worktree_store.clone(), buffer_store.clone()));
@@ -1812,6 +1909,7 @@ impl Project {
                 worktree_store.clone(),
                 task_store.clone(),
                 None,
+                remote_id,
                 true,
                 cx,
             )
@@ -1825,7 +1923,13 @@ impl Project {
 
             let weak_self = cx.weak_entity();
             let context_server_store = cx.new(|cx| {
-                ContextServerStore::local(worktree_store.clone(), Some(weak_self), false, cx)
+                ContextServerStore::local(
+                    worktree_store.clone(),
+                    Some(weak_self),
+                    false,
+                    HostContextServerRegistry::default(),
+                    cx,
+                )
             });
 
             let mut worktrees = Vec::new();
@@ -1871,7 +1975,6 @@ impl Project {
                 task_store,
                 snippets,
                 fs,
-                remote_client: None,
                 settings_observer: settings_observer.clone(),
                 client_subscriptions: Default::default(),
                 _subscriptions: vec![cx.on_release(Self::release)],
@@ -1974,9 +2077,41 @@ impl Project {
         )
     }
 
+    fn remote_server(&self) -> Option<(u64, &Entity<RemoteClient>)> {
+        match &self.client_state {
+            ProjectClientState::RemoteServer {
+                project_id,
+                host_client,
+            } => Some((*project_id, host_client)),
+            _ => None,
+        }
+    }
+
+    fn collab_forwarding_project_id(&self) -> Option<u64> {
+        match self.client_state {
+            ProjectClientState::Shared { remote_id, .. }
+            | ProjectClientState::Collab { remote_id, .. } => Some(remote_id),
+            ProjectClientState::Local | ProjectClientState::RemoteServer { .. } => None,
+        }
+    }
+
+    fn take_remote_server_client(&mut self) -> Option<Entity<RemoteClient>> {
+        let state = std::mem::replace(&mut self.client_state, ProjectClientState::Local);
+        match state {
+            ProjectClientState::RemoteServer { host_client, .. } => Some(host_client),
+            state => {
+                self.client_state = state;
+                None
+            }
+        }
+    }
+
     fn release(&mut self, cx: &mut App) {
-        if let Some(client) = self.remote_client.take() {
+        if let Some(client) = self.take_remote_server_client() {
             let shutdown = client.update(cx, |client, cx| {
+                if client.is_persistent_host() {
+                    return None;
+                }
                 client.shutdown_processes(
                     Some(proto::ShutdownRemoteServer {}),
                     cx.background_executor().clone(),
@@ -1992,7 +2127,7 @@ impl Project {
         }
 
         match &self.client_state {
-            ProjectClientState::Local => {}
+            ProjectClientState::Local | ProjectClientState::RemoteServer { .. } => {}
             ProjectClientState::Shared { .. } => {
                 let _ = self.unshare_internal(cx);
             }
@@ -2057,7 +2192,15 @@ impl Project {
         root_paths: impl IntoIterator<Item = &Path>,
         cx: &mut gpui::TestAppContext,
     ) -> Entity<Project> {
-        Self::test_project(fs, root_paths, false, cx).await
+        Self::test_project(
+            fs,
+            root_paths,
+            false,
+            HostResourceRegistry::without_shared_context_server_runtimes_for_test(),
+            None,
+            cx,
+        )
+        .await
     }
 
     #[cfg(feature = "test-support")]
@@ -2066,7 +2209,44 @@ impl Project {
         root_paths: impl IntoIterator<Item = &Path>,
         cx: &mut gpui::TestAppContext,
     ) -> Entity<Project> {
-        Self::test_project(fs, root_paths, true, cx).await
+        Self::test_project(
+            fs,
+            root_paths,
+            true,
+            HostResourceRegistry::without_shared_context_server_runtimes_for_test(),
+            None,
+            cx,
+        )
+        .await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn test_with_host_resources(
+        fs: Arc<dyn Fs>,
+        root_paths: impl IntoIterator<Item = &Path>,
+        host_resource_registry: HostResourceRegistry,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<Project> {
+        Self::test_project(fs, root_paths, false, host_resource_registry, None, cx).await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn test_with_host_resources_and_languages(
+        fs: Arc<dyn Fs>,
+        root_paths: impl IntoIterator<Item = &Path>,
+        host_resource_registry: HostResourceRegistry,
+        languages: Arc<LanguageRegistry>,
+        cx: &mut gpui::TestAppContext,
+    ) -> Entity<Project> {
+        Self::test_project(
+            fs,
+            root_paths,
+            false,
+            host_resource_registry,
+            Some(languages),
+            cx,
+        )
+        .await
     }
 
     #[cfg(feature = "test-support")]
@@ -2074,27 +2254,31 @@ impl Project {
         fs: Arc<dyn Fs>,
         root_paths: impl IntoIterator<Item = &Path>,
         init_worktree_trust: bool,
+        host_resource_registry: HostResourceRegistry,
+        languages: Option<Arc<LanguageRegistry>>,
         cx: &mut gpui::TestAppContext,
     ) -> Entity<Project> {
         use clock::FakeSystemClock;
 
-        let languages = LanguageRegistry::test(cx.executor());
+        let languages =
+            languages.unwrap_or_else(|| Arc::new(LanguageRegistry::test(cx.executor())));
         let clock = Arc::new(FakeSystemClock::new());
         let http_client = http_client::FakeHttpClient::with_404_response();
         let client = cx.update(|cx| client::Client::new(clock, http_client.clone(), cx));
         let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
         let project = cx.update(|cx| {
-            Project::local(
+            Project::local_with_host_resources(
                 client,
                 node_runtime::NodeRuntime::unavailable(),
                 user_store,
-                Arc::new(languages),
+                languages,
                 fs,
                 None,
                 LocalProjectFlags {
                     init_worktree_trust,
                     ..Default::default()
                 },
+                host_resource_registry,
                 cx,
             )
         });
@@ -2221,7 +2405,13 @@ impl Project {
 
     #[inline]
     pub fn remote_client(&self) -> Option<Entity<RemoteClient>> {
-        self.remote_client.clone()
+        self.remote_server()
+            .map(|(_, host_client)| host_client.clone())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn collab_forwarding_project_id_for_test(&self) -> Option<u64> {
+        self.collab_forwarding_project_id()
     }
 
     #[inline]
@@ -2281,6 +2471,7 @@ impl Project {
             ProjectClientState::Local => None,
             ProjectClientState::Shared { remote_id, .. }
             | ProjectClientState::Collab { remote_id, .. } => Some(remote_id),
+            ProjectClientState::RemoteServer { project_id, .. } => Some(project_id),
         }
     }
 
@@ -2291,16 +2482,14 @@ impl Project {
 
     #[inline]
     pub fn remote_connection_state(&self, cx: &App) -> Option<remote::ConnectionState> {
-        self.remote_client
-            .as_ref()
-            .map(|remote| remote.read(cx).connection_state())
+        self.remote_server()
+            .map(|(_, host_client)| host_client.read(cx).connection_state())
     }
 
     #[inline]
     pub fn remote_connection_options(&self, cx: &App) -> Option<RemoteConnectionOptions> {
-        self.remote_client
-            .as_ref()
-            .map(|remote| remote.read(cx).connection_options())
+        self.remote_server()
+            .map(|(_, host_client)| host_client.read(cx).connection_options())
     }
 
     /// Reveals the given path in the system file manager.
@@ -2328,13 +2517,8 @@ impl Project {
     pub fn replica_id(&self) -> ReplicaId {
         match self.client_state {
             ProjectClientState::Collab { replica_id, .. } => replica_id,
-            _ => {
-                if self.remote_client.is_some() {
-                    ReplicaId::REMOTE_SERVER
-                } else {
-                    ReplicaId::LOCAL
-                }
-            }
+            ProjectClientState::RemoteServer { .. } => ReplicaId::REMOTE_SERVER,
+            ProjectClientState::Local | ProjectClientState::Shared { .. } => ReplicaId::LOCAL,
         }
     }
 
@@ -2814,7 +2998,7 @@ impl Project {
         self.worktree_store.update(cx, |worktree_store, cx| {
             worktree_store.send_project_updates(cx);
         });
-        if let Some(remote_id) = self.remote_id() {
+        if let Some(remote_id) = self.collab_forwarding_project_id() {
             self.git_store.update(cx, |git_store, cx| {
                 git_store.shared(remote_id, self.collab_client.clone().into(), cx)
             });
@@ -2966,26 +3150,20 @@ impl Project {
                 sharing_has_stopped,
                 ..
             } => *sharing_has_stopped,
-            ProjectClientState::Local if self.is_via_remote_server() => {
-                self.remote_client_is_disconnected(cx)
+            ProjectClientState::RemoteServer { host_client, .. } => {
+                host_client.read(cx).is_disconnected()
             }
             _ => false,
         }
     }
 
     #[inline]
-    fn remote_client_is_disconnected(&self, cx: &App) -> bool {
-        self.remote_client
-            .as_ref()
-            .map(|remote| remote.read(cx).is_disconnected())
-            .unwrap_or(false)
-    }
-
-    #[inline]
     pub fn capability(&self) -> Capability {
         match &self.client_state {
             ProjectClientState::Collab { capability, .. } => *capability,
-            ProjectClientState::Shared { .. } | ProjectClientState::Local => Capability::ReadWrite,
+            ProjectClientState::Shared { .. }
+            | ProjectClientState::Local
+            | ProjectClientState::RemoteServer { .. } => Capability::ReadWrite,
         }
     }
 
@@ -2997,29 +3175,24 @@ impl Project {
     #[inline]
     pub fn is_local(&self) -> bool {
         match &self.client_state {
-            ProjectClientState::Local | ProjectClientState::Shared { .. } => {
-                self.remote_client.is_none()
-            }
-            ProjectClientState::Collab { .. } => false,
+            ProjectClientState::Local | ProjectClientState::Shared { .. } => true,
+            ProjectClientState::Collab { .. } | ProjectClientState::RemoteServer { .. } => false,
         }
     }
 
     /// Whether this project is a remote server (not counting collab).
     #[inline]
     pub fn is_via_remote_server(&self) -> bool {
-        match &self.client_state {
-            ProjectClientState::Local | ProjectClientState::Shared { .. } => {
-                self.remote_client.is_some()
-            }
-            ProjectClientState::Collab { .. } => false,
-        }
+        matches!(self.client_state, ProjectClientState::RemoteServer { .. })
     }
 
     /// Whether this project is from collab (not counting remote servers).
     #[inline]
     pub fn is_via_collab(&self) -> bool {
         match &self.client_state {
-            ProjectClientState::Local | ProjectClientState::Shared { .. } => false,
+            ProjectClientState::Local
+            | ProjectClientState::Shared { .. }
+            | ProjectClientState::RemoteServer { .. } => false,
             ProjectClientState::Collab { .. } => true,
         }
     }
@@ -3037,13 +3210,12 @@ impl Project {
     #[inline]
     pub fn is_via_wsl_with_host_interop(&self, cx: &App) -> bool {
         match &self.client_state {
-            ProjectClientState::Local | ProjectClientState::Shared { .. } => {
-                matches!(
-                    &self.remote_client, Some(remote_client)
-                    if remote_client.read(cx).has_wsl_interop()
-                )
+            ProjectClientState::RemoteServer { host_client, .. } => {
+                host_client.read(cx).has_wsl_interop()
             }
-            _ => false,
+            ProjectClientState::Local
+            | ProjectClientState::Shared { .. }
+            | ProjectClientState::Collab { .. } => false,
         }
     }
 
@@ -3139,15 +3311,12 @@ impl Project {
             destination_path
         );
 
-        let Some(remote_client) = &self.remote_client else {
+        let Some((project_id, remote_client)) = self.remote_server() else {
             log::error!("download_file: not a remote project");
             return Task::ready(Err(anyhow!("not a remote project")));
         };
 
         let proto_client = remote_client.read(cx).proto_client();
-        // For SSH remote projects, use REMOTE_SERVER_PROJECT_ID instead of remote_id()
-        // because SSH projects have client_state: Local but still need to communicate with remote server
-        let project_id = self.remote_id().unwrap_or(REMOTE_SERVER_PROJECT_ID);
         let downloading_files = self.downloading_files.clone();
         let path_str = path.to_proto();
 
@@ -3461,7 +3630,7 @@ impl Project {
         ) -> Result<()> {
             for (buffer_id, operations) in operations_by_buffer_id.drain() {
                 let request = this.read_with(cx, |this, _| {
-                    let project_id = this.remote_id()?;
+                    let project_id = this.collab_forwarding_project_id()?;
                     Some(this.collab_client.request(proto::UpdateBuffer {
                         buffer_id: buffer_id.into(),
                         project_id,
@@ -3527,7 +3696,7 @@ impl Project {
                         .await?;
 
                         project.read_with(cx, |project, _| {
-                            if let Some(project_id) = project.remote_id() {
+                            if let Some(project_id) = project.collab_forwarding_project_id() {
                                 project
                                     .collab_client
                                     .send(proto::UpdateLanguageServer {
@@ -3567,12 +3736,12 @@ impl Project {
                 self.register_buffer(buffer, cx).log_err();
             }
             BufferStoreEvent::BufferDropped(buffer_id) => {
-                if let Some(ref remote_client) = self.remote_client {
-                    remote_client
+                if let Some((project_id, host_client)) = self.remote_server() {
+                    host_client
                         .read(cx)
                         .proto_client()
                         .send(proto::CloseBuffer {
-                            project_id: 0,
+                            project_id,
                             buffer_id: buffer_id.to_proto(),
                         })
                         .log_err();
@@ -3888,11 +4057,12 @@ impl Project {
     }
 
     fn on_worktree_released(&mut self, id_to_remove: WorktreeId, cx: &mut Context<Self>) {
-        if let Some(remote) = &self.remote_client {
-            remote
+        if let Some((project_id, host_client)) = self.remote_server() {
+            host_client
                 .read(cx)
                 .proto_client()
                 .send(proto::RemoveWorktree {
+                    project_id,
                     worktree_id: id_to_remove.to_proto(),
                 })
                 .log_err();
@@ -3927,12 +4097,12 @@ impl Project {
             } => {
                 let operation = language::proto::serialize_operation(operation);
 
-                if let Some(remote) = &self.remote_client {
-                    remote
+                if let Some((project_id, host_client)) = self.remote_server() {
+                    host_client
                         .read(cx)
                         .proto_client()
                         .send(proto::UpdateBuffer {
-                            project_id: 0,
+                            project_id,
                             buffer_id: buffer_id.to_proto(),
                             operations: vec![operation.clone()],
                         })
@@ -4438,17 +4608,15 @@ impl Project {
 
     pub fn open_server_settings(&mut self, cx: &mut Context<Self>) -> Task<Result<Entity<Buffer>>> {
         let guard = self.retain_remotely_created_models(cx);
-        let Some(remote) = self.remote_client.as_ref() else {
+        let Some((project_id, host_client)) = self.remote_server() else {
             return Task::ready(Err(anyhow!("not an ssh project")));
         };
 
-        let proto_client = remote.read(cx).proto_client();
+        let proto_client = host_client.read(cx).proto_client();
 
         cx.spawn(async move |project, cx| {
             let buffer = proto_client
-                .request(proto::OpenServerSettings {
-                    project_id: REMOTE_SERVER_PROJECT_ID,
-                })
+                .request(proto::OpenServerSettings { project_id })
                 .await?;
 
             let buffer = project
@@ -4637,15 +4805,16 @@ impl Project {
     }
 
     fn search_impl(&mut self, query: SearchQuery, cx: &mut Context<Self>) -> SearchResultsHandle {
-        let client: Option<(AnyProtoClient, _)> = if let Some(ssh_client) = &self.remote_client {
-            Some((ssh_client.read(cx).proto_client(), 0))
-        } else if let Some(remote_id) = self.remote_id() {
-            self.is_local()
-                .not()
-                .then(|| (self.collab_client.clone().into(), remote_id))
-        } else {
-            None
-        };
+        let client: Option<(AnyProtoClient, _)> =
+            if let Some((project_id, host_client)) = self.remote_server() {
+                Some((host_client.read(cx).proto_client(), project_id))
+            } else if let Some(remote_id) = self.remote_id() {
+                self.is_local()
+                    .not()
+                    .then(|| (self.collab_client.clone().into(), remote_id))
+            } else {
+                None
+            };
         let searcher = if query.is_opened_only() {
             project_search::Search::open_buffers_only(
                 self.buffer_store.clone(),
@@ -4735,11 +4904,8 @@ impl Project {
         cx: &App,
     ) -> impl Future<Output = Result<PathBuf>> + use<> {
         let fut = if cfg!(windows)
-            && let (
-                ProjectClientState::Local | ProjectClientState::Shared { .. },
-                Some(remote_client),
-            ) = (&self.client_state, &self.remote_client)
-            && let RemoteConnectionOptions::Wsl(wsl) = remote_client.read(cx).connection_options()
+            && let ProjectClientState::RemoteServer { host_client, .. } = &self.client_state
+            && let RemoteConnectionOptions::Wsl(wsl) = host_client.read(cx).connection_options()
         {
             Either::Left(wsl.abs_windows_path_to_wsl_path(abs_path))
         } else {
@@ -4775,7 +4941,7 @@ impl Project {
     pub fn is_shared(&self) -> bool {
         match &self.client_state {
             ProjectClientState::Shared { .. } => true,
-            ProjectClientState::Local => false,
+            ProjectClientState::Local | ProjectClientState::RemoteServer { .. } => false,
             ProjectClientState::Collab { .. } => true,
         }
     }
@@ -4818,12 +4984,12 @@ impl Project {
                     is_dir: metadata.is_dir,
                 })
             })
-        } else if let Some(ssh_client) = self.remote_client.as_ref() {
-            let request = ssh_client
+        } else if let Some((project_id, host_client)) = self.remote_server() {
+            let request = host_client
                 .read(cx)
                 .proto_client()
                 .request(proto::GetPathMetadata {
-                    project_id: REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     path: path.into(),
                 });
             cx.background_spawn(async move {
@@ -4925,14 +5091,14 @@ impl Project {
     ) -> Task<Result<Vec<DirectoryItem>>> {
         if self.is_local() {
             DirectoryLister::Local(cx.entity(), self.fs.clone()).list_directory(query, cx)
-        } else if let Some(session) = self.remote_client.as_ref() {
+        } else if let Some((_, host_client)) = self.remote_server() {
             let request = proto::ListRemoteDirectory {
                 dev_server_id: REMOTE_SERVER_PROJECT_ID,
                 path: query,
                 config: Some(proto::ListRemoteDirectoryConfig { is_dir: true }),
             };
 
-            let response = session.read(cx).proto_client().request(request);
+            let response = host_client.read(cx).proto_client().request(request);
             cx.background_spawn(async move {
                 let proto::ListRemoteDirectoryResponse {
                     entries,
@@ -5394,8 +5560,8 @@ impl Project {
             // already known from connection setup, so they don't need to be sent
             // with each event.
             let Some((connection_type, platform, os_version)) =
-                this.remote_client.as_ref().map(|client| {
-                    let client = client.read(cx);
+                this.remote_server().map(|(_, host_client)| {
+                    let client = host_client.read(cx);
                     (
                         client.connection_type(),
                         client.remote_platform(),
@@ -5505,7 +5671,7 @@ impl Project {
         cx: AsyncApp,
     ) -> Result<proto::Ack> {
         let buffer_store = this.read_with(&cx, |this, cx| {
-            if let Some(remote_id) = this.remote_id() {
+            if let Some(remote_id) = this.collab_forwarding_project_id() {
                 let mut payload = envelope.payload.clone();
                 payload.project_id = remote_id;
                 cx.background_spawn(this.collab_client.request(payload))
@@ -5595,10 +5761,10 @@ impl Project {
         cx: AsyncApp,
     ) -> Result<proto::Ack> {
         let buffer_store = this.read_with(&cx, |this, cx| {
-            if let Some(ssh) = &this.remote_client {
+            if let Some((project_id, host_client)) = this.remote_server() {
                 let mut payload = envelope.payload.clone();
-                payload.project_id = REMOTE_SERVER_PROJECT_ID;
-                cx.background_spawn(ssh.read(cx).proto_client().request(payload))
+                payload.project_id = project_id;
+                cx.background_spawn(host_client.read(cx).proto_client().request(payload))
                     .detach_and_log_err(cx);
             }
             this.buffer_store.clone()
@@ -6016,7 +6182,9 @@ impl Project {
                     remote_id
                 }
             }
-            ProjectClientState::Shared { .. } | ProjectClientState::Local => {
+            ProjectClientState::Shared { .. }
+            | ProjectClientState::Local
+            | ProjectClientState::RemoteServer { .. } => {
                 return Task::ready(Err(anyhow!(
                     "can't synchronize remote buffers on a local project"
                 )));

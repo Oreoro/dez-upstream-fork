@@ -1,7 +1,7 @@
 /// todo(windows)
 /// The tests in this file assume that server_cx is running on Windows too.
 /// We neead to find a way to test Windows-Non-Windows interactions.
-use crate::headless_project::HeadlessProject;
+use crate::{SuperzedHost, headless_project::HeadlessProject};
 use agent::{
     AgentTool, NativeAgent, NativeAgentConnection, ReadFileTool, ReadFileToolInput, SkillTool,
     SkillToolInput, SkillToolOutput, Templates, ThreadStore, ToolCallEventStream, ToolInput,
@@ -29,6 +29,7 @@ use http_client::{BlockedHttpClient, FakeHttpClient};
 use language::{
     Buffer, FakeLspAdapter, LanguageConfig, LanguageMatcher, LanguageRegistry, LineEnding, Point,
     language_settings::{AllLanguageSettings, LanguageSettings},
+    proto::serialize_anchor,
 };
 use lsp::{
     CompletionContext, CompletionResponse, CompletionTriggerKind, DEFAULT_LSP_REQUEST_TIMEOUT,
@@ -51,8 +52,587 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+use superzed_session::{
+    HostSessionDb, HostSessionSnapshot, MutationRequest, ProjectRoot, ProjectSpec, SessionMutation,
+};
 use unindent::Unindent as _;
 use util::{path, path_list::PathList, paths::PathMatcher, rel_path::rel_path};
+
+#[gpui::test]
+async fn test_superzed_session_snapshot_does_not_wait_for_project_initialization(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+
+    let (options, server_session, _) = RemoteClient::fake_server(cx, server_cx);
+    server_cx.update(HeadlessProject::init);
+    let temporary_directory = tempfile::tempdir().expect("temporary session directory");
+    let database = HostSessionDb::open(&temporary_directory.path().join("session.sqlite3"))
+        .expect("host session database");
+    let snapshot = HostSessionSnapshot::default();
+    let first_project_id = snapshot.workspaces[0].project_id;
+    let server_executor = server_cx.executor();
+    let host = server_cx.new(|cx| {
+        SuperzedHost::new(
+            crate::HeadlessAppState {
+                session: server_session,
+                fs: FakeFs::new(server_executor.clone()),
+                http_client: Arc::new(BlockedHttpClient),
+                node_runtime: NodeRuntime::unavailable(),
+                languages: Arc::new(LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            database,
+            snapshot,
+            cx,
+        )
+    });
+    let (initialization_release, initialization_blocker) = futures::channel::oneshot::channel();
+    let blocked_initialization = server_cx.spawn(|_| async move {
+        initialization_blocker.await.map_err(|_| {
+            Arc::new(anyhow::anyhow!(
+                "project initialization release was dropped"
+            ))
+        })
+    });
+    host.read_with(server_cx, |host, _| host.project_for_test(first_project_id))
+        .expect("initial project should exist")
+        .update(server_cx, |project, _| {
+            project.set_superzed_initialization_for_test(blocked_initialization)
+        });
+
+    let remote = RemoteClient::connect_mock(options, cx).await;
+    let proto_client = remote.read_with(cx, |remote, _| remote.proto_client());
+    let request = Box::pin(proto_client.request(proto::GetSuperzedSession {}));
+    let timeout = Box::pin(
+        cx.background_executor
+            .timer(std::time::Duration::from_millis(100)),
+    );
+    let completed_before_initialization = match futures::future::select(request, timeout).await {
+        futures::future::Either::Left((response, _)) => {
+            response.expect("session snapshot should load");
+            initialization_release
+                .send(())
+                .expect("release project initialization");
+            true
+        }
+        futures::future::Either::Right((_, request)) => {
+            initialization_release
+                .send(())
+                .expect("release project initialization after timeout");
+            request
+                .await
+                .expect("session snapshot should load after initialization");
+            false
+        }
+    };
+
+    assert!(
+        completed_before_initialization,
+        "loading the authoritative session snapshot must not wait for project scans"
+    );
+}
+
+#[gpui::test]
+async fn test_superzed_stale_mutation_returns_authoritative_snapshot_for_retry(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+
+    let (options, server_session, _) = RemoteClient::fake_server(cx, server_cx);
+    server_cx.update(HeadlessProject::init);
+    let temporary_directory = tempfile::tempdir().expect("temporary session directory");
+    let database = HostSessionDb::open(&temporary_directory.path().join("session.sqlite3"))
+        .expect("host session database");
+    let initial_snapshot = HostSessionSnapshot::default();
+    let first_workspace_id = initial_snapshot.active_workspace_id;
+    let server_executor = server_cx.executor();
+    let _host = server_cx.new(|cx| {
+        SuperzedHost::new(
+            crate::HeadlessAppState {
+                session: server_session,
+                fs: FakeFs::new(server_executor.clone()),
+                http_client: Arc::new(BlockedHttpClient),
+                node_runtime: NodeRuntime::unavailable(),
+                languages: Arc::new(LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            database,
+            initial_snapshot,
+            cx,
+        )
+    });
+
+    let remote = RemoteClient::connect_mock(options, cx).await;
+    let proto_client = remote.read_with(cx, |remote, _| remote.proto_client());
+    let response = proto_client
+        .request(proto::MutateSuperzedSession {
+            mutation_json: serde_json::to_string(&MutationRequest {
+                expected_revision: 0,
+                mutation: SessionMutation::CreateWorkspace {
+                    after: Some(first_workspace_id),
+                    project_spec: ProjectSpec::default(),
+                },
+            })
+            .expect("serialize advancing mutation"),
+        })
+        .await
+        .expect("advance authoritative session revision");
+    let advanced_snapshot: HostSessionSnapshot =
+        serde_json::from_str(&response.snapshot_json).expect("deserialize advanced snapshot");
+    assert!(response.applied);
+
+    let response = proto_client
+        .request(proto::MutateSuperzedSession {
+            mutation_json: serde_json::to_string(&MutationRequest {
+                expected_revision: 0,
+                mutation: SessionMutation::CloseWorkspace {
+                    workspace_id: first_workspace_id,
+                },
+            })
+            .expect("serialize stale mutation"),
+        })
+        .await
+        .expect("stale mutation should return the authoritative session snapshot");
+    let authoritative_snapshot: HostSessionSnapshot = serde_json::from_str(&response.snapshot_json)
+        .expect("deserialize authoritative conflict snapshot");
+    assert!(!response.applied);
+    assert_eq!(authoritative_snapshot, advanced_snapshot);
+
+    let response = proto_client
+        .request(proto::MutateSuperzedSession {
+            mutation_json: serde_json::to_string(&MutationRequest {
+                expected_revision: authoritative_snapshot.revision,
+                mutation: SessionMutation::CloseWorkspace {
+                    workspace_id: first_workspace_id,
+                },
+            })
+            .expect("serialize retried mutation"),
+        })
+        .await
+        .expect("retry mutation against authoritative revision");
+    let retried_snapshot: HostSessionSnapshot =
+        serde_json::from_str(&response.snapshot_json).expect("deserialize retried snapshot");
+    assert!(response.applied);
+    assert_eq!(
+        retried_snapshot.revision,
+        authoritative_snapshot.revision + 1
+    );
+    assert!(
+        retried_snapshot
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != first_workspace_id)
+    );
+}
+
+#[gpui::test]
+async fn test_superzed_host_routes_real_project_ids_and_drops_closed_projects(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let server_fs = FakeFs::new(server_cx.executor());
+    server_fs
+        .insert_tree(
+            path!("/code"),
+            json!({
+                "one": { ".git": {}, "one.txt": "project one" },
+                "two": { ".git": {}, "two.txt": "project two" }
+            }),
+        )
+        .await;
+    server_fs.set_index_for_repo(
+        Path::new(path!("/code/one/.git")),
+        &[("one.txt", "project one".into())],
+    );
+    server_fs.set_index_for_repo(
+        Path::new(path!("/code/two/.git")),
+        &[("two.txt", "project two".into())],
+    );
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    init_logger();
+
+    let (options, server_session, _) = RemoteClient::fake_server(cx, server_cx);
+    let http_client = Arc::new(BlockedHttpClient);
+    let languages = Arc::new(LanguageRegistry::new(server_cx.executor()));
+    let extension_host_proxy = Arc::new(ExtensionHostProxy::new());
+    server_cx.update(HeadlessProject::init);
+    let temporary_directory = tempfile::tempdir().expect("temporary session directory");
+    let database = HostSessionDb::open(&temporary_directory.path().join("session.sqlite3"))
+        .expect("host session database");
+    let initial_snapshot = HostSessionSnapshot::default();
+    let first_workspace_id = initial_snapshot.active_workspace_id;
+    let host = server_cx.new(|cx| {
+        SuperzedHost::new(
+            crate::HeadlessAppState {
+                session: server_session,
+                fs: server_fs,
+                http_client,
+                node_runtime: NodeRuntime::unavailable(),
+                languages,
+                extension_host_proxy,
+                startup_time: std::time::Instant::now(),
+            },
+            database,
+            initial_snapshot,
+            cx,
+        )
+    });
+
+    let remote = RemoteClient::connect_mock(options, cx).await;
+    let proto_client = remote.read_with(cx, |remote, _| remote.proto_client());
+    let first_spec = ProjectSpec {
+        roots: vec![ProjectRoot {
+            requested_path: PathBuf::from(path!("/code/one")),
+            canonical_path: PathBuf::from(path!("/code/one")),
+        }],
+    };
+    let response = proto_client
+        .request(proto::MutateSuperzedSession {
+            mutation_json: serde_json::to_string(&MutationRequest {
+                expected_revision: 0,
+                mutation: SessionMutation::SetWorkspaceProjectRoots {
+                    workspace_id: first_workspace_id,
+                    project_spec: first_spec,
+                },
+            })
+            .unwrap(),
+        })
+        .await
+        .expect("first project mutation");
+    let snapshot: HostSessionSnapshot = serde_json::from_str(&response.snapshot_json).unwrap();
+    let first_project_id = snapshot.workspaces[0].project_id;
+
+    let second_spec = ProjectSpec {
+        roots: vec![ProjectRoot {
+            requested_path: PathBuf::from(path!("/code/two")),
+            canonical_path: PathBuf::from(path!("/code/two")),
+        }],
+    };
+    let response = proto_client
+        .request(proto::MutateSuperzedSession {
+            mutation_json: serde_json::to_string(&MutationRequest {
+                expected_revision: snapshot.revision,
+                mutation: SessionMutation::CreateWorkspace {
+                    after: Some(first_workspace_id),
+                    project_spec: second_spec,
+                },
+            })
+            .unwrap(),
+        })
+        .await
+        .expect("second project mutation");
+    let snapshot: HostSessionSnapshot = serde_json::from_str(&response.snapshot_json).unwrap();
+    let second_workspace = snapshot.workspaces[1].clone();
+    let second_project_id = second_workspace.project_id;
+    assert_eq!(
+        host.read_with(server_cx, |host, _| host.project_count_for_test()),
+        2
+    );
+    assert!(
+        host.read_with(server_cx, |host, _| host.project_for_test(first_project_id))
+            .is_some()
+    );
+
+    let first_project = build_project_for_id(remote.clone(), first_project_id.get(), cx);
+    let second_project = build_project_for_id(remote, second_project_id.get(), cx);
+    cx.spawn({
+        let first_project = first_project.clone();
+        |mut cx| async move { Project::initialize_superzed_project(first_project, &mut cx).await }
+    })
+    .await
+    .expect("initialize first project");
+    cx.spawn({
+        let second_project = second_project.clone();
+        |mut cx| async move { Project::initialize_superzed_project(second_project, &mut cx).await }
+    })
+    .await
+    .expect("initialize second project");
+
+    let first_worktree = first_project
+        .read_with(cx, |project, cx| project.worktrees(cx).next())
+        .expect("first client worktree");
+    let second_worktree = second_project
+        .read_with(cx, |project, cx| project.worktrees(cx).next())
+        .expect("second client worktree");
+    let first_worktree_id = first_worktree.read_with(cx, |worktree, _| worktree.id());
+    let second_worktree_id = second_worktree.read_with(cx, |worktree, _| worktree.id());
+    let first_buffer = first_project
+        .update(cx, |project, cx| {
+            project.open_buffer((first_worktree_id, rel_path("one.txt")), cx)
+        })
+        .await
+        .expect("open first project buffer");
+    let second_buffer = second_project
+        .update(cx, |project, cx| {
+            project.open_buffer((second_worktree_id, rel_path("two.txt")), cx)
+        })
+        .await
+        .expect("open second project buffer");
+    assert_eq!(
+        first_buffer.read_with(cx, |buffer, _| buffer.text()),
+        "project one"
+    );
+    assert_eq!(
+        second_buffer.read_with(cx, |buffer, _| buffer.text()),
+        "project two"
+    );
+    assert_eq!(
+        first_remote_search_path(&first_project, "project", cx).await,
+        PathBuf::from(path!("one/one.txt"))
+    );
+    assert_eq!(
+        first_remote_search_path(&second_project, "project", cx).await,
+        PathBuf::from(path!("two/two.txt"))
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        host.read_with(server_cx, |host, _| host.host_resource_counts_for_test()),
+        (2, 2, 2)
+    );
+
+    let first_buffer_id = first_buffer.read_with(cx, |buffer, _| buffer.remote_id().to_proto());
+    let second_buffer_id = second_buffer.read_with(cx, |buffer, _| buffer.remote_id().to_proto());
+    proto_client
+        .request(proto::RegisterBufferWithLanguageServers {
+            project_id: first_project_id.get(),
+            buffer_id: first_buffer_id,
+            only_servers: Vec::new(),
+        })
+        .await
+        .expect("first project LSP request");
+    proto_client
+        .request(proto::RegisterBufferWithLanguageServers {
+            project_id: second_project_id.get(),
+            buffer_id: second_buffer_id,
+            only_servers: Vec::new(),
+        })
+        .await
+        .expect("second project LSP request");
+    let lsp_cross_route = proto_client
+        .request(proto::RegisterBufferWithLanguageServers {
+            project_id: second_project_id.get(),
+            buffer_id: first_buffer_id,
+            only_servers: Vec::new(),
+        })
+        .await
+        .expect_err("LSP requests must use the target project's buffer store");
+    assert!(lsp_cross_route.to_string().contains("buffer"));
+
+    let first_repository_id = first_project
+        .read_with(cx, |project, cx| {
+            project
+                .git_store()
+                .read(cx)
+                .repositories()
+                .keys()
+                .next()
+                .copied()
+        })
+        .expect("first project repository");
+    let second_repository_id = second_project
+        .read_with(cx, |project, cx| {
+            project
+                .git_store()
+                .read(cx)
+                .repositories()
+                .keys()
+                .next()
+                .copied()
+        })
+        .expect("second project repository");
+    proto_client
+        .request(proto::GitGetBranches {
+            project_id: first_project_id.get(),
+            repository_id: first_repository_id.0,
+        })
+        .await
+        .expect("first project Git request");
+    proto_client
+        .request(proto::GitGetBranches {
+            project_id: second_project_id.get(),
+            repository_id: second_repository_id.0,
+        })
+        .await
+        .expect("second project Git request");
+    let git_cross_route = proto_client
+        .request(proto::GitGetBranches {
+            project_id: second_project_id.get(),
+            repository_id: first_repository_id.0,
+        })
+        .await
+        .expect_err("Git requests must use the target project's repository store");
+    assert!(git_cross_route.to_string().contains("repository"));
+
+    let first_anchor = first_buffer.read_with(cx, |buffer, _| buffer.anchor_after(0));
+    let second_anchor = second_buffer.read_with(cx, |buffer, _| buffer.anchor_after(0));
+    for (project_id, buffer_id, anchor) in [
+        (first_project_id.get(), first_buffer_id, first_anchor),
+        (second_project_id.get(), second_buffer_id, second_anchor),
+    ] {
+        proto_client
+            .request(proto::TaskContextForLocation {
+                project_id,
+                location: Some(proto::Location {
+                    buffer_id,
+                    start: Some(serialize_anchor(&anchor)),
+                    end: Some(serialize_anchor(&anchor)),
+                }),
+                task_variables: Default::default(),
+            })
+            .await
+            .expect("task context request should route to its project");
+    }
+    let task_cross_route = proto_client
+        .request(proto::TaskContextForLocation {
+            project_id: second_project_id.get(),
+            location: Some(proto::Location {
+                buffer_id: first_buffer_id,
+                start: Some(serialize_anchor(&first_anchor)),
+                end: Some(serialize_anchor(&first_anchor)),
+            }),
+            task_variables: Default::default(),
+        })
+        .await
+        .expect_err("task requests must use the target project's buffer store");
+    assert!(task_cross_route.to_string().contains("buffer"));
+
+    for project_id in [first_project_id.get(), second_project_id.get()] {
+        let debugger_error = proto_client
+            .request(proto::RunDebugLocators {
+                project_id,
+                build_command: Some(proto::SpawnInTerminal {
+                    label: "routing probe".into(),
+                    command: None,
+                    args: Vec::new(),
+                    env: Default::default(),
+                    cwd: None,
+                }),
+                locator: "missing-routing-probe".into(),
+            })
+            .await
+            .expect_err("the routing probe uses an intentionally missing locator");
+        assert!(
+            debugger_error
+                .to_string()
+                .contains("Couldn't find any locator")
+        );
+    }
+
+    let cross_project_error = proto_client
+        .request(proto::OpenBufferByPath {
+            project_id: first_project_id.get(),
+            worktree_id: second_worktree_id.to_proto(),
+            path: rel_path("two.txt").to_proto(),
+        })
+        .await
+        .expect_err("a project must not open another project's worktree");
+    assert!(cross_project_error.to_string().contains("no such worktree"));
+
+    let response = proto_client
+        .request(proto::MutateSuperzedSession {
+            mutation_json: serde_json::to_string(&MutationRequest {
+                expected_revision: snapshot.revision,
+                mutation: SessionMutation::CloseWorkspace {
+                    workspace_id: first_workspace_id,
+                },
+            })
+            .unwrap(),
+        })
+        .await
+        .expect("close first workspace");
+    let snapshot: HostSessionSnapshot = serde_json::from_str(&response.snapshot_json).unwrap();
+    server_cx.run_until_parked();
+    assert_eq!(
+        host.read_with(server_cx, |host, _| host.project_count_for_test()),
+        1
+    );
+    assert_eq!(
+        host.read_with(server_cx, |host, _| host.host_resource_counts_for_test()),
+        (1, 1, 1)
+    );
+
+    let missing_root = PathBuf::from(path!("/code/missing/nested"));
+    let response = proto_client
+        .request(proto::MutateSuperzedSession {
+            mutation_json: serde_json::to_string(&MutationRequest {
+                expected_revision: snapshot.revision,
+                mutation: SessionMutation::SetWorkspaceProjectRoots {
+                    workspace_id: second_workspace.id,
+                    project_spec: ProjectSpec {
+                        roots: vec![ProjectRoot {
+                            requested_path: missing_root.clone(),
+                            canonical_path: missing_root.clone(),
+                        }],
+                    },
+                },
+            })
+            .unwrap(),
+        })
+        .await
+        .expect("missing project root remains an accepted session fact");
+    let snapshot: HostSessionSnapshot = serde_json::from_str(&response.snapshot_json).unwrap();
+    assert_eq!(snapshot.workspaces[0].project_spec.roots.len(), 1);
+    assert_eq!(
+        snapshot.workspaces[0].project_spec.roots[0].requested_path,
+        missing_root
+    );
+    assert_eq!(
+        snapshot.workspaces[0].project_spec.roots[0].canonical_path,
+        PathBuf::from(path!("/code/missing/nested"))
+    );
+
+    let closed_project_error = proto_client
+        .request(proto::OpenBufferByPath {
+            project_id: first_project_id.get(),
+            worktree_id: first_worktree_id.to_proto(),
+            path: rel_path("one.txt").to_proto(),
+        })
+        .await
+        .expect_err("closed project requests must be rejected");
+    assert!(closed_project_error.to_string().contains("unknown"));
+}
+
+async fn first_remote_search_path(
+    project: &Entity<Project>,
+    query: &str,
+    cx: &mut TestAppContext,
+) -> PathBuf {
+    let search = project.update(cx, |project, cx| {
+        project.search(
+            SearchQuery::text(
+                query,
+                false,
+                true,
+                false,
+                PathMatcher::default(),
+                PathMatcher::default(),
+                false,
+                None,
+            )
+            .expect("valid search query"),
+            cx,
+        )
+    });
+    loop {
+        match search.rx.recv().await.expect("search result") {
+            SearchResult::Buffer { buffer, .. } => {
+                return buffer.read_with(cx, |buffer, cx| {
+                    buffer.file().expect("search result file").full_path(cx)
+                });
+            }
+            SearchResult::WaitingForScan | SearchResult::Searching => {}
+            SearchResult::LimitReached => panic!("search unexpectedly reached its limit"),
+        }
+    }
+}
 
 #[gpui::test]
 async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
@@ -185,6 +765,85 @@ async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut Test
             "fn one() -> usize { 100 }"
         );
     });
+}
+
+#[gpui::test]
+async fn test_initialize_superzed_project_returns_existing_worktrees(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let server_fs = FakeFs::new(server_cx.executor());
+    server_fs
+        .insert_tree(
+            path!("/code"),
+            json!({ "project1": { "README.md": "# project 1" } }),
+        )
+        .await;
+
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    init_logger();
+
+    let (opts, server_session, _) = RemoteClient::fake_server(cx, server_cx);
+    let http_client = Arc::new(BlockedHttpClient);
+    let languages = Arc::new(LanguageRegistry::new(server_cx.executor()));
+    let extension_host_proxy = Arc::new(ExtensionHostProxy::new());
+    server_cx.update(HeadlessProject::init);
+    let temporary_directory = tempfile::tempdir().expect("temporary session directory");
+    let database = HostSessionDb::open(&temporary_directory.path().join("session.sqlite3"))
+        .expect("host session database");
+    let mut snapshot = HostSessionSnapshot::default();
+    let workspace_id = snapshot.active_workspace_id;
+    snapshot
+        .apply(MutationRequest {
+            expected_revision: snapshot.revision,
+            mutation: SessionMutation::SetWorkspaceProjectRoots {
+                workspace_id,
+                project_spec: ProjectSpec {
+                    roots: vec![ProjectRoot {
+                        requested_path: PathBuf::from(path!("/code/project1")),
+                        canonical_path: PathBuf::from(path!("/code/project1")),
+                    }],
+                },
+            },
+        })
+        .expect("add project root to host session");
+    database.save(&snapshot).expect("save host session fixture");
+    let project_id = snapshot.workspaces[0].project_id;
+    let host = server_cx.new(|cx| {
+        SuperzedHost::new(
+            crate::HeadlessAppState {
+                session: server_session,
+                fs: server_fs,
+                http_client,
+                node_runtime: NodeRuntime::unavailable(),
+                languages,
+                extension_host_proxy,
+                startup_time: std::time::Instant::now(),
+            },
+            database,
+            snapshot,
+            cx,
+        )
+    });
+
+    let ssh = RemoteClient::connect_mock(opts, cx).await;
+    let project = build_project_for_id(ssh, project_id.get(), cx);
+    let initialize = cx.spawn({
+        let project = project.clone();
+        |mut cx| async move { Project::initialize_superzed_project(project, &mut cx).await }
+    });
+    initialize.await.unwrap();
+    cx.executor().run_until_parked();
+
+    let worktree = project
+        .read_with(cx, |project, cx| project.worktrees(cx).next())
+        .unwrap();
+    worktree.update(cx, |worktree, _| {
+        assert!(worktree.paths().any(|path| path == rel_path("README.md")));
+    });
+
+    drop(host);
 }
 
 #[gpui::test]
@@ -3544,6 +4203,14 @@ fn init_logger() {
 }
 
 fn build_project(ssh: Entity<RemoteClient>, cx: &mut TestAppContext) -> Entity<Project> {
+    build_project_for_id(ssh, proto::REMOTE_SERVER_PROJECT_ID, cx)
+}
+
+fn build_project_for_id(
+    ssh: Entity<RemoteClient>,
+    project_id: u64,
+    cx: &mut TestAppContext,
+) -> Entity<Project> {
     cx.update(|cx| {
         if !cx.has_global::<SettingsStore>() {
             let settings_store = SettingsStore::test(cx);
@@ -3568,5 +4235,18 @@ fn build_project(ssh: Entity<RemoteClient>, cx: &mut TestAppContext) -> Entity<P
         Project::init(&client, cx);
     });
 
-    cx.update(|cx| Project::remote(ssh, client, node, user_store, languages, fs, false, cx))
+    cx.update(|cx| {
+        Project::remote_for_project(
+            ssh,
+            client,
+            node,
+            user_store,
+            languages,
+            fs,
+            project_id,
+            false,
+            project::context_server_store::HostContextServerRegistry::default(),
+            cx,
+        )
+    })
 }

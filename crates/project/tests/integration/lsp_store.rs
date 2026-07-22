@@ -1,15 +1,186 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc, time::Duration};
 
 use fs::FakeFs;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt, pin_mut, select};
 use gpui::TestAppContext;
-use language::{CodeLabel, FakeLspAdapter, HighlightId, rust_lang};
+use language::{CodeLabel, FakeLspAdapter, HighlightId, LanguageRegistry, rust_lang};
 use lsp::Uri;
-use project::{Project, lsp_store::*};
+use project::{Project, host_resource_registry::HostResourceRegistry, lsp_store::*};
 use serde_json::json;
 use util::path;
 
 use crate::init_test;
+
+#[gpui::test]
+async fn overlapping_projects_share_one_language_server_and_document_lifecycle(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/shared"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+    let languages = Arc::new(LanguageRegistry::test(cx.executor()));
+    languages.add(rust_lang());
+    let mut fake_servers = languages.register_fake_lsp("Rust", FakeLspAdapter::default());
+    let host_resources = HostResourceRegistry::default();
+    let first_project = Project::test_with_host_resources_and_languages(
+        fs.clone(),
+        [Path::new(path!("/shared"))],
+        host_resources.clone(),
+        languages.clone(),
+        cx,
+    )
+    .await;
+    let second_project = Project::test_with_host_resources_and_languages(
+        fs,
+        [Path::new(path!("/shared"))],
+        host_resources.clone(),
+        languages,
+        cx,
+    )
+    .await;
+
+    let (first_buffer, first_handle) = first_project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/shared/main.rs"), cx)
+        })
+        .await
+        .expect("first project should open the shared Rust buffer");
+    let mut fake_server = {
+        let next_server = fake_servers.next().fuse();
+        let timeout = cx.background_executor.timer(Duration::from_secs(2)).fuse();
+        pin_mut!(next_server, timeout);
+        select! {
+            server = next_server => server.expect("the host should start one language server"),
+            _ = timeout => panic!("the shared language server did not start"),
+        }
+    };
+    {
+        let did_open = fake_server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .fuse();
+        let timeout = cx.background_executor.timer(Duration::from_secs(2)).fuse();
+        pin_mut!(did_open, timeout);
+        select! {
+            _ = did_open => {},
+            _ = timeout => panic!("the shared language server did not receive didOpen"),
+        }
+    }
+
+    let (second_buffer, second_handle) = second_project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/shared/main.rs"), cx)
+        })
+        .await
+        .expect("second project should open the shared Rust buffer");
+    assert_eq!(first_buffer.entity_id(), second_buffer.entity_id());
+    cx.run_until_parked();
+    let (server_id, buffer_id) = first_project.read_with(cx, |project, cx| {
+        (
+            project
+                .lsp_store()
+                .read(cx)
+                .language_server_statuses()
+                .next()
+                .expect("the shared language server should be running")
+                .0,
+            first_buffer.read(cx).remote_id(),
+        )
+    });
+    assert_eq!(
+        first_project.read_with(cx, |project, cx| {
+            project
+                .lsp_store()
+                .read(cx)
+                .host_document_user_count_for_test(server_id, buffer_id)
+        }),
+        2
+    );
+    assert_eq!(
+        first_project.read_with(cx, |project, cx| {
+            project
+                .lsp_store()
+                .read(cx)
+                .host_language_server_user_count_for_test(server_id)
+        }),
+        2
+    );
+
+    let second_server = fake_servers.next().fuse();
+    let timeout = cx
+        .background_executor
+        .timer(Duration::from_millis(20))
+        .fuse();
+    pin_mut!(second_server, timeout);
+    select! {
+        _ = second_server => panic!("overlapping projects started a second language server"),
+        _ = timeout => {}
+    }
+
+    cx.update(|_| drop(first_handle));
+    cx.run_until_parked();
+    assert_eq!(
+        second_project.read_with(cx, |project, cx| {
+            project
+                .lsp_store()
+                .read(cx)
+                .host_document_user_count_for_test(server_id, buffer_id)
+        }),
+        1
+    );
+    {
+        let premature_close = fake_server
+            .receive_notification::<lsp::notification::DidCloseTextDocument>()
+            .fuse();
+        let timeout = cx
+            .background_executor
+            .timer(Duration::from_millis(20))
+            .fuse();
+        pin_mut!(premature_close, timeout);
+        select! {
+            _ = premature_close => panic!("the first project close sent didClose while the document was still shared"),
+            _ = timeout => {}
+        }
+    }
+
+    cx.update(|_| drop(second_handle));
+    cx.run_until_parked();
+    assert_eq!(
+        second_project.read_with(cx, |project, cx| {
+            project
+                .lsp_store()
+                .read(cx)
+                .host_document_user_count_for_test(server_id, buffer_id)
+        }),
+        0
+    );
+    let did_close = fake_server
+        .receive_notification::<lsp::notification::DidCloseTextDocument>()
+        .fuse();
+    let timeout = cx.background_executor.timer(Duration::from_secs(2)).fuse();
+    pin_mut!(did_close, timeout);
+    select! {
+        _ = did_close => {},
+        _ = timeout => panic!("the final project close did not send didClose"),
+    }
+
+    cx.update(|_| drop(first_project));
+    cx.run_until_parked();
+    assert_eq!(
+        second_project.read_with(cx, |project, cx| {
+            project
+                .lsp_store()
+                .read(cx)
+                .host_language_server_user_count_for_test(server_id)
+        }),
+        1
+    );
+    cx.update(|_| drop(second_project));
+    cx.run_until_parked();
+    assert_eq!(host_resources.lsp_user_count_for_test(server_id), 0);
+}
 
 #[gpui::test]
 async fn test_removing_invisible_worktree_cleans_reused_lsp_bookkeeping(cx: &mut TestAppContext) {

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "test-support"))]
 use anyhow::Context as _;
 use collections::HashSet;
 use fuzzy::StringMatchCandidate;
@@ -19,15 +20,13 @@ use ui::{
 };
 use util::ResultExt as _;
 use util::paths::PathExt;
-use workspace::{
-    ModalView, MultiWorkspace, Workspace, dock::DockPosition, notifications::DetachAndPromptErr,
-};
+#[cfg(any(test, feature = "test-support"))]
+use workspace::notifications::DetachAndPromptErr;
+use workspace::{ModalView, MultiWorkspace, Workspace, dock::DockPosition};
 
 use crate::git_panel::show_error_toast;
 use crate::worktree_service::{RemoteBranchName, WorktreeCreateTarget, worktree_create_targets};
-use zed_actions::{
-    CreateWorktree, NewWorktreeBranchTarget, OpenWorktreeInNewWindow, SwitchWorktree,
-};
+use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
 
 actions!(
     worktree_picker,
@@ -926,7 +925,7 @@ impl PickerDelegate for WorktreePickerDelegate {
         })
     }
 
-    fn confirm(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         let Some(entry) = self.matches.get(self.selected_index) else {
             return;
         };
@@ -982,33 +981,24 @@ impl PickerDelegate for WorktreePickerDelegate {
                 let is_current = self.active_worktree_paths.contains(&worktree.path);
 
                 if !is_current {
-                    if secondary {
-                        window.dispatch_action(
-                            Box::new(OpenWorktreeInNewWindow {
-                                path: worktree.path.clone(),
-                            }),
-                            cx,
-                        );
-                    } else {
-                        let main_worktree_path = self
-                            .all_worktrees
-                            .iter()
-                            .find(|wt| wt.is_main)
-                            .map(|wt| wt.path.as_path());
-                        if let Some(workspace) = self.workspace.upgrade() {
-                            workspace.update(cx, |workspace, cx| {
-                                crate::worktree_service::handle_switch_worktree(
-                                    workspace,
-                                    &SwitchWorktree {
-                                        path: worktree.path.clone(),
-                                        display_name: worktree.directory_name(main_worktree_path),
-                                    },
-                                    window,
-                                    self.focused_dock,
-                                    cx,
-                                );
-                            });
-                        }
+                    let main_worktree_path = self
+                        .all_worktrees
+                        .iter()
+                        .find(|wt| wt.is_main)
+                        .map(|wt| wt.path.as_path());
+                    if let Some(workspace) = self.workspace.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            crate::worktree_service::handle_switch_worktree(
+                                workspace,
+                                &SwitchWorktree {
+                                    path: worktree.path.clone(),
+                                    display_name: worktree.directory_name(main_worktree_path),
+                                },
+                                window,
+                                self.focused_dock,
+                                cx,
+                            );
+                        });
                     }
                 }
             }
@@ -1227,32 +1217,6 @@ impl PickerDelegate for WorktreePickerDelegate {
                             )
                         })
                         .when(!is_deleting && !is_current, |this| {
-                            let open_in_new_window_button =
-                                IconButton::new(("open-new-window", ix), IconName::ArrowUpRight)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Open in New Window"))
-                                    .on_click(cx.listener(move |picker, _, window, cx| {
-                                        let Some(entry) = picker.delegate.matches.get(ix) else {
-                                            return;
-                                        };
-                                        if let WorktreeEntry::Worktree { worktree, .. } = entry {
-                                            if picker
-                                                .delegate
-                                                .deleting_worktree_paths
-                                                .contains(&worktree.path)
-                                            {
-                                                return;
-                                            }
-                                            window.dispatch_action(
-                                                Box::new(OpenWorktreeInNewWindow {
-                                                    path: worktree.path.clone(),
-                                                }),
-                                                cx,
-                                            );
-                                            cx.emit(DismissEvent);
-                                        }
-                                    }));
-
                             let focus_handle_delete = self.focus_handle.clone();
                             let force_delete = self.is_force_delete_hovering_index(ix);
                             let delete_button = div()
@@ -1289,7 +1253,6 @@ impl PickerDelegate for WorktreePickerDelegate {
                             this.end_slot(
                                 h_flex()
                                     .gap_0p5()
-                                    .child(open_in_new_window_button)
                                     .when(can_remove_from_window, |this| {
                                         let worktree_path = worktree.path.clone();
                                         this.child(
@@ -1372,10 +1335,6 @@ impl PickerDelegate for WorktreePickerDelegate {
             matches!(e, WorktreeEntry::Worktree { worktree, .. } if self.can_delete_worktree(worktree))
         });
 
-        let is_current = selected_entry.is_some_and(|e| {
-            matches!(e, WorktreeEntry::Worktree { worktree, .. } if self.project_worktree_paths.contains(&worktree.path))
-        });
-
         let is_deleting = selected_entry.is_some_and(|e| {
             matches!(e, WorktreeEntry::Worktree { worktree, .. } if self.deleting_worktree_paths.contains(&worktree.path))
         });
@@ -1423,23 +1382,6 @@ impl PickerDelegate for WorktreePickerDelegate {
                                 )
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(DeleteWorktree.boxed_clone(), cx)
-                                }),
-                        )
-                    })
-                    .when(!is_deleting && !is_current, |this| {
-                        let focus_handle = focus_handle.clone();
-                        this.child(
-                            Button::new("open-in-new-window", "Open in New Window")
-                                .key_binding(
-                                    KeyBinding::for_action_in(
-                                        &menu::SecondaryConfirm,
-                                        &focus_handle,
-                                        cx,
-                                    )
-                                    .map(|kb| kb.size(rems_from_px(12.))),
-                                )
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
                                 }),
                         )
                     })
@@ -1498,6 +1440,7 @@ fn create_new_list_item(
         .into_any_element()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub async fn open_remote_worktree(
     connection_options: remote::RemoteConnectionOptions,
     paths: Vec<PathBuf>,
@@ -1582,7 +1525,7 @@ pub async fn open_remote_worktree(
         cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
     })?;
 
-    workspace::open_remote_project_with_existing_connection(
+    workspace::open_non_ssh_remote_project_with_existing_connection(
         connection_options,
         new_project,
         paths,

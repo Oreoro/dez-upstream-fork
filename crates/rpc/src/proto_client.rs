@@ -93,6 +93,7 @@ pub struct ProtoMessageHandlerSet {
     pub entity_id_extractors: TypeIdHashMap<fn(&dyn AnyTypedEnvelope) -> u64>,
     pub entities_by_message_type: TypeIdHashMap<AnyWeakEntity>,
     pub message_handlers: TypeIdHashMap<ProtoMessageHandler>,
+    pub missing_entity_handlers: TypeIdHashMap<MissingEntityHandler>,
 }
 
 pub type ProtoMessageHandler = Arc<
@@ -106,12 +107,19 @@ pub type ProtoMessageHandler = Arc<
         ) -> LocalBoxFuture<'static, Result<()>>,
 >;
 
+pub type MissingEntityHandler = Arc<
+    dyn Send
+        + Sync
+        + Fn(Box<dyn AnyTypedEnvelope>, AnyProtoClient) -> LocalBoxFuture<'static, Result<()>>,
+>;
+
 impl ProtoMessageHandlerSet {
     pub fn clear(&mut self) {
         self.message_handlers.clear();
         self.entities_by_message_type.clear();
         self.entities_by_type_and_remote_id.clear();
         self.entity_id_extractors.clear();
+        self.missing_entity_handlers.clear();
     }
 
     fn add_message_handler(
@@ -161,15 +169,29 @@ impl ProtoMessageHandlerSet {
             let extract_entity_id = *this.entity_id_extractors.get(&payload_type_id)?;
             let entity_type_id = *this.entity_types_by_message_type.get(&payload_type_id)?;
             let entity_id = (extract_entity_id)(message.as_ref());
-            match this
+            let Some(subscriber) = this
                 .entities_by_type_and_remote_id
-                .get_mut(&(entity_type_id, entity_id))?
-            {
+                .get_mut(&(entity_type_id, entity_id))
+            else {
+                let missing_handler = this.missing_entity_handlers.get(&payload_type_id)?.clone();
+                drop(this);
+                return Some(missing_handler(message, client));
+            };
+            match subscriber {
                 EntityMessageSubscriber::Pending(pending) => {
                     pending.push(message);
                     return None;
                 }
-                EntityMessageSubscriber::Entity { handle } => handle.upgrade()?,
+                EntityMessageSubscriber::Entity { handle } => {
+                    if let Some(entity) = handle.upgrade() {
+                        entity
+                    } else {
+                        let missing_handler =
+                            this.missing_entity_handlers.get(&payload_type_id)?.clone();
+                        drop(this);
+                        return Some(missing_handler(message, client));
+                    }
+                }
             }
         };
         drop(this);
@@ -512,6 +534,31 @@ impl AnyProtoClient {
                         .boxed_local()
                 }),
             );
+        self.0
+            .client
+            .message_handler_set()
+            .lock()
+            .missing_entity_handlers
+            .insert(
+                message_type_id,
+                Arc::new(move |envelope, client| {
+                    let envelope = envelope
+                        .into_any()
+                        .downcast::<TypedEnvelope<M>>()
+                        .expect("entity request envelope type should match its handler");
+                    let request_id = envelope.message_id();
+                    let remote_entity_id = envelope.payload.remote_entity_id();
+                    async move {
+                        let error = anyhow::anyhow!(
+                            "unknown {} entity {remote_entity_id}",
+                            std::any::type_name::<E>()
+                        );
+                        client.send_response(request_id, error.to_proto())?;
+                        Err(error)
+                    }
+                    .boxed_local()
+                }),
+            );
     }
 
     pub fn add_entity_stream_request_handler<M, E, H, F, S>(&self, handler: H)
@@ -625,6 +672,15 @@ impl AnyProtoClient {
                 handle: entity.downgrade().into(),
             },
         );
+    }
+
+    pub fn unsubscribe_from_remote_id(&self, remote_id: u64) {
+        self.0
+            .client
+            .message_handler_set()
+            .lock()
+            .entities_by_type_and_remote_id
+            .retain(|(_, subscribed_remote_id), _| *subscribed_remote_id != remote_id);
     }
 
     pub fn has_wsl_interop(&self) -> bool {

@@ -688,6 +688,7 @@ pub struct App {
     pub(crate) entities: EntityMap,
     pub(crate) new_entity_observers: SubscriberSet<TypeId, NewEntityListener>,
     pub(crate) windows: SlotMap<WindowId, Option<Box<Window>>>,
+    max_window_count: Option<usize>,
     pub(crate) window_handles: FxHashMap<WindowId, AnyWindowHandle>,
     pub(crate) focus_handles: Arc<FocusMap>,
     pub(crate) keymap: Rc<RefCell<Keymap>>,
@@ -806,6 +807,7 @@ impl App {
                 entities,
                 new_entity_observers: SubscriberSet::new(),
                 windows: SlotMap::with_key(),
+                max_window_count: None,
                 window_update_stack: Vec::new(),
                 window_handles: FxHashMap::default(),
                 focus_handles: Arc::new(RwLock::new(SlotMap::with_key())),
@@ -1202,6 +1204,12 @@ impl App {
         options: crate::WindowOptions,
         build_root_view: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
     ) -> anyhow::Result<WindowHandle<V>> {
+        if self
+            .max_window_count
+            .is_some_and(|max_window_count| self.windows.len() >= max_window_count)
+        {
+            anyhow::bail!("application window limit reached");
+        }
         self.update(|cx| {
             let id = cx.windows.insert(None);
             let handle = WindowHandle::new(id);
@@ -1230,6 +1238,12 @@ impl App {
                 }
             }
         })
+    }
+
+    /// Sets a hard upper bound on simultaneously open application windows.
+    pub fn set_max_window_count(&mut self, max_window_count: usize) {
+        assert!(max_window_count > 0, "window count limit must be nonzero");
+        self.max_window_count = Some(max_window_count);
     }
 
     /// Instructs the platform to activate the application by bringing it to the foreground.

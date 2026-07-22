@@ -51,7 +51,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use util::debug_panic;
+use util::{ResultExt as _, debug_panic};
 
 use crate::{project_settings::ProjectSettings, worktree_store::WorktreeStore};
 
@@ -102,6 +102,45 @@ pub fn track_worktree_trust(
         }
         None => log::debug!("No TrustedWorktrees initialized, not tracking worktree trust"),
     }
+}
+
+pub fn set_downstream_client(
+    worktree_store: &Entity<WorktreeStore>,
+    downstream_client: (AnyProtoClient, ProjectId),
+    cx: &mut App,
+) {
+    let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) else {
+        return;
+    };
+    trusted_worktrees.update(cx, |trusted_worktrees, _| {
+        let weak_worktree_store = worktree_store.downgrade();
+        let Some(store_data) = trusted_worktrees
+            .worktree_stores
+            .get_mut(&weak_worktree_store)
+        else {
+            log::error!("cannot attach trust client for an untracked worktree store");
+            return;
+        };
+        store_data.downstream_client = Some(downstream_client.clone());
+
+        let Some(restricted_worktrees) = trusted_worktrees.restricted.get(&weak_worktree_store)
+        else {
+            return;
+        };
+        if restricted_worktrees.is_empty() {
+            return;
+        }
+        downstream_client
+            .0
+            .send(proto::RestrictWorktrees {
+                project_id: downstream_client.1.0,
+                worktree_ids: restricted_worktrees
+                    .iter()
+                    .map(|worktree_id| worktree_id.to_proto())
+                    .collect(),
+            })
+            .log_err();
+    });
 }
 
 /// A collection of worktree trust metadata, can be accessed globally (if initialized) and subscribed to.
@@ -159,6 +198,7 @@ pub struct RemoteHostLocation {
 impl From<RemoteConnectionOptions> for RemoteHostLocation {
     fn from(options: RemoteConnectionOptions) -> Self {
         let (user_name, host_name) = match options {
+            RemoteConnectionOptions::Local(_) => (None, SharedString::new("local")),
             RemoteConnectionOptions::Ssh(ssh) => (
                 ssh.username.map(SharedString::new),
                 SharedString::new(ssh.host.to_string()),

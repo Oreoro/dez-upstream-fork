@@ -1019,8 +1019,6 @@ impl VsCodeSettings {
             }),
             bottom_dock_layout: None,
             centered_layout: None,
-            cli_default_open_behavior: None,
-            default_open_behavior: None,
             close_on_file_delete: None,
             close_panel_on_toggle: None,
             command_aliases: Default::default(),
@@ -1049,7 +1047,6 @@ impl VsCodeSettings {
             show_call_status_icon: None,
             use_system_path_prompts: self.read_bool("files.simpleDialog.enable").map(|b| !b),
             use_system_prompts: None,
-            use_system_window_tabs: self.read_bool("window.nativeTabs"),
             when_closing_with_no_tabs: self.read_bool("window.closeWhenEmpty").map(|b| {
                 if b {
                     CloseWindowWhenNoItems::CloseWindow

@@ -1,8 +1,7 @@
 pub mod platforms;
-mod system_window_tabs;
 
 use gpui::{
-    Action, AnyElement, App, Context, Decorations, Entity, Hsla, InteractiveElement, IntoElement,
+    Action, AnyElement, App, Context, Decorations, Hsla, InteractiveElement, IntoElement,
     MouseButton, ParentElement, StatefulInteractiveElement, Styled, WeakEntity, Window,
     WindowButtonLayout, WindowControlArea, div, px,
 };
@@ -16,36 +15,25 @@ use ui::{
 };
 use workspace::{MultiWorkspace, SidebarRenderState, SidebarSide};
 
-use crate::{
-    platforms::{platform_linux, platform_windows},
-    system_window_tabs::SystemWindowTabs,
-};
-
-pub use system_window_tabs::{
-    DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, ShowNextWindowTab, ShowPreviousWindowTab,
-};
+use crate::platforms::{platform_linux, platform_windows};
 
 pub struct PlatformTitleBar {
     id: ElementId,
     platform_style: PlatformStyle,
     children: SmallVec<[AnyElement; 2]>,
     should_move: bool,
-    system_window_tabs: Entity<SystemWindowTabs>,
     button_layout: Option<WindowButtonLayout>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
 }
 
 impl PlatformTitleBar {
-    pub fn new(id: impl Into<ElementId>, cx: &mut Context<Self>) -> Self {
+    pub fn new(id: impl Into<ElementId>, _cx: &mut Context<Self>) -> Self {
         let platform_style = PlatformStyle::platform();
-        let system_window_tabs = cx.new(|_cx| SystemWindowTabs::new());
-
         Self {
             id: id.into(),
             platform_style,
             children: SmallVec::new(),
             should_move: false,
-            system_window_tabs,
             button_layout: None,
             multi_workspace: None,
         }
@@ -95,10 +83,6 @@ impl PlatformTitleBar {
         } else {
             None
         }
-    }
-
-    pub fn init(cx: &mut App) {
-        SystemWindowTabs::init(cx);
     }
 
     fn sidebar_render_state(&self, cx: &App) -> SidebarRenderState {
@@ -319,10 +303,7 @@ impl Render for PlatformTitleBar {
                 }
             });
 
-        v_flex()
-            .w_full()
-            .child(title_bar)
-            .child(self.system_window_tabs.clone().into_any_element())
+        v_flex().w_full().child(title_bar)
     }
 }
 

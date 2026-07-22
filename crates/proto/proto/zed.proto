@@ -13,6 +13,7 @@ import "git.proto";
 import "image.proto";
 import "lsp.proto";
 import "notification.proto";
+import "superzed.proto";
 import "task.proto";
 import "toolchain.proto";
 import "worktree.proto";
@@ -489,7 +490,16 @@ message Envelope {
     GitWorktreeCreatedAtResponse git_worktree_created_at_response = 458;
     TelemetryEvent telemetry_event = 459;
     ResolveCodeAction resolve_code_action = 460;
-    ResolveCodeActionResponse resolve_code_action_response = 461; // current max
+    ResolveCodeActionResponse resolve_code_action_response = 461;
+    GetSuperzedSession get_superzed_session = 462;
+    GetSuperzedSessionResponse get_superzed_session_response = 463;
+    MutateSuperzedSession mutate_superzed_session = 464;
+    MutateSuperzedSessionResponse mutate_superzed_session_response = 465;
+    InitializeSuperzedProject initialize_superzed_project = 466;
+    InitializeSuperzedProjectResponse initialize_superzed_project_response = 467;
+    ResyncSuperzedProject resync_superzed_project = 468;
+    ResolveSuperzedProjectSpec resolve_superzed_project_spec = 469;
+    ResolveSuperzedProjectSpecResponse resolve_superzed_project_spec_response = 470; // current max
   }
 
   reserved 87 to 88;

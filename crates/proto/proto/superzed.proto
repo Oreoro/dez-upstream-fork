@@ -1,0 +1,40 @@
+syntax = "proto3";
+package zed.messages;
+
+import "worktree.proto";
+
+message GetSuperzedSession {}
+
+message GetSuperzedSessionResponse {
+  string snapshot_json = 1;
+}
+
+message ResolveSuperzedProjectSpec {
+  string project_spec_json = 1;
+}
+
+message ResolveSuperzedProjectSpecResponse {
+  string project_spec_json = 1;
+  string snapshot_json = 2;
+}
+
+message MutateSuperzedSession {
+  string mutation_json = 1;
+}
+
+message MutateSuperzedSessionResponse {
+  string snapshot_json = 1;
+  bool applied = 2;
+}
+
+message InitializeSuperzedProject {
+  uint64 project_id = 1;
+}
+
+message InitializeSuperzedProjectResponse {
+  repeated WorktreeMetadata worktrees = 1;
+}
+
+message ResyncSuperzedProject {
+  uint64 project_id = 1;
+}

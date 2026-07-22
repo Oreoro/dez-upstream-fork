@@ -2,7 +2,6 @@ use std::{
     any::Any,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
-    time::Duration,
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -186,6 +185,7 @@ impl ExternalAgentEntry {
 pub struct AgentServerStore {
     state: AgentServerStoreState,
     pub external_agents: HashMap<AgentId, ExternalAgentEntry>,
+    downstream_ready: bool,
 }
 
 pub struct AgentServersUpdated;
@@ -292,6 +292,7 @@ impl AgentServerStore {
     }
 
     fn reregister_agents(&mut self, cx: &mut Context<Self>) {
+        let downstream_ready = self.downstream_ready;
         let AgentServerStoreState::Local {
             node_runtime,
             fs,
@@ -471,7 +472,7 @@ impl AgentServerStore {
 
         *old_settings = Some(new_settings);
 
-        if let Some((project_id, downstream_client)) = downstream_client {
+        if downstream_ready && let Some((project_id, downstream_client)) = downstream_client {
             downstream_client
                 .send(proto::ExternalAgentsUpdated {
                     project_id: *project_id,
@@ -519,6 +520,7 @@ impl AgentServerStore {
                 _subscriptions: subscriptions,
             },
             external_agents: HashMap::default(),
+            downstream_ready: false,
         };
         this.agent_servers_settings_changed(cx);
         this
@@ -536,6 +538,7 @@ impl AgentServerStore {
                 worktree_store,
             },
             external_agents: HashMap::default(),
+            downstream_ready: false,
         }
     }
 
@@ -543,31 +546,17 @@ impl AgentServerStore {
         Self {
             state: AgentServerStoreState::Collab,
             external_agents: HashMap::default(),
+            downstream_ready: false,
         }
     }
 
-    pub fn shared(&mut self, project_id: u64, client: AnyProtoClient, cx: &mut Context<Self>) {
+    pub fn shared(&mut self, project_id: u64, client: AnyProtoClient, _cx: &mut Context<Self>) {
         match &mut self.state {
             AgentServerStoreState::Local {
                 downstream_client, ..
             } => {
-                *downstream_client = Some((project_id, client.clone()));
-                // Send the current list of external agents downstream, but only after a delay,
-                // to avoid having the message arrive before the downstream project's agent server store
-                // sets up its handlers.
-                cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
-                    let names = this.update(cx, |this, _| {
-                        this.external_agents()
-                            .map(|name| name.to_string())
-                            .collect()
-                    })?;
-                    client
-                        .send(proto::ExternalAgentsUpdated { project_id, names })
-                        .log_err();
-                    anyhow::Ok(())
-                })
-                .detach();
+                *downstream_client = Some((project_id, client));
+                self.downstream_ready = false;
             }
             AgentServerStoreState::Remote { .. } => {
                 debug_panic!(
@@ -577,6 +566,34 @@ impl AgentServerStore {
             AgentServerStoreState::Collab => {
                 debug_panic!("external agents over collab not implemented, should not be shared");
             }
+        }
+    }
+
+    pub fn resume_downstream(&mut self) -> Result<()> {
+        self.downstream_ready = true;
+        let AgentServerStoreState::Local {
+            downstream_client: Some((project_id, client)),
+            ..
+        } = &self.state
+        else {
+            return Ok(());
+        };
+        client.send(proto::ExternalAgentsUpdated {
+            project_id: *project_id,
+            names: self
+                .external_agents()
+                .map(|name| name.to_string())
+                .collect(),
+        })
+    }
+
+    pub fn unshared(&mut self) {
+        self.downstream_ready = false;
+        if let AgentServerStoreState::Local {
+            downstream_client, ..
+        } = &mut self.state
+        {
+            downstream_client.take();
         }
     }
 
@@ -1735,7 +1752,14 @@ mod tests {
             let worktree_store =
                 cx.new(|cx| WorktreeStore::local(false, fs.clone(), WorktreeIdCounter::get(cx)));
             let project_environment = cx.new(|cx| {
-                crate::ProjectEnvironment::new(None, worktree_store.downgrade(), None, false, cx)
+                crate::ProjectEnvironment::new(
+                    None,
+                    worktree_store.downgrade(),
+                    None,
+                    rpc::proto::REMOTE_SERVER_PROJECT_ID,
+                    false,
+                    cx,
+                )
             });
             let http_client = http_client::FakeHttpClient::with_404_response();
 

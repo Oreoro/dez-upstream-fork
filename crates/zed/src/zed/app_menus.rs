@@ -63,7 +63,6 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             name: "Zed".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("About Zed", zed_actions::About),
                 MenuItem::action("Check for Updates", auto_update::Check),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu::new("Settings").items([
@@ -109,7 +108,6 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("New", workspace::NewFile),
-                MenuItem::action("New Window", workspace::NewWindow),
                 MenuItem::separator(),
                 #[cfg(not(target_os = "macos"))]
                 MenuItem::action("Open File...", workspace::OpenFiles),
@@ -119,10 +117,10 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                     } else {
                         "Open…"
                     },
-                    workspace::Open::default(),
+                    workspace::Open,
                 ),
-                MenuItem::action("Open Recent…", zed_actions::OpenRecent::default()),
-                MenuItem::action("Open Remote…", zed_actions::OpenRemote::default()),
+                MenuItem::action("Open Recent…", zed_actions::OpenRecent),
+                MenuItem::action("Connect SSH Host…", zed_actions::hosts::ConnectSshHost),
                 MenuItem::separator(),
                 MenuItem::action("Add Folder to Project…", workspace::AddFolderToProject),
                 MenuItem::separator(),

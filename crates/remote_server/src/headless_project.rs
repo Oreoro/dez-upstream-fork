@@ -9,6 +9,7 @@ use lsp::LanguageServerId;
 use extension::ExtensionHostProxy;
 use extension_host::headless_host::HeadlessExtensionStore;
 use fs::Fs;
+use futures::{FutureExt as _, future::Shared, future::try_join_all};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, PromptLevel, TaskExt};
 use http_client::HttpClient;
 use language::{Buffer, BufferEvent, LanguageRegistry, proto::serialize_operation};
@@ -21,6 +22,7 @@ use project::{
     context_server_store::ContextServerStore,
     debugger::{breakpoint_store::BreakpointStore, dap_store::DapStore},
     git_store::GitStore,
+    host_resource_registry::HostResourceRegistry,
     image_store::ImageId,
     lsp_store::log_store::{self, GlobalLogStore, LanguageServerKind, LogKind},
     project_settings::SettingsObserver,
@@ -41,7 +43,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -49,7 +51,10 @@ use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
 use worktree::Worktree;
 
+pub(crate) type SuperzedProjectInitialization = Shared<gpui::Task<Result<(), Arc<anyhow::Error>>>>;
+
 pub struct HeadlessProject {
+    pub project_id: u64,
     pub fs: Arc<dyn Fs>,
     pub session: AnyProtoClient,
     pub worktree_store: Entity<WorktreeStore>,
@@ -61,7 +66,6 @@ pub struct HeadlessProject {
     pub agent_server_store: Entity<AgentServerStore>,
     pub context_server_store: Entity<ContextServerStore>,
     pub settings_observer: Entity<SettingsObserver>,
-    pub next_entry_id: Arc<AtomicUsize>,
     pub languages: Arc<LanguageRegistry>,
     pub extensions: Entity<HeadlessExtensionStore>,
     pub git_store: Entity<GitStore>,
@@ -71,8 +75,11 @@ pub struct HeadlessProject {
     // Local variant is used within LSP store, but that's a separate entity.
     pub _toolchain_store: Entity<ToolchainStore>,
     pub kernels: HashMap<String, Child>,
+    superzed_initialization: Option<SuperzedProjectInitialization>,
+    superzed_git_downstream_started: bool,
 }
 
+#[derive(Clone)]
 pub struct HeadlessAppState {
     pub session: AnyProtoClient,
     pub fs: Arc<dyn Fs>,
@@ -89,7 +96,27 @@ impl HeadlessProject {
         log_store::init(true, cx);
     }
 
-    pub fn new(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_superzed_initialization_for_test(
+        &mut self,
+        initialization: gpui::Task<Result<(), Arc<anyhow::Error>>>,
+    ) {
+        self.superzed_initialization = Some(initialization.shared());
+    }
+
+    pub fn new(state: HeadlessAppState, init_worktree_trust: bool, cx: &mut Context<Self>) -> Self {
+        Self::new_for_project(
+            state,
+            REMOTE_SERVER_PROJECT_ID,
+            HostResourceRegistry::default(),
+            init_worktree_trust,
+            true,
+            None,
+            cx,
+        )
+    }
+
+    pub fn new_for_project(
         HeadlessAppState {
             session,
             fs,
@@ -99,30 +126,44 @@ impl HeadlessProject {
             extension_host_proxy: proxy,
             startup_time,
         }: HeadlessAppState,
+        project_id: u64,
+        host_resource_registry: HostResourceRegistry,
         init_worktree_trust: bool,
+        register_protocol_handlers: bool,
+        shared_extensions: Option<Entity<HeadlessExtensionStore>>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let defer_superzed_downstream = shared_extensions.is_some();
         debug_adapter_extension::init(proxy.clone(), cx);
         languages::init(languages.clone(), fs.clone(), node_runtime.clone(), cx);
+        let host_context_servers = host_resource_registry.context_servers();
 
         let worktree_store = cx.new(|cx| {
-            let mut store = WorktreeStore::local(true, fs.clone(), WorktreeIdCounter::get(cx));
-            store.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
+            let mut store = WorktreeStore::local_with_host_resources(
+                true,
+                fs.clone(),
+                WorktreeIdCounter::get(cx),
+                host_resource_registry,
+            );
+            store.shared_as_remote_server(project_id, session.clone(), cx);
             store
         });
 
         if init_worktree_trust {
+            let downstream_client =
+                (!defer_superzed_downstream).then(|| (session.clone(), ProjectId(project_id)));
             project::trusted_worktrees::track_worktree_trust(
                 worktree_store.clone(),
                 None::<RemoteHostLocation>,
-                Some((session.clone(), ProjectId(REMOTE_SERVER_PROJECT_ID))),
+                downstream_client,
                 None,
                 cx,
             );
         }
 
-        let environment =
-            cx.new(|cx| ProjectEnvironment::new(None, worktree_store.downgrade(), None, true, cx));
+        let environment = cx.new(|cx| {
+            ProjectEnvironment::new(None, worktree_store.downgrade(), None, project_id, true, cx)
+        });
         let manifest_tree = ManifestTree::new(worktree_store.clone(), cx);
         let toolchain_store = cx.new(|cx| {
             ToolchainStore::local(
@@ -136,14 +177,14 @@ impl HeadlessProject {
 
         let buffer_store = cx.new(|cx| {
             let mut buffer_store = BufferStore::local(worktree_store.clone(), cx);
-            buffer_store.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
+            buffer_store.shared(project_id, session.clone(), cx);
             buffer_store
         });
 
         let breakpoint_store = cx.new(|_| {
             let mut breakpoint_store =
                 BreakpointStore::local(worktree_store.clone(), buffer_store.clone());
-            breakpoint_store.shared(REMOTE_SERVER_PROJECT_ID, session.clone());
+            breakpoint_store.shared(project_id, session.clone());
 
             breakpoint_store
         });
@@ -160,7 +201,7 @@ impl HeadlessProject {
                 true,
                 cx,
             );
-            dap_store.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
+            dap_store.shared(project_id, session.clone(), cx);
             dap_store
         });
 
@@ -172,7 +213,9 @@ impl HeadlessProject {
                 fs.clone(),
                 cx,
             );
-            store.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
+            if !defer_superzed_downstream {
+                store.shared(project_id, session.clone(), cx);
+            }
             store
         });
 
@@ -195,7 +238,7 @@ impl HeadlessProject {
                 git_store.clone(),
                 cx,
             );
-            task_store.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
+            task_store.shared(project_id, session.clone(), cx);
             task_store
         });
         let settings_observer = cx.new(|cx| {
@@ -206,7 +249,7 @@ impl HeadlessProject {
                 true,
                 cx,
             );
-            observer.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
+            observer.shared(project_id, session.clone(), cx);
             observer
         });
 
@@ -227,7 +270,7 @@ impl HeadlessProject {
                 fs.clone(),
                 cx,
             );
-            lsp_store.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
+            lsp_store.shared(project_id, session.clone(), cx);
             lsp_store
         });
 
@@ -241,14 +284,19 @@ impl HeadlessProject {
                 http_client.clone(),
                 cx,
             );
-            agent_server_store.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
+            agent_server_store.shared(project_id, session.clone(), cx);
             agent_server_store
         });
 
         let context_server_store = cx.new(|cx| {
-            let mut context_server_store =
-                ContextServerStore::local(worktree_store.clone(), None, true, cx);
-            context_server_store.shared(REMOTE_SERVER_PROJECT_ID, session.clone());
+            let mut context_server_store = ContextServerStore::local(
+                worktree_store.clone(),
+                None,
+                true,
+                host_context_servers,
+                cx,
+            );
+            context_server_store.shared(project_id, session.clone());
             context_server_store
         });
 
@@ -266,81 +314,74 @@ impl HeadlessProject {
         })
         .detach();
 
-        let extensions = HeadlessExtensionStore::new(
-            fs.clone(),
-            http_client.clone(),
-            paths::remote_extensions_dir().to_path_buf(),
-            proxy,
-            node_runtime,
-            cx,
-        );
+        let extensions = shared_extensions.unwrap_or_else(|| {
+            HeadlessExtensionStore::new(
+                fs.clone(),
+                http_client.clone(),
+                paths::remote_extensions_dir().to_path_buf(),
+                proxy,
+                node_runtime,
+                cx,
+            )
+        });
 
         // local_machine -> ssh handlers
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &worktree_store);
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &buffer_store);
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &cx.entity());
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &lsp_store);
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &task_store);
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &toolchain_store);
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &dap_store);
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &breakpoint_store);
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &settings_observer);
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &git_store);
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &agent_server_store);
-        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &context_server_store);
+        session.subscribe_to_entity(project_id, &worktree_store);
+        session.subscribe_to_entity(project_id, &buffer_store);
+        session.subscribe_to_entity(project_id, &cx.entity());
+        session.subscribe_to_entity(project_id, &lsp_store);
+        session.subscribe_to_entity(project_id, &task_store);
+        session.subscribe_to_entity(project_id, &toolchain_store);
+        session.subscribe_to_entity(project_id, &dap_store);
+        session.subscribe_to_entity(project_id, &breakpoint_store);
+        session.subscribe_to_entity(project_id, &settings_observer);
+        session.subscribe_to_entity(project_id, &git_store);
+        session.subscribe_to_entity(project_id, &agent_server_store);
+        session.subscribe_to_entity(project_id, &context_server_store);
 
-        session.add_request_handler(cx.weak_entity(), Self::handle_list_remote_directory);
-        session.add_request_handler(cx.weak_entity(), Self::handle_get_path_metadata);
-        session.add_request_handler(cx.weak_entity(), Self::handle_shutdown_remote_server);
-        session.add_request_handler(cx.weak_entity(), Self::handle_ping);
-        session.add_request_handler(cx.weak_entity(), Self::handle_get_processes);
-        session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
+        if register_protocol_handlers {
+            session.add_entity_request_handler(Self::handle_add_worktree);
+            session.add_entity_request_handler(Self::handle_remove_worktree);
+            session.add_entity_request_handler(Self::handle_get_path_metadata);
+            session.add_entity_request_handler(Self::handle_initialize_superzed_project);
+            session.add_entity_request_handler(Self::handle_resync_superzed_project);
+            session.add_entity_request_handler(Self::handle_get_processes);
+            session.add_entity_request_handler(Self::handle_get_remote_profiling_data);
 
-        session.add_entity_request_handler(Self::handle_add_worktree);
-        session.add_request_handler(cx.weak_entity(), Self::handle_remove_worktree);
+            session.add_entity_request_handler(Self::handle_open_buffer_by_path);
+            session.add_entity_request_handler(Self::handle_open_new_buffer);
+            session.add_entity_request_handler(Self::handle_find_search_candidates);
+            session.add_entity_request_handler(Self::handle_open_server_settings);
+            session.add_entity_request_handler(Self::handle_get_directory_environment);
+            session.add_entity_message_handler(Self::handle_toggle_lsp_logs);
+            session.add_entity_request_handler(Self::handle_open_image_by_path);
+            session.add_entity_request_handler(Self::handle_trust_worktrees);
+            session.add_entity_request_handler(Self::handle_restrict_worktrees);
+            session.add_entity_request_handler(Self::handle_download_file_by_path);
 
-        session.add_entity_request_handler(Self::handle_open_buffer_by_path);
-        session.add_entity_request_handler(Self::handle_open_new_buffer);
-        session.add_entity_request_handler(Self::handle_find_search_candidates);
-        session.add_entity_request_handler(Self::handle_open_server_settings);
-        session.add_entity_request_handler(Self::handle_get_directory_environment);
-        session.add_entity_message_handler(Self::handle_toggle_lsp_logs);
-        session.add_entity_request_handler(Self::handle_open_image_by_path);
-        session.add_entity_request_handler(Self::handle_trust_worktrees);
-        session.add_entity_request_handler(Self::handle_restrict_worktrees);
-        session.add_entity_request_handler(Self::handle_download_file_by_path);
+            session.add_entity_message_handler(Self::handle_find_search_candidates_cancel);
+            session.add_entity_request_handler(BufferStore::handle_update_buffer);
+            session.add_entity_message_handler(BufferStore::handle_close_buffer);
 
-        session.add_entity_message_handler(Self::handle_find_search_candidates_cancel);
-        session.add_entity_request_handler(BufferStore::handle_update_buffer);
-        session.add_entity_message_handler(BufferStore::handle_close_buffer);
+            session.add_entity_request_handler(Self::handle_spawn_kernel);
+            session.add_entity_request_handler(Self::handle_kill_kernel);
 
-        session.add_request_handler(
-            extensions.downgrade(),
-            HeadlessExtensionStore::handle_sync_extensions,
-        );
-        session.add_request_handler(
-            extensions.downgrade(),
-            HeadlessExtensionStore::handle_install_extension,
-        );
-
-        session.add_request_handler(cx.weak_entity(), Self::handle_spawn_kernel);
-        session.add_request_handler(cx.weak_entity(), Self::handle_kill_kernel);
-
-        BufferStore::init(&session);
-        WorktreeStore::init(&session);
-        SettingsObserver::init(&session);
-        LspStore::init(&session);
-        TaskStore::init(Some(&session));
-        ToolchainStore::init(&session);
-        DapStore::init(&session, cx);
-        // todo(debugger): Re init breakpoint store when we set it up for collab
-        BreakpointStore::init(&session);
-        GitStore::init(&session);
-        AgentServerStore::init_headless(&session);
-        ContextServerStore::init_headless(&session);
+            BufferStore::init(&session);
+            WorktreeStore::init(&session);
+            SettingsObserver::init(&session);
+            LspStore::init(&session);
+            TaskStore::init(Some(&session));
+            ToolchainStore::init(&session);
+            DapStore::init(&session, cx);
+            // todo(debugger): Re init breakpoint store when we set it up for collab
+            BreakpointStore::init(&session);
+            GitStore::init(&session);
+            AgentServerStore::init_headless(&session);
+            ContextServerStore::init_headless(&session);
+        }
 
         HeadlessProject {
-            next_entry_id: Default::default(),
+            project_id,
             session,
             settings_observer,
             fs,
@@ -359,7 +400,81 @@ impl HeadlessProject {
             profiling_collector: gpui::ProfilingCollector::new(startup_time),
             _toolchain_store: toolchain_store,
             kernels: Default::default(),
+            superzed_initialization: None,
+            superzed_git_downstream_started: !defer_superzed_downstream,
         }
+    }
+
+    pub fn reconcile_superzed_roots(
+        &mut self,
+        desired_paths: HashSet<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let worktree_tasks = self.worktree_store.update(cx, |store, cx| {
+            store.pause_downstream_project_updates();
+            let mut existing_paths = HashSet::default();
+            let mut removed_worktree_ids = Vec::new();
+            for worktree in store.worktrees() {
+                let worktree = worktree.read(cx);
+                let path = worktree.abs_path().to_path_buf();
+                if desired_paths.contains(&path) {
+                    existing_paths.insert(path);
+                } else {
+                    removed_worktree_ids.push(worktree.id());
+                }
+            }
+            for worktree_id in removed_worktree_ids {
+                store.remove_worktree(worktree_id, cx);
+            }
+            desired_paths
+                .difference(&existing_paths)
+                .map(|path| store.create_worktree(path, true, cx))
+                .collect::<Vec<_>>()
+        });
+        let worktree_store = self.worktree_store.clone();
+        self.superzed_initialization = Some(
+            cx.spawn(async move |_, cx| {
+                try_join_all(worktree_tasks).await.map_err(Arc::new)?;
+                let initial_scan =
+                    worktree_store.read_with(cx, |store, _| store.wait_for_initial_scan());
+                initial_scan.await;
+                Ok(())
+            })
+            .shared(),
+        );
+    }
+
+    pub fn close_superzed_runtime(&mut self, cx: &mut Context<Self>) {
+        self.session.unsubscribe_from_remote_id(self.project_id);
+        self.agent_server_store
+            .update(cx, |store, _| store.unshared());
+        self.lsp_store.update(cx, |store, cx| {
+            store.disconnected_from_host();
+            store.release_host_resources(cx);
+        });
+        self.dap_store.update(cx, |store, cx| store.unshared(cx));
+        self.task_store.update(cx, |store, cx| store.unshared(cx));
+        self.settings_observer
+            .update(cx, |store, cx| store.unshared(cx));
+        self.git_store.update(cx, |store, cx| {
+            store.unshared(cx);
+            store.release_host_resources();
+        });
+        self.superzed_git_downstream_started = false;
+        self.buffer_store.update(cx, |store, cx| {
+            store.unshared(cx);
+            store.release_host_resources();
+        });
+        self.worktree_store.update(cx, |store, cx| {
+            store.unshared(cx);
+            let worktree_ids = store
+                .worktrees()
+                .map(|worktree| worktree.read(cx).id())
+                .collect::<Vec<_>>();
+            for worktree_id in worktree_ids {
+                store.remove_worktree(worktree_id, cx);
+            }
+        });
     }
 
     fn on_buffer_event(
@@ -374,7 +489,7 @@ impl HeadlessProject {
         } = event
         {
             cx.background_spawn(self.session.request(proto::UpdateBuffer {
-                project_id: REMOTE_SERVER_PROJECT_ID,
+                project_id: self.project_id,
                 buffer_id: buffer.read(cx).remote_id().to_proto(),
                 operations: vec![serialize_operation(operation)],
             }))
@@ -419,7 +534,7 @@ impl HeadlessProject {
                 }
                 self.session
                     .send(proto::UpdateLanguageServer {
-                        project_id: REMOTE_SERVER_PROJECT_ID,
+                        project_id: self.project_id,
                         server_name: None,
                         language_server_id: id.to_proto(),
                         variant: Some(proto::update_language_server::Variant::Removed(
@@ -435,7 +550,7 @@ impl HeadlessProject {
             } => {
                 self.session
                     .send(proto::UpdateLanguageServer {
-                        project_id: REMOTE_SERVER_PROJECT_ID,
+                        project_id: self.project_id,
                         server_name: name.as_ref().map(|name| name.to_string()),
                         language_server_id: language_server_id.to_proto(),
                         variant: Some(message.clone()),
@@ -445,7 +560,7 @@ impl HeadlessProject {
             LspStoreEvent::Notification(message) => {
                 self.session
                     .send(proto::Toast {
-                        project_id: REMOTE_SERVER_PROJECT_ID,
+                        project_id: self.project_id,
                         notification_id: "lsp".to_string(),
                         message: message.clone(),
                     })
@@ -453,7 +568,7 @@ impl HeadlessProject {
             }
             LspStoreEvent::LanguageServerPrompt(prompt) => {
                 let request = self.session.request(proto::LanguageServerPromptRequest {
-                    project_id: REMOTE_SERVER_PROJECT_ID,
+                    project_id: self.project_id,
                     actions: prompt
                         .actions
                         .iter()
@@ -509,23 +624,11 @@ impl HeadlessProject {
                 }
             }
         };
-        let next_worktree_id = this
-            .update(&mut cx, |this, cx| {
-                this.worktree_store
-                    .update(cx, |worktree_store, _| worktree_store.next_worktree_id())
-            })
-            .await?;
         let worktree = this
-            .read_with(&cx.clone(), |this, _| {
-                Worktree::local(
-                    Arc::from(canonicalized.as_path()),
-                    message.payload.visible,
-                    this.fs.clone(),
-                    this.next_entry_id.clone(),
-                    true,
-                    next_worktree_id,
-                    &mut cx,
-                )
+            .update(&mut cx, |this, cx| {
+                this.worktree_store.update(cx, |worktree_store, cx| {
+                    worktree_store.create_worktree(&canonicalized, message.payload.visible, cx)
+                })
             })
             .await?;
 
@@ -540,27 +643,6 @@ impl HeadlessProject {
                 root_repo_is_linked_worktree: worktree.root_repo_is_linked_worktree(),
             }
         });
-
-        // We spawn this asynchronously, so that we can send the response back
-        // *before* `worktree_store.add()` can send out UpdateProject requests
-        // to the client about the new worktree.
-        //
-        // That lets the client manage the reference/handles of the newly-added
-        // worktree, before getting interrupted by an UpdateProject request.
-        //
-        // This fixes the problem of the client sending the AddWorktree request,
-        // headless project sending out a project update, client receiving it
-        // and immediately dropping the reference of the new client, causing it
-        // to be dropped on the headless project, and the client only then
-        // receiving a response to AddWorktree.
-        cx.spawn(async move |cx| {
-            this.update(cx, |this, cx| {
-                this.worktree_store.update(cx, |worktree_store, cx| {
-                    worktree_store.add(&worktree, cx);
-                });
-            });
-        })
-        .detach();
 
         Ok(response)
     }
@@ -1150,39 +1232,6 @@ impl HeadlessProject {
         BufferStore::handle_find_search_candidates_cancel(buffer_store, envelope, cx).await
     }
 
-    async fn handle_list_remote_directory(
-        this: Entity<Self>,
-        envelope: TypedEnvelope<proto::ListRemoteDirectory>,
-        cx: AsyncApp,
-    ) -> Result<proto::ListRemoteDirectoryResponse> {
-        use smol::stream::StreamExt;
-        let fs = cx.read_entity(&this, |this, _| this.fs.clone());
-        let expanded = PathBuf::from(shellexpand::tilde(&envelope.payload.path).to_string());
-        let check_info = envelope
-            .payload
-            .config
-            .as_ref()
-            .is_some_and(|config| config.is_dir);
-
-        let mut entries = Vec::new();
-        let mut entry_info = Vec::new();
-        let mut response = fs.read_dir(&expanded).await?;
-        while let Some(path) = response.next().await {
-            let path = path?;
-            if let Some(file_name) = path.file_name() {
-                entries.push(file_name.to_string_lossy().into_owned());
-                if check_info {
-                    let is_dir = fs.is_dir(&path).await;
-                    entry_info.push(proto::EntryInfo { is_dir });
-                }
-            }
-        }
-        Ok(proto::ListRemoteDirectoryResponse {
-            entries,
-            entry_info,
-        })
-    }
-
     async fn handle_get_path_metadata(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::GetPathMetadata>,
@@ -1201,30 +1250,63 @@ impl HeadlessProject {
         })
     }
 
-    async fn handle_shutdown_remote_server(
-        _this: Entity<Self>,
-        _envelope: TypedEnvelope<proto::ShutdownRemoteServer>,
+    async fn handle_initialize_superzed_project(
+        this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::InitializeSuperzedProject>,
         cx: AsyncApp,
-    ) -> Result<proto::Ack> {
-        cx.spawn(async move |cx| {
-            cx.update(|cx| {
-                // TODO: This is a hack, because in a headless project, shutdown isn't executed
-                // when calling quit, but it should be.
-                cx.shutdown();
-                cx.quit();
-            })
-        })
-        .detach();
-
-        Ok(proto::Ack {})
+    ) -> Result<proto::InitializeSuperzedProjectResponse> {
+        let initialization = this.read_with(&cx, |this, _| this.superzed_initialization.clone());
+        if let Some(initialization) = initialization {
+            initialization.await.map_err(|error| anyhow!("{error:#}"))?;
+        }
+        let worktrees = this.read_with(&cx, |this, cx| {
+            this.worktree_store.read(cx).worktree_metadata_protos(cx)
+        });
+        Ok(proto::InitializeSuperzedProjectResponse { worktrees })
     }
 
-    pub async fn handle_ping(
-        _this: Entity<Self>,
-        _envelope: TypedEnvelope<proto::Ping>,
-        _cx: AsyncApp,
+    async fn handle_resync_superzed_project(
+        this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::ResyncSuperzedProject>,
+        mut cx: AsyncApp,
     ) -> Result<proto::Ack> {
-        log::debug!("Received ping from client");
+        let (session, worktree_store, agent_server_store, updates) =
+            this.update(&mut cx, |this, cx| {
+                project::trusted_worktrees::set_downstream_client(
+                    &this.worktree_store,
+                    (this.session.clone(), ProjectId(this.project_id)),
+                    cx,
+                );
+                if !this.superzed_git_downstream_started {
+                    this.git_store.update(cx, |store, cx| {
+                        store.shared(this.project_id, this.session.clone(), cx)
+                    });
+                    this.superzed_git_downstream_started = true;
+                }
+                let updates = this
+                    .worktree_store
+                    .read(cx)
+                    .worktrees()
+                    .flat_map(|worktree| {
+                        proto::split_worktree_update(
+                            worktree.read(cx).initial_update(this.project_id),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    this.session.clone(),
+                    this.worktree_store.clone(),
+                    this.agent_server_store.clone(),
+                    updates,
+                )
+            });
+        for update in updates {
+            session.send(update)?;
+        }
+        worktree_store.update(&mut cx, |store, cx| {
+            store.resume_downstream_worktree_updates(cx)
+        });
+        agent_server_store.update(&mut cx, |store, _| store.resume_downstream())?;
         Ok(proto::Ack {})
     }
 

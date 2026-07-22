@@ -6,6 +6,7 @@ use crate::{
     proxy::ProxyLaunchError,
     transport::{
         docker::{DockerConnectionOptions, DockerExecConnection},
+        local::{LocalConnectionOptions, LocalRemoteConnection},
         ssh::SshRemoteConnection,
         wsl::{WslConnectionOptions, WslRemoteConnection},
     },
@@ -333,6 +334,8 @@ pub struct RemoteClient {
     platform: RemotePlatform,
     os_version: Option<String>,
     state: Option<State>,
+    project_handlers_registered: bool,
+    persistent_host: bool,
 }
 
 #[derive(Debug)]
@@ -345,6 +348,7 @@ impl EventEmitter<RemoteClientEvent> for RemoteClient {}
 /// Identifies the socket on the remote server so that reconnects
 /// can re-join the same project.
 pub enum ConnectionIdentifier {
+    Host,
     Setup(u64),
     Workspace(i64),
 }
@@ -368,6 +372,7 @@ impl ConnectionIdentifier {
             release_channel => format!("{}-", release_channel.dev_name()),
         };
         match self {
+            Self::Host => format!("{identifier_prefix}superzed-{}", rpc::PROTOCOL_VERSION),
             Self::Setup(setup_id) => format!("{identifier_prefix}setup-{setup_id}"),
             Self::Workspace(workspace_id) => {
                 format!("{identifier_prefix}workspace-{workspace_id}",)
@@ -405,6 +410,19 @@ pub fn has_active_connection(opts: &RemoteConnectionOptions, cx: &App) -> bool {
 }
 
 impl RemoteClient {
+    pub fn is_persistent_host(&self) -> bool {
+        self.persistent_host
+    }
+
+    pub fn take_project_handler_registration(&mut self) -> bool {
+        if self.project_handlers_registered {
+            false
+        } else {
+            self.project_handlers_registered = true;
+            true
+        }
+    }
+
     pub fn new(
         unique_identifier: ConnectionIdentifier,
         remote_connection: Arc<dyn RemoteConnection>,
@@ -412,6 +430,7 @@ impl RemoteClient {
         delegate: Arc<dyn RemoteClientDelegate>,
         cx: &mut App,
     ) -> Task<Result<Option<Entity<Self>>>> {
+        let persistent_host = matches!(unique_identifier, ConnectionIdentifier::Host);
         let unique_identifier = unique_identifier.to_string(cx);
         cx.spawn(async move |cx| {
             let success = Box::pin(async move {
@@ -442,6 +461,8 @@ impl RemoteClient {
                     platform,
                     os_version: os_version.clone(),
                     state: Some(State::Connecting),
+                    project_handlers_registered: false,
+                    persistent_host,
                 });
 
                 let io_task = remote_connection.start_proxy(
@@ -459,7 +480,12 @@ impl RemoteClient {
                     .with_timeout(INITIAL_CONNECTION_TIMEOUT, cx.background_executor())
                     .await;
                 match ready {
-                    Ok(Some(_)) => {}
+                    Ok(Some(Ok(()))) => {}
+                    Ok(Some(Err(error))) => {
+                        let error = anyhow::anyhow!(error);
+                        log::error!("failed to establish connection: {error}");
+                        return Err(error);
+                    }
                     Ok(None) => {
                         let mut error = "remote client exited before becoming ready".to_owned();
                         if let Some(status) = io_task.now_or_never() {
@@ -1261,6 +1287,9 @@ impl ConnectionPool {
                 let delegate = delegate.clone();
                 async move |cx| {
                     let connection = match opts.clone() {
+                        RemoteConnectionOptions::Local(_) => {
+                            Ok(Arc::new(LocalRemoteConnection::new()) as Arc<dyn RemoteConnection>)
+                        }
                         RemoteConnectionOptions::Ssh(opts) => {
                             SshRemoteConnection::new(opts, delegate, cx)
                                 .await
@@ -1320,6 +1349,7 @@ impl ConnectionPool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RemoteConnectionOptions {
+    Local(LocalConnectionOptions),
     Ssh(SshConnectionOptions),
     Wsl(WslConnectionOptions),
     Docker(DockerConnectionOptions),
@@ -1330,6 +1360,7 @@ pub enum RemoteConnectionOptions {
 impl RemoteConnectionOptions {
     pub fn display_name(&self) -> String {
         match self {
+            RemoteConnectionOptions::Local(_) => "Local".to_owned(),
             RemoteConnectionOptions::Ssh(opts) => opts
                 .nickname
                 .clone()
@@ -1351,6 +1382,7 @@ impl RemoteConnectionOptions {
     /// telemetry (e.g. `"ssh"`, `"wsl"`, `"docker"`, `"podman"`).
     pub fn connection_type(&self) -> &'static str {
         match self {
+            RemoteConnectionOptions::Local(_) => "local",
             RemoteConnectionOptions::Ssh(_) => "ssh",
             RemoteConnectionOptions::Wsl(_) => "wsl",
             RemoteConnectionOptions::Docker(opts) => {
@@ -1369,8 +1401,14 @@ impl RemoteConnectionOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{App, TestAppContext};
     use rpc::{ErrorCodeExt, proto::ErrorCode};
+
+    #[gpui::test]
+    fn test_host_connection_identifier_uses_current_protocol_version(cx: &mut App) {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+        assert_eq!(ConnectionIdentifier::Host.to_string(cx), "dev-superzed-72");
+    }
 
     #[test]
     fn test_ssh_display_name_prefers_nickname() {
@@ -1422,6 +1460,31 @@ mod tests {
             })
             .connection_type(),
             "podman"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_channel_client_reports_explicit_startup_error(cx: &mut TestAppContext) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, _outgoing_rx) = mpsc::unbounded::<Envelope>();
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test-client", false));
+        let ready = client.wait_for_remote_started();
+
+        incoming_tx
+            .unbounded_send(
+                proto::Error {
+                    message: "another Super Zed GUI is already attached".to_string(),
+                    code: proto::ErrorCode::Disconnected as i32,
+                    tags: Vec::new(),
+                }
+                .into_envelope(0, None, None),
+            )
+            .expect("send startup rejection");
+
+        assert_eq!(
+            ready.await,
+            Some(Err("another Super Zed GUI is already attached".to_string()))
         );
     }
 
@@ -1681,7 +1744,7 @@ pub(crate) struct ChannelClient {
     max_received: AtomicU32,
     name: &'static str,
     task: Mutex<Task<Result<()>>>,
-    remote_started: Signal<()>,
+    remote_started: Signal<Result<(), String>>,
     has_wsl_interop: bool,
     executor: BackgroundExecutor,
 }
@@ -1714,7 +1777,7 @@ impl ChannelClient {
         })
     }
 
-    fn wait_for_remote_started(&self) -> Shared<Task<Option<()>>> {
+    fn wait_for_remote_started(&self) -> Shared<Task<Option<Result<(), String>>>> {
         self.remote_started.wait()
     }
 
@@ -1762,10 +1825,17 @@ impl ChannelClient {
                 }
 
                 if let Some(proto::envelope::Payload::RemoteStarted(_)) = &incoming.payload {
-                    this.remote_started.set(());
+                    this.remote_started.set(Ok(()));
                     let mut envelope = proto::Ack {}.into_envelope(0, Some(incoming.id), None);
                     envelope.id = this.next_message_id.fetch_add(1, SeqCst);
                     this.outgoing_tx.lock().unbounded_send(envelope).ok();
+                    continue;
+                }
+
+                if incoming.responding_to.is_none()
+                    && let Some(proto::envelope::Payload::Error(error)) = &incoming.payload
+                {
+                    this.remote_started.set(Err(error.message.clone()));
                     continue;
                 }
 

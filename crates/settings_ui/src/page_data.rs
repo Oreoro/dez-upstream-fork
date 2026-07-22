@@ -251,47 +251,6 @@ fn general_page(cx: &App) -> SettingsPage {
                 metadata: None,
                 files: USER,
             }),
-            SettingsPageItem::SettingItem(SettingItem {
-                title: "CLI Default Open Behavior",
-                description: "How `zed <path>` opens directories when no flag is specified.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("cli_default_open_behavior"),
-                    pick: |settings_content| {
-                        settings_content
-                            .workspace
-                            .cli_default_open_behavior
-                            .as_ref()
-                    },
-                    write: |settings_content, value, _| {
-                        settings_content.workspace.cli_default_open_behavior = value;
-                    },
-                }),
-                metadata: Some(Box::new(SettingsFieldMetadata {
-                    should_do_titlecase: Some(false),
-                    ..Default::default()
-                })),
-                files: USER,
-            }),
-            SettingsPageItem::SettingItem(SettingItem {
-                title: "Default Open Behavior",
-                description: "How projects open from the UI by default.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("default_open_behavior"),
-                    pick: |settings_content| {
-                        settings_content.workspace.default_open_behavior.as_ref()
-                    },
-                    write: |settings_content, value, _| {
-                        settings_content.workspace.default_open_behavior = value;
-                    },
-                }),
-                metadata: Some(Box::new(SettingsFieldMetadata {
-                    should_do_titlecase: Some(false),
-                    ..Default::default()
-                })),
-                files: USER,
-            }),
         ]
     }
     fn security_section() -> [SettingsPageItem; 2] {
@@ -4767,26 +4726,9 @@ fn window_and_layout_page() -> SettingsPage {
         ]
     }
 
-    fn window_section() -> [SettingsPageItem; 3] {
+    fn window_section() -> [SettingsPageItem; 2] {
         [
             SettingsPageItem::SectionHeader("Window"),
-            // todo(settings_ui): Should we filter by platform.as_ref()?
-            SettingsPageItem::SettingItem(SettingItem {
-                title: "Use System Window Tabs",
-                description: "(macOS only) whether to allow Windows to tab together.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("use_system_window_tabs"),
-                    pick: |settings_content| {
-                        settings_content.workspace.use_system_window_tabs.as_ref()
-                    },
-                    write: |settings_content, value, _| {
-                        settings_content.workspace.use_system_window_tabs = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Window Decorations",
                 description: "(Linux only) whether Zed or your compositor should draw window decorations.",

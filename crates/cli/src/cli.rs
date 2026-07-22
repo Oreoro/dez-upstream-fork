@@ -11,19 +11,13 @@ pub struct IpcHandshake {
     pub responses: ipc::IpcReceiver<CliResponse>,
 }
 
-/// Controls how CLI paths are opened — whether to reuse existing windows,
-/// create new ones, or add to the sidebar.
+/// Controls how CLI paths are opened in the sole application shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenBehavior {
-    /// Consult the user's `cli_default_open_behavior` setting.
+    /// Use the product default.
     #[default]
     Default,
-    /// Always create a new window. No matching against existing worktrees.
-    /// Corresponds to `zed -n`.
-    AlwaysNew,
-    /// Create a new window unless opening a subpath of an existing project.
-    PreferNewWindow,
     /// Match broadly including subdirectories, and fall back to any existing
     /// window if no worktree matched. Corresponds to `zed -a`.
     Add,
@@ -31,25 +25,9 @@ pub enum OpenBehavior {
     /// Reuse existing windows for files in open worktrees.
     /// Corresponds to `zed -e`.
     ExistingWindow,
-    /// New window for directories, reuse existing window for files in open
-    /// worktrees. The classic pre-sidebar behavior.
-    /// Corresponds to `zed --classic`.
-    Classic,
     /// Replace the content of an existing window with a new workspace.
     /// Corresponds to `zed -r`.
     Reuse,
-}
-
-/// The setting-level enum for configuring default behavior. This only has
-/// two values because the other modes are always explicitly requested via
-/// CLI flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CliBehaviorSetting {
-    /// Open directories as a new workspace in the current Zed window's sidebar.
-    ExistingWindow,
-    /// Open paths in a new window unless they are subpaths of an existing project.
-    NewWindow,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,9 +47,6 @@ pub enum CliRequest {
         #[serde(default)]
         cwd: Option<PathBuf>,
     },
-    SetOpenBehavior {
-        behavior: CliBehaviorSetting,
-    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,7 +55,6 @@ pub enum CliResponse {
     Stdout { message: String },
     Stderr { message: String },
     Exit { status: i32 },
-    PromptOpenBehavior,
 }
 
 /// When Zed started not as an *.app but as a binary (e.g. local development),

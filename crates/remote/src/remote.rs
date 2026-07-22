@@ -16,6 +16,10 @@ pub use remote_identity::{
     RemoteConnectionIdentity, remote_connection_identity, same_remote_connection_identity,
 };
 pub use transport::docker::DockerConnectionOptions;
+pub use transport::local::{
+    EMBEDDED_REMOTE_SERVER_DATA_DIR_ENV, EMBEDDED_REMOTE_SERVER_ENV, LocalConnectionOptions,
+    LocalRemoteClientDelegate,
+};
 pub use transport::ssh::{SshConnectionOptions, SshPortForwardOption};
 pub use transport::wsl::WslConnectionOptions;
 #[cfg(target_os = "windows")]

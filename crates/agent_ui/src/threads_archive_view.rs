@@ -1611,7 +1611,7 @@ impl PickerDelegate for ProjectPickerDelegate {
                 .child(
                     Button::new("open_local_folder", "Choose from Local Folders")
                         .key_binding(KeyBinding::for_action_in(
-                            &workspace::Open::default(),
+                            &workspace::Open,
                             &focus_handle,
                             cx,
                         ))

@@ -375,6 +375,7 @@ pub fn read_serialized_multi_workspaces(
 
 const DEFAULT_DOCK_STATE_KEY: &str = "default_dock_state";
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn read_default_dock_state(kvp: &KeyValueStore) -> Option<DockStructure> {
     let json_str = kvp.read_kvp(DEFAULT_DOCK_STATE_KEY).log_err().flatten()?;
 
@@ -1206,6 +1207,7 @@ impl WorkspaceDb {
     }
 
     /// Returns the workspace with the given ID, loading all associated data.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn workspace_for_id(
         &self,
         workspace_id: WorkspaceId,
@@ -1668,7 +1670,11 @@ impl WorkspaceDb {
         let mut use_podman = None;
         let mut remote_env = None;
 
+        #[allow(unreachable_patterns)]
         match identity {
+            RemoteConnectionIdentity::Local => {
+                anyhow::bail!("local Super Zed host connections use local workspace persistence")
+            }
             RemoteConnectionIdentity::Ssh {
                 host: identity_host,
                 username,
@@ -1697,11 +1703,10 @@ impl WorkspaceDb {
                 name = Some(identity_name);
                 user = Some(remote_user);
             }
-            #[cfg(any(test, feature = "test-support"))]
-            RemoteConnectionIdentity::Mock { id } => {
+            other => {
                 kind = RemoteConnectionKind::Ssh;
-                host = Some(format!("mock-{}", id));
-                user = Some(format!("mock-user-{}", id));
+                host = Some(format!("{other:?}"));
+                user = None;
             }
         }
 

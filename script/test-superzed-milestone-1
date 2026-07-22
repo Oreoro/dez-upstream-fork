@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+acceptance_tmp=$(mktemp -d "/tmp/superzed-milestone-1.XXXXXX")
+trap 'rm -rf "${acceptance_tmp}"' EXIT
+
+cd "${repo_dir}"
+export TMPDIR="${acceptance_tmp}"
+export RUST_BACKTRACE=1
+
+cargo test -p superzed_session
+cargo test -p project --test integration overlapping_projects -- --nocapture
+cargo test -p project --test integration overlapping_project_scopes -- --nocapture
+cargo test -p remote_server superzed -- --nocapture
+cargo test -p sidebar test_superzed -- --nocapture
+cargo test -p recent_projects test_superzed -- --nocapture
+cargo test -p superzed test_restart_restores_persisted_superzed_workspaces_in_sidebar -- --nocapture
+cargo test -p superzed test_product_keymaps_load_after_product_action_initialization -- --nocapture
+cargo test -p superzed --test superzed_host_lifecycle -- --nocapture
+./script/check-keymaps
+
+if [[ -z ${SUPERZED_MILESTONE_1_SSH_TARGET:-} ]]; then
+  echo "SUPERZED_MILESTONE_1_SSH_TARGET must name a configured Unix SSH target" >&2
+  exit 1
+fi
+
+if [[ -z ${ZED_COPY_REMOTE_SERVER:-} ]]; then
+  read -r remote_os remote_arch < <(
+    ssh -o BatchMode=yes "${SUPERZED_MILESTONE_1_SSH_TARGET}" 'printf "%s " "$(uname -s)"; uname -m'
+  )
+  case "${remote_os}:${remote_arch}" in
+    Linux:x86_64) remote_target=x86_64-unknown-linux-musl ;;
+    Linux:aarch64 | Linux:arm64) remote_target=aarch64-unknown-linux-musl ;;
+    Darwin:x86_64) remote_target=x86_64-apple-darwin ;;
+    Darwin:arm64 | Darwin:aarch64) remote_target=aarch64-apple-darwin ;;
+    *)
+      echo "unsupported SSH target for source-built acceptance server: ${remote_os} ${remote_arch}" >&2
+      exit 1
+      ;;
+  esac
+
+  rustup target add "${remote_target}"
+  if [[ ${remote_os} == Linux ]]; then
+    RUSTFLAGS=' -C target-feature=+crt-static' cargo zigbuild \
+      --package remote_server \
+      --features debug-embed \
+      --target-dir target/remote_server \
+      --target "${remote_target}"
+  else
+    cargo build \
+      --package remote_server \
+      --features debug-embed \
+      --target-dir target/remote_server \
+      --target "${remote_target}"
+  fi
+  remote_server_binary="${repo_dir}/target/remote_server/${remote_target}/debug/remote_server"
+  gzip -kf "${remote_server_binary}"
+  export ZED_COPY_REMOTE_SERVER="${remote_server_binary}.gz"
+fi
+
+cargo test -p superzed --test superzed_real_ssh \
+  real_ssh_host_detaches_and_restores_the_same_session -- \
+  --ignored --exact --nocapture

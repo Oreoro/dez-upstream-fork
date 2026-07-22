@@ -3101,8 +3101,9 @@ mod test {
         let project_path = SanitizedPath::new_arc(&PathBuf::from(TEST_PROJECT_PATH));
         let worktree_store =
             cx.new(|_cx| WorktreeStore::local(false, fs.clone(), WorktreeIdCounter::default()));
-        let project_environment =
-            cx.new(|cx| ProjectEnvironment::new(None, worktree_store.downgrade(), None, false, cx));
+        let project_environment = cx.new(|cx| {
+            ProjectEnvironment::new(None, worktree_store.downgrade(), None, 0, false, cx)
+        });
 
         let context = DevContainerContext {
             project_directory: SanitizedPath::cast_arc(project_path),

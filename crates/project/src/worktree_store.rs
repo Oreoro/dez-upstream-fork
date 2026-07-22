@@ -15,12 +15,8 @@ use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EntityId, EventEmitter, Global, Task, TaskExt,
     WeakEntity,
 };
-use itertools::Either;
 use postage::{prelude::Stream as _, watch};
-use rpc::{
-    AnyProtoClient, ErrorExt, TypedEnvelope,
-    proto::{self, REMOTE_SERVER_PROJECT_ID},
-};
+use rpc::{AnyProtoClient, ErrorExt, TypedEnvelope, proto};
 use text::ReplicaId;
 use util::{
     ResultExt,
@@ -33,7 +29,9 @@ use worktree::{
     WorktreeId,
 };
 
-use crate::{ProjectPath, trusted_worktrees::TrustedWorktrees};
+use crate::{
+    ProjectPath, host_resource_registry::HostResourceRegistry, trusted_worktrees::TrustedWorktrees,
+};
 
 /// The current paths for a project's worktrees. Each folder path has a corresponding
 /// main worktree path at the same position. The two lists are always the
@@ -186,6 +184,8 @@ pub struct WorktreeStore {
     next_entry_id: Arc<AtomicUsize>,
     next_worktree_id: WorktreeIdCounter,
     downstream_client: Option<(AnyProtoClient, u64)>,
+    downstream_is_remote_server: bool,
+    downstream_project_updates_paused: bool,
     retain_worktrees: bool,
     worktrees: Vec<WorktreeHandle>,
     scanning_enabled: bool,
@@ -193,6 +193,8 @@ pub struct WorktreeStore {
     loading_worktrees:
         HashMap<Arc<SanitizedPath>, Shared<Task<Result<Entity<Worktree>, Arc<anyhow::Error>>>>>,
     initial_scan_complete: (watch::Sender<bool>, watch::Receiver<bool>),
+    host_resource_registry: HostResourceRegistry,
+    host_resource_worktrees: HashMap<WorktreeId, Arc<SanitizedPath>>,
     state: WorktreeStoreState,
 }
 
@@ -210,6 +212,14 @@ pub enum WorktreeStoreEvent {
 }
 
 impl EventEmitter<WorktreeStoreEvent> for WorktreeStore {}
+
+impl Drop for WorktreeStore {
+    fn drop(&mut self) {
+        for path in self.host_resource_worktrees.values() {
+            self.host_resource_registry.release_worktree(path);
+        }
+    }
+}
 
 impl WorktreeStore {
     pub fn init(client: &AnyProtoClient) {
@@ -229,15 +239,33 @@ impl WorktreeStore {
         fs: Arc<dyn Fs>,
         next_worktree_id: WorktreeIdCounter,
     ) -> Self {
+        Self::local_with_host_resources(
+            retain_worktrees,
+            fs,
+            next_worktree_id,
+            HostResourceRegistry::default(),
+        )
+    }
+
+    pub fn local_with_host_resources(
+        retain_worktrees: bool,
+        fs: Arc<dyn Fs>,
+        next_worktree_id: WorktreeIdCounter,
+        host_resource_registry: HostResourceRegistry,
+    ) -> Self {
         Self {
             next_entry_id: Default::default(),
             next_worktree_id,
             loading_worktrees: Default::default(),
             downstream_client: None,
+            downstream_is_remote_server: false,
+            downstream_project_updates_paused: false,
             worktrees: Vec::new(),
             scanning_enabled: true,
             retain_worktrees,
             initial_scan_complete: watch::channel_with(true),
+            host_resource_registry,
+            host_resource_worktrees: Default::default(),
             state: WorktreeStoreState::Local { fs },
         }
     }
@@ -254,10 +282,14 @@ impl WorktreeStore {
             next_worktree_id,
             loading_worktrees: Default::default(),
             downstream_client: None,
+            downstream_is_remote_server: false,
+            downstream_project_updates_paused: false,
             worktrees: Vec::new(),
             scanning_enabled: true,
             retain_worktrees,
             initial_scan_complete: watch::channel_with(true),
+            host_resource_registry: HostResourceRegistry::default(),
+            host_resource_worktrees: Default::default(),
             state: WorktreeStoreState::Remote {
                 upstream_client,
                 upstream_project_id,
@@ -267,28 +299,12 @@ impl WorktreeStore {
     }
 
     pub fn next_worktree_id(&self) -> impl Future<Output = Result<WorktreeId>> + use<> {
-        let strategy = match (&self.state, &self.downstream_client) {
-            // we are a remote server, the client is in charge of assigning worktree ids
-            (WorktreeStoreState::Local { .. }, Some((client, REMOTE_SERVER_PROJECT_ID))) => {
-                Either::Left(client.clone())
-            }
-            // we are just a local zed project, we can assign ids
-            (WorktreeStoreState::Local { .. }, _) => Either::Right(self.next_worktree_id.next()),
-            // we are connected to a remote server, we are in charge of assigning worktree ids
-            (WorktreeStoreState::Remote { .. }, _) => Either::Right(self.next_worktree_id.next()),
-        };
-        async move {
-            match strategy {
-                Either::Left(client) => Ok(client
-                    .request(proto::AllocateWorktreeId {
-                        project_id: REMOTE_SERVER_PROJECT_ID,
-                    })
-                    .await?
-                    .worktree_id),
-                Either::Right(id) => Ok(id),
-            }
-            .map(WorktreeId::from_proto)
-        }
+        let id = self.next_worktree_id.next();
+        async move { Ok(WorktreeId::from_proto(id)) }
+    }
+
+    pub fn host_resource_registry(&self) -> HostResourceRegistry {
+        self.host_resource_registry.clone()
     }
 
     pub fn disable_scanner(&mut self) {
@@ -704,32 +720,55 @@ impl WorktreeStore {
         let abs_path: Arc<SanitizedPath> = SanitizedPath::new_arc(&abs_path);
         let is_via_collab = matches!(&self.state, WorktreeStoreState::Remote { upstream_client, .. } if upstream_client.is_via_collab());
         if !self.loading_worktrees.contains_key(&abs_path) {
-            let task = match &self.state {
-                WorktreeStoreState::Remote {
-                    upstream_client,
-                    path_style,
-                    ..
-                } => {
-                    if upstream_client.is_via_collab() {
-                        Task::ready(Err(Arc::new(anyhow!("cannot create worktrees via collab"))))
-                    } else {
-                        let abs_path = RemotePathBuf::new(abs_path.to_string(), *path_style);
-                        self.create_remote_worktree(upstream_client.clone(), abs_path, visible, cx)
+            let local_fs = match &self.state {
+                WorktreeStoreState::Local { fs } => Some(fs.clone()),
+                WorktreeStoreState::Remote { .. } => None,
+            };
+            let task = if let Some(fs) = local_fs {
+                let host_resource_registry = self.host_resource_registry.clone();
+                host_resource_registry.acquire_worktree(abs_path.clone(), || {
+                    self.create_local_worktree(fs, abs_path.clone(), visible, cx)
+                })
+            } else {
+                match &self.state {
+                    WorktreeStoreState::Remote {
+                        upstream_client,
+                        upstream_project_id,
+                        path_style,
+                        ..
+                    } => {
+                        if upstream_client.is_via_collab() {
+                            Task::ready(Err(Arc::new(anyhow!(
+                                "cannot create worktrees via collab"
+                            ))))
+                            .shared()
+                        } else {
+                            let abs_path = RemotePathBuf::new(abs_path.to_string(), *path_style);
+                            self.create_remote_worktree(
+                                upstream_client.clone(),
+                                *upstream_project_id,
+                                abs_path,
+                                visible,
+                                cx,
+                            )
+                            .shared()
+                        }
                     }
-                }
-                WorktreeStoreState::Local { fs } => {
-                    self.create_local_worktree(fs.clone(), abs_path.clone(), visible, cx)
+                    WorktreeStoreState::Local { .. } => {
+                        return Task::ready(Err(anyhow!("invalid local worktree state")));
+                    }
                 }
             };
 
-            self.loading_worktrees
-                .insert(abs_path.clone(), task.shared());
+            self.loading_worktrees.insert(abs_path.clone(), task);
 
             if visible && self.scanning_enabled {
                 *self.initial_scan_complete.0.borrow_mut() = false;
             }
         }
-        let task = self.loading_worktrees.get(&abs_path).unwrap().clone();
+        let Some(task) = self.loading_worktrees.get(&abs_path).cloned() else {
+            return Task::ready(Err(anyhow!("worktree creation did not start")));
+        };
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -742,6 +781,17 @@ impl WorktreeStore {
 
             match result {
                 Ok(worktree) => {
+                    this.update(cx, |this, cx| {
+                        this.host_resource_worktrees
+                            .insert(worktree.read(cx).id(), abs_path.clone());
+                        if this
+                            .worktrees()
+                            .all(|existing| existing.entity_id() != worktree.entity_id())
+                        {
+                            this.add(&worktree, cx);
+                        }
+                    })?;
+
                     if !is_via_collab {
                         if let Some((trusted_worktrees, worktree_store)) = this
                             .update(cx, |_, cx| {
@@ -768,7 +818,13 @@ impl WorktreeStore {
                     }
                     Ok(worktree)
                 }
-                Err(err) => Err((*err).cloned()),
+                Err(err) => {
+                    this.update(cx, |this, _| {
+                        this.host_resource_registry.release_worktree(&abs_path);
+                    })
+                    .ok();
+                    Err((*err).cloned())
+                }
             }
         })
     }
@@ -776,6 +832,7 @@ impl WorktreeStore {
     fn create_remote_worktree(
         &mut self,
         client: AnyProtoClient,
+        project_id: u64,
         abs_path: RemotePathBuf,
         visible: bool,
         cx: &mut Context<Self>,
@@ -799,7 +856,7 @@ impl WorktreeStore {
             let path = RemotePathBuf::new(abs_path, path_style);
             let response = client
                 .request(proto::AddWorktree {
-                    project_id: REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     path: path.to_proto(),
                     visible,
                 })
@@ -819,7 +876,7 @@ impl WorktreeStore {
 
             let worktree = cx.update(|cx| {
                 Worktree::remote(
-                    REMOTE_SERVER_PROJECT_ID,
+                    project_id,
                     ReplicaId::REMOTE_SERVER,
                     proto::WorktreeMetadata {
                         id: response.worktree_id,
@@ -854,7 +911,7 @@ impl WorktreeStore {
 
         let next_worktree_id = self.next_worktree_id();
 
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |_this, cx| {
             let worktree_id = next_worktree_id.await?;
             let worktree = Worktree::local(
                 SanitizedPath::cast_arc(abs_path.clone()),
@@ -866,8 +923,6 @@ impl WorktreeStore {
                 cx,
             )
             .await?;
-
-            this.update(cx, |this, cx| this.add(&worktree, cx))?;
 
             if visible {
                 cx.update(|cx| {
@@ -892,6 +947,13 @@ impl WorktreeStore {
         self.worktrees.push(handle);
 
         cx.emit(WorktreeStoreEvent::WorktreeAdded(worktree.clone()));
+        let current_git_repositories = worktree.read(cx).current_git_repository_updates();
+        if !current_git_repositories.is_empty() {
+            cx.emit(WorktreeStoreEvent::WorktreeUpdatedGitRepositories(
+                worktree_id,
+                current_git_repositories,
+            ));
+        }
         self.send_project_updates(cx);
 
         let handle_id = worktree.entity_id();
@@ -940,6 +1002,9 @@ impl WorktreeStore {
     }
 
     pub fn remove_worktree(&mut self, id_to_remove: WorktreeId, cx: &mut Context<Self>) {
+        if let Some(path) = self.host_resource_worktrees.remove(&id_to_remove) {
+            self.host_resource_registry.release_worktree(&path);
+        }
         self.worktrees.retain(|worktree| {
             if let Some(worktree) = worktree.upgrade() {
                 if worktree.read(cx).id() == id_to_remove {
@@ -1091,6 +1156,9 @@ impl WorktreeStore {
     }
 
     pub fn send_project_updates(&mut self, cx: &mut Context<Self>) {
+        if self.downstream_project_updates_paused {
+            return;
+        }
         let Some((downstream_client, project_id)) = self.downstream_client.clone() else {
             return;
         };
@@ -1113,35 +1181,51 @@ impl WorktreeStore {
             }
 
             this.update(cx, |this, cx| {
-                let worktrees = this.worktrees().collect::<Vec<_>>();
-
-                for worktree in worktrees {
-                    worktree.update(cx, |worktree, cx| {
-                        let client = downstream_client.clone();
-                        worktree.observe_updates(project_id, cx, {
-                            move |update| {
-                                let client = client.clone();
-                                async move {
-                                    if client.is_via_collab() {
-                                        client
-                                            .request(update)
-                                            .map(|result| result.log_err().is_some())
-                                            .await
-                                    } else {
-                                        client.send(update).log_err().is_some()
-                                    }
-                                }
-                            }
-                        });
-                    });
-
-                    cx.emit(WorktreeStoreEvent::WorktreeUpdateSent(worktree.clone()))
-                }
-
+                this.observe_downstream_worktree_updates(downstream_client, project_id, cx);
                 anyhow::Ok(())
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    pub fn pause_downstream_project_updates(&mut self) {
+        self.downstream_project_updates_paused = true;
+    }
+
+    pub fn resume_downstream_worktree_updates(&mut self, cx: &mut Context<Self>) {
+        self.downstream_project_updates_paused = false;
+        let Some((downstream_client, project_id)) = self.downstream_client.clone() else {
+            return;
+        };
+        self.observe_downstream_worktree_updates(downstream_client, project_id, cx);
+    }
+
+    fn observe_downstream_worktree_updates(
+        &mut self,
+        downstream_client: AnyProtoClient,
+        project_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let worktrees = self.worktrees().collect::<Vec<_>>();
+        for worktree in worktrees {
+            worktree.update(cx, |worktree, cx| {
+                let client = downstream_client.clone();
+                worktree.observe_updates(project_id, cx, move |update| {
+                    let client = client.clone();
+                    async move {
+                        if client.is_via_collab() {
+                            client
+                                .request(update)
+                                .map(|result| result.log_err().is_some())
+                                .await
+                        } else {
+                            client.send(update).log_err().is_some()
+                        }
+                    }
+                });
+            });
+            cx.emit(WorktreeStoreEvent::WorktreeUpdateSent(worktree));
+        }
     }
 
     pub fn worktree_metadata_protos(&self, cx: &App) -> Vec<proto::WorktreeMetadata> {
@@ -1168,6 +1252,26 @@ impl WorktreeStore {
         downstream_client: AnyProtoClient,
         cx: &mut Context<Self>,
     ) {
+        self.downstream_is_remote_server = false;
+        self.share_with_downstream(remote_id, downstream_client, cx);
+    }
+
+    pub fn shared_as_remote_server(
+        &mut self,
+        remote_id: u64,
+        downstream_client: AnyProtoClient,
+        cx: &mut Context<Self>,
+    ) {
+        self.downstream_is_remote_server = true;
+        self.share_with_downstream(remote_id, downstream_client, cx);
+    }
+
+    fn share_with_downstream(
+        &mut self,
+        remote_id: u64,
+        downstream_client: AnyProtoClient,
+        cx: &mut Context<Self>,
+    ) {
         self.retain_worktrees = true;
         self.downstream_client = Some((downstream_client, remote_id));
 
@@ -1186,7 +1290,7 @@ impl WorktreeStore {
         // Otherwise we are the remote server which is currently constructing
         // worktree store before the client actually has set up its message
         // handlers.
-        if remote_id != REMOTE_SERVER_PROJECT_ID {
+        if !self.downstream_is_remote_server {
             self.send_project_updates(cx);
         }
     }
@@ -1194,6 +1298,7 @@ impl WorktreeStore {
     pub fn unshared(&mut self, cx: &mut Context<Self>) {
         self.retain_worktrees = false;
         self.downstream_client.take();
+        self.downstream_is_remote_server = false;
 
         // When not shared, only retain the visible worktrees
         for worktree_handle in self.worktrees.iter_mut() {
@@ -1234,13 +1339,13 @@ impl WorktreeStore {
             RelPath::from_proto(&envelope.payload.new_path)?,
         );
         let (scan_id, entry) = this.update(&mut cx, |this, cx| {
-            let Some((_, project_id)) = this.downstream_client else {
+            let Some((_, _project_id)) = this.downstream_client else {
                 bail!("no downstream client")
             };
             let Some(entry) = this.entry_for_id(entry_id, cx) else {
                 bail!("no such entry");
             };
-            if entry.is_private && project_id != REMOTE_SERVER_PROJECT_ID {
+            if entry.is_private && !this.downstream_is_remote_server {
                 bail!("entry is private")
             }
 
@@ -1267,13 +1372,13 @@ impl WorktreeStore {
     ) -> Result<proto::ProjectEntryResponse> {
         let entry_id = ProjectEntryId::from_proto(envelope.payload.entry_id);
         let worktree = this.update(&mut cx, |this, cx| {
-            let Some((_, project_id)) = this.downstream_client else {
+            let Some((_, _project_id)) = this.downstream_client else {
                 bail!("no downstream client")
             };
             let Some(entry) = this.entry_for_id(entry_id, cx) else {
                 bail!("no entry")
             };
-            if entry.is_private && project_id != REMOTE_SERVER_PROJECT_ID {
+            if entry.is_private && !this.downstream_is_remote_server {
                 bail!("entry is private")
             }
             this.worktree_for_entry(entry_id, cx)
@@ -1297,14 +1402,14 @@ impl WorktreeStore {
                 .worktree_for_entry(entry_id, cx)
                 .context("no such worktree")?;
 
-            let Some((_, project_id)) = this.downstream_client else {
+            let Some((_, _project_id)) = this.downstream_client else {
                 bail!("no downstream client")
             };
             let entry = worktree
                 .read(cx)
                 .entry_for_id(entry_id)
                 .ok_or_else(|| anyhow!("missing entry"))?;
-            if entry.is_private && project_id != REMOTE_SERVER_PROJECT_ID {
+            if entry.is_private && !this.downstream_is_remote_server {
                 bail!("entry is private")
             }
 

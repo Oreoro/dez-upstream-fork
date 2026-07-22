@@ -66,7 +66,7 @@ impl Project {
         spawn_task: SpawnInTerminal,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        let is_via_remote = self.remote_client.is_some();
+        let is_via_remote = self.remote_client().is_some();
 
         let path: Option<Arc<Path>> = if let Some(cwd) = &spawn_task.cwd {
             if is_via_remote {
@@ -100,7 +100,7 @@ impl Project {
             status: TaskStatus::Running,
             completion_rx,
         });
-        let remote_client = self.remote_client.clone();
+        let remote_client = self.remote_client();
         let shell = match &remote_client {
             Some(remote_client) => remote_client
                 .read(cx)
@@ -302,7 +302,7 @@ impl Project {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        let working_directory = if self.remote_client.is_some() {
+        let working_directory = if self.remote_client().is_some() {
             // Remote project: don't use remote paths, let shell use Zed's cwd
             None
         } else {
@@ -322,7 +322,7 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let path = cwd.map(|p| Arc::from(&*p));
-        let is_via_remote = !force_local && self.remote_client.is_some();
+        let is_via_remote = !force_local && self.remote_client().is_some();
 
         let mut settings_location = None;
         if let Some(path) = path.as_ref()
@@ -357,7 +357,7 @@ impl Project {
         let remote_client = if force_local {
             None
         } else {
-            self.remote_client.clone()
+            self.remote_client()
         };
         let shell = match &remote_client {
             Some(remote_client) => remote_client
@@ -527,7 +527,7 @@ impl Project {
         cx: &mut Context<Self>,
     ) -> Task<Result<smol::process::Command>> {
         let path = self.first_project_directory(cx);
-        let remote_client = self.remote_client.clone();
+        let remote_client = self.remote_client();
         let settings = self.terminal_settings(&path, cx).clone();
         let shell = remote_client
             .as_ref()

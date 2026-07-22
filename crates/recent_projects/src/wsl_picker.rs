@@ -10,7 +10,7 @@ use ui::{
 use util::ResultExt as _;
 use workspace::{ModalView, MultiWorkspace};
 
-use crate::open_remote_project;
+use crate::open_non_ssh_remote_project;
 
 #[derive(Clone, Debug)]
 pub struct WslDistroSelected {
@@ -190,18 +190,12 @@ impl picker::PickerDelegate for WslPickerDelegate {
 
 pub(crate) struct WslOpenModal {
     paths: Vec<PathBuf>,
-    create_new_window: bool,
     picker: Entity<Picker<WslPickerDelegate>>,
     _subscriptions: [Subscription; 2],
 }
 
 impl WslOpenModal {
-    pub fn new(
-        paths: Vec<PathBuf>,
-        create_new_window: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let delegate = WslPickerDelegate::new();
         let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx).embedded());
 
@@ -223,7 +217,6 @@ impl WslOpenModal {
 
         WslOpenModal {
             paths,
-            create_new_window,
             picker,
             _subscriptions: [selected, dismissed],
         }
@@ -232,7 +225,7 @@ impl WslOpenModal {
     fn confirm(
         &mut self,
         distro: &str,
-        secondary: bool,
+        _secondary: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -243,26 +236,17 @@ impl WslOpenModal {
             user: None,
         });
 
-        let replace_current_window = match self.create_new_window {
-            true => secondary,
-            false => !secondary,
-        };
-        let open_mode = if replace_current_window {
-            workspace::OpenMode::Activate
-        } else {
-            workspace::OpenMode::NewWindow
-        };
-
         let paths = self.paths.clone();
         let open_options = workspace::OpenOptions {
             requesting_window: window.window_handle().downcast::<MultiWorkspace>(),
-            open_mode,
+            open_mode: workspace::OpenMode::Activate,
             ..Default::default()
         };
 
         cx.emit(DismissEvent);
         cx.spawn_in(window, async move |_, cx| {
-            open_remote_project(connection_options, paths, app_state, open_options, cx).await
+            open_non_ssh_remote_project(connection_options, paths, app_state, open_options, cx)
+                .await
         })
         .detach();
     }

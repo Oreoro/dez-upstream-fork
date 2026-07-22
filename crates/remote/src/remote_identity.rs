@@ -8,6 +8,7 @@ use crate::RemoteConnectionOptions;
 /// nicknames or Docker environment overrides do not affect matching.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RemoteConnectionIdentity {
+    Local,
     Ssh {
         host: String,
         username: Option<String>,
@@ -23,7 +24,9 @@ pub enum RemoteConnectionIdentity {
         remote_user: String,
     },
     #[cfg(any(test, feature = "test-support"))]
-    Mock { id: u64 },
+    Mock {
+        id: u64,
+    },
 }
 
 impl RemoteConnectionIdentity {
@@ -31,6 +34,7 @@ impl RemoteConnectionIdentity {
     /// persistence keys (e.g. database keys scoped to a remote host).
     pub fn persistence_key(&self) -> String {
         match self {
+            Self::Local => "local".to_owned(),
             Self::Ssh {
                 host,
                 username,
@@ -60,6 +64,7 @@ impl RemoteConnectionIdentity {
 impl From<&RemoteConnectionOptions> for RemoteConnectionIdentity {
     fn from(options: &RemoteConnectionOptions) -> Self {
         match options {
+            RemoteConnectionOptions::Local(_) => Self::Local,
             RemoteConnectionOptions::Ssh(options) => Self::Ssh {
                 host: options.host.to_string(),
                 username: options.username.clone(),

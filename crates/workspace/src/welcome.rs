@@ -1,6 +1,6 @@
 use crate::{
     NewFile, Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation,
-    ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
+    ToggleWorkspaceSidebar, Workspace,
     item::{Item, ItemEvent},
     persistence::WorkspaceDb,
 };
@@ -15,7 +15,7 @@ use menu::{SelectNext, SelectPrevious};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{DefaultOpenBehavior, Settings};
+use settings::Settings;
 use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
 use util::ResultExt;
 use zed_actions::{
@@ -173,7 +173,7 @@ const CONTENT: (Section<4>, Section<3>) = (
             SectionEntry {
                 icon: IconName::FolderOpen,
                 title: "Open Project",
-                action: &Open::DEFAULT,
+                action: &Open,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
@@ -307,10 +307,7 @@ impl WelcomePage {
 
                 if is_local {
                     let paths = workspace.paths.paths().to_vec();
-                    let open_mode = match WorkspaceSettings::get_global(cx).default_open_behavior {
-                        DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
-                        DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
-                    };
+                    let open_mode = OpenMode::Activate;
                     self.workspace
                         .update(cx, |workspace, cx| {
                             workspace
@@ -320,7 +317,7 @@ impl WelcomePage {
                         .log_err();
                 } else {
                     use zed_actions::OpenRecent;
-                    window.dispatch_action(OpenRecent::default().boxed_clone(), cx);
+                    window.dispatch_action(OpenRecent.boxed_clone(), cx);
                 }
             }
         }

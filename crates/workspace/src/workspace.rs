@@ -1,6 +1,7 @@
 pub mod active_file_name;
 pub mod dock;
 pub mod history_manager;
+mod host_session;
 pub mod invalid_item_view;
 pub mod item;
 mod modal_layer;
@@ -30,11 +31,12 @@ pub mod workspace_error;
 mod workspace_settings;
 
 pub use dock::Panel;
+pub use host_session::{HostId, HostSessionClient, HostWorkspaceIdentity};
 pub use multi_workspace::{
-    CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectToNewWindow,
-    MultiWorkspace, MultiWorkspaceEvent, NewThread, NextProject, NextThread, PreviousProject,
-    PreviousThread, ProjectGroup, ProjectGroupKey, SerializedProjectGroupState, Sidebar,
-    SidebarEvent, SidebarHandle, SidebarRenderState, SidebarSide, ToggleWorkspaceSidebar,
+    CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MultiWorkspace,
+    MultiWorkspaceEvent, NewThread, NextProject, NextThread, PreviousProject, PreviousThread,
+    ProjectGroup, ProjectGroupKey, SerializedProjectGroupState, Sidebar, SidebarEvent,
+    SidebarHandle, SidebarRenderState, SidebarSide, ToggleWorkspaceSidebar,
     sidebar_side_context_menu,
 };
 pub use path_list::{PathList, SerializedPathList};
@@ -98,21 +100,21 @@ use postage::stream::Stream;
 use project::{
     DirectoryLister, Project, ProjectEntryId, ProjectPath, ResolvedPath, Worktree, WorktreeId,
     WorktreeSettings,
+    context_server_store::HostContextServerRegistry,
     debugger::{breakpoint_store::BreakpointStoreEvent, session::ThreadStatus},
     project_settings::ProjectSettings,
     toolchain_store::ToolchainStoreEvent,
     trusted_worktrees::{RemoteHostLocation, TrustedWorktrees, TrustedWorktreesEvent},
 };
 use remote::{
-    RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions,
+    RemoteClient, RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions,
     remote_client::ConnectionIdentifier,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use session::AppSession;
 use settings::{
-    CenteredPaddingSettings, DefaultOpenBehavior, Settings, SettingsLocation, SettingsStore,
-    update_settings_file,
+    CenteredPaddingSettings, Settings, SettingsLocation, SettingsStore, update_settings_file,
 };
 
 use sqlez::{
@@ -159,7 +161,9 @@ pub use workspace_settings::{
     RestoreOnStartupBehavior, StatusBarSettings, TabBarSettings, WorkspaceSettings,
     observe_accessible_mode,
 };
-use zed_actions::{Spawn, feedback::FileBugReport, theme::ToggleMode};
+#[cfg(any(test, feature = "test-support"))]
+use zed_actions::feedback::FileBugReport;
+use zed_actions::{Spawn, theme::ToggleMode};
 
 use crate::{dock::PanelSizeState, item::ItemBufferKind, notifications::NotificationId};
 use crate::{
@@ -223,27 +227,9 @@ pub trait DebuggerProvider {
 }
 
 /// Opens a file or directory.
-#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[derive(Clone, Default, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = workspace)]
-pub struct Open {
-    /// When true, opens in a new window. When false, adds to the current
-    /// window as a new workspace (multi-workspace). When omitted, uses
-    /// `default_open_behavior`.
-    #[serde(default)]
-    pub create_new_window: Option<bool>,
-}
-
-impl Open {
-    pub const DEFAULT: Self = Self {
-        create_new_window: None,
-    };
-}
-
-impl Default for Open {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
+pub struct Open;
 
 actions!(
     workspace,
@@ -261,10 +247,6 @@ actions!(
         /// Moves focus to the previous major region of the window. See
         /// [`FocusNextPart`].
         FocusPreviousPart,
-        /// Switches to the next window.
-        ActivateNextWindow,
-        /// Switches to the previous window.
-        ActivatePreviousWindow,
         /// Adds a folder to the current project.
         AddFolderToProject,
         /// Clears all bookmarks in the project.
@@ -297,8 +279,6 @@ actions!(
         NewFileSplitHorizontal,
         /// Opens a new search.
         NewSearch,
-        /// Opens a new window.
-        NewWindow,
         /// Opens multiple files.
         OpenFiles,
         /// Opens the current location in terminal.
@@ -674,12 +654,7 @@ impl From<WorkspaceId> for i64 {
     }
 }
 
-fn prompt_and_open_paths(
-    app_state: Arc<AppState>,
-    options: PathPromptOptions,
-    create_new_window: bool,
-    cx: &mut App,
-) {
+fn prompt_and_open_paths(app_state: Arc<AppState>, options: PathPromptOptions, cx: &mut App) {
     if let Some(workspace_window) =
         workspace_windows_for_location(&SerializedWorkspaceLocation::Local, cx)
             .into_iter()
@@ -689,14 +664,7 @@ fn prompt_and_open_paths(
             .update(cx, |multi_workspace, window, cx| {
                 let workspace = multi_workspace.workspace().clone();
                 workspace.update(cx, |workspace, cx| {
-                    prompt_for_open_path_and_open(
-                        workspace,
-                        app_state,
-                        options,
-                        create_new_window,
-                        window,
-                        cx,
-                    );
+                    prompt_for_open_path_and_open(workspace, app_state, options, window, cx);
                 });
             })
             .ok();
@@ -716,14 +684,7 @@ fn prompt_and_open_paths(
                 window.activate_window();
                 let workspace = multi_workspace.workspace().clone();
                 workspace.update(cx, |workspace, cx| {
-                    prompt_for_open_path_and_open(
-                        workspace,
-                        app_state,
-                        options,
-                        create_new_window,
-                        window,
-                        cx,
-                    );
+                    prompt_for_open_path_and_open(workspace, app_state, options, window, cx);
                 });
             })?;
             anyhow::Ok(())
@@ -736,10 +697,10 @@ pub fn prompt_for_open_path_and_open(
     workspace: &mut Workspace,
     app_state: Arc<AppState>,
     options: PathPromptOptions,
-    create_new_window: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let target = workspace.host_workspace_identity().cloned();
     let paths = workspace.prompt_for_open_path(
         options,
         DirectoryLister::Local(workspace.project().clone(), app_state.fs.clone()),
@@ -747,33 +708,47 @@ pub fn prompt_for_open_path_and_open(
         cx,
     );
     let multi_workspace_handle = window.window_handle().downcast::<MultiWorkspace>();
-    cx.spawn_in(window, async move |this, cx| {
-        let Some(paths) = paths.await.log_err().flatten() else {
-            return;
+    cx.spawn_in(window, async move |_this, cx| {
+        let Some(paths) = paths.await? else {
+            return anyhow::Ok(());
         };
-        if !create_new_window {
-            if let Some(handle) = multi_workspace_handle {
-                if let Some(task) = handle
-                    .update(cx, |multi_workspace, window, cx| {
-                        multi_workspace.open_project(paths, OpenMode::Activate, window, cx)
+        let is_host_session = multi_workspace_handle
+            .and_then(|handle| {
+                handle
+                    .read_with(cx, |multi_workspace, _| {
+                        multi_workspace.host_session().is_some()
                     })
-                    .log_err()
-                {
-                    task.await.log_err();
-                }
-                return;
-            }
-        }
-        if let Some(task) = this
-            .update_in(cx, |this, window, cx| {
-                this.open_workspace_for_paths(OpenMode::NewWindow, paths, window, cx)
+                    .ok()
             })
-            .log_err()
-        {
-            task.await.log_err();
+            .unwrap_or(false);
+        if is_host_session {
+            let target = target.context("requesting workspace has no host identity")?;
+            let open = cx.update(|_, cx| {
+                open_superzed_paths(
+                    target,
+                    &paths,
+                    &paths,
+                    OpenOptions {
+                        requesting_window: multi_workspace_handle,
+                        open_mode: OpenMode::Activate,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })?;
+            open.await?;
+            return anyhow::Ok(());
         }
+        if let Some(handle) = multi_workspace_handle {
+            let task = handle.update(cx, |multi_workspace, window, cx| {
+                multi_workspace.open_project(paths, OpenMode::Activate, window, cx)
+            })?;
+            task.await?;
+            return anyhow::Ok(());
+        }
+        anyhow::bail!("opening a project requires the authoritative Super Zed host shell")
     })
-    .detach();
+    .detach_and_prompt_err("Failed to open project", window, cx, |_, _, _| None);
 }
 
 pub fn init(app_state: Arc<AppState>, cx: &mut App) {
@@ -784,7 +759,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
 
     cx.on_action(|_: &CloseWindow, cx| Workspace::close_global(cx))
         .on_action(|_: &Reload, cx| reload(cx))
-        .on_action(|action: &Open, cx: &mut App| {
+        .on_action(|_: &Open, cx: &mut App| {
             let app_state = AppState::global(cx);
             prompt_and_open_paths(
                 app_state,
@@ -794,12 +769,6 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
                     multiple: true,
                     prompt: None,
                 },
-                action.create_new_window.unwrap_or_else(|| {
-                    matches!(
-                        WorkspaceSettings::get_global(cx).default_open_behavior,
-                        DefaultOpenBehavior::NewWindow
-                    )
-                }),
                 cx,
             );
         })
@@ -814,7 +783,6 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
                     multiple: true,
                     prompt: None,
                 },
-                true,
                 cx,
             );
         });
@@ -1424,6 +1392,9 @@ pub struct Workspace {
     _panels_task: Option<Task<Result<()>>>,
     sidebar_focus_handle: Option<FocusHandle>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    identity: WorkspaceIdentity,
+    superzed_pane_ids: RefCell<HashMap<EntityId, superzed_session::PaneId>>,
+    superzed_item_ids: RefCell<HashMap<EntityId, superzed_session::SessionItemId>>,
     /// Shared with the parent `MultiWorkspace` and any sibling workspaces: holds
     /// the id of the single workspace currently presented in this OS window.
     /// `MultiWorkspace` is the only writer; workspaces only read it to decide
@@ -1433,6 +1404,12 @@ pub struct Workspace {
     active_workspace_id: Option<Rc<Cell<EntityId>>>,
     active_worktree_creation: ActiveWorktreeCreation,
     deferred_save_items: Vec<Box<dyn WeakItemHandle>>,
+}
+
+#[derive(Clone)]
+enum WorkspaceIdentity {
+    Standard,
+    Host(HostWorkspaceIdentity),
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -1470,8 +1447,6 @@ struct FollowerView {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpenMode {
-    /// Open the workspace in a new window.
-    NewWindow,
     /// Add to the window's multi workspace without activating it (used during deserialization).
     Add,
     /// Add to the window's multi workspace and activate it.
@@ -1480,6 +1455,19 @@ pub enum OpenMode {
 }
 
 impl Workspace {
+    pub fn new_for_host(
+        workspace_id: Option<WorkspaceId>,
+        project: Entity<Project>,
+        app_state: Arc<AppState>,
+        identity: HostWorkspaceIdentity,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut workspace = Self::new(workspace_id, project, app_state, window, cx);
+        workspace.identity = WorkspaceIdentity::Host(identity);
+        workspace
+    }
+
     pub fn new(
         workspace_id: Option<WorkspaceId>,
         project: Entity<Project>,
@@ -1877,6 +1865,9 @@ impl Workspace {
             removing: false,
             sidebar_focus_handle: None,
             multi_workspace,
+            identity: WorkspaceIdentity::Standard,
+            superzed_pane_ids: Default::default(),
+            superzed_item_ids: Default::default(),
             active_workspace_id: None,
             active_worktree_creation: ActiveWorktreeCreation::default(),
             open_in_dev_container: false,
@@ -1885,6 +1876,22 @@ impl Workspace {
         }
     }
 
+    #[cfg(not(any(test, feature = "test-support")))]
+    pub fn new_local(
+        _abs_paths: Vec<PathBuf>,
+        _app_state: Arc<AppState>,
+        _requesting_window: Option<WindowHandle<MultiWorkspace>>,
+        _env: Option<HashMap<String, String>>,
+        _init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        _open_mode: OpenMode,
+        _cx: &mut App,
+    ) -> Task<anyhow::Result<OpenResult>> {
+        Task::ready(Err(anyhow!(
+            "legacy local workspace creation is not supported by Super Zed"
+        )))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_local(
         abs_paths: Vec<PathBuf>,
         app_state: Arc<AppState>,
@@ -1984,10 +1991,7 @@ impl Workspace {
                 });
             }
 
-            let window_to_replace = match open_mode {
-                OpenMode::NewWindow => None,
-                _ => requesting_window,
-            };
+            let window_to_replace = requesting_window;
 
             let (window, workspace): (WindowHandle<MultiWorkspace>, Entity<Workspace>) =
                 if let Some(window) = window_to_replace {
@@ -2022,9 +2026,6 @@ impl Workspace {
                             OpenMode::Add => {
                                 multi_workspace.add(workspace.clone(), &*window, cx);
                             }
-                            OpenMode::NewWindow => {
-                                unreachable!()
-                            }
                         }
                         workspace
                     })?;
@@ -2050,7 +2051,7 @@ impl Workspace {
                         (None, None)
                     };
 
-                    // Use the serialized workspace to construct the new window
+                    // Construct the initial test shell from the serialized workspace.
                     let mut options = cx.update(|cx| (app_state.build_window_options)(display, cx));
                     options.window_bounds = window_bounds;
                     let centered_layout = serialized_workspace
@@ -2141,7 +2142,7 @@ impl Workspace {
                 })
                 .log_err();
 
-            if open_mode == OpenMode::NewWindow || open_mode == OpenMode::Activate {
+            if open_mode == OpenMode::Activate {
                 window
                     .update(cx, |_, window, _cx| {
                         window.activate_window();
@@ -2616,6 +2617,13 @@ impl Workspace {
         });
         self.multi_workspace = Some(multi_workspace);
         self.active_workspace_id = Some(active_workspace_id);
+    }
+
+    pub fn host_workspace_identity(&self) -> Option<&HostWorkspaceIdentity> {
+        match &self.identity {
+            WorkspaceIdentity::Standard => None,
+            WorkspaceIdentity::Host(identity) => Some(identity),
+        }
     }
 
     pub fn app_state(&self) -> &Arc<AppState> {
@@ -3632,11 +3640,7 @@ impl Workspace {
                         OpenOptions {
                             requesting_window,
                             open_mode,
-                            workspace_matching: if open_mode == OpenMode::NewWindow {
-                                WorkspaceMatching::None
-                            } else {
-                                WorkspaceMatching::default()
-                            },
+                            workspace_matching: WorkspaceMatching::default(),
                             ..Default::default()
                         },
                         cx,
@@ -3886,28 +3890,97 @@ impl Workspace {
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
-            if let Some(paths) = paths.await.log_err().flatten() {
-                let results = this
-                    .update_in(cx, |this, window, cx| {
-                        this.open_paths(
-                            paths,
-                            OpenOptions {
-                                visible: Some(OpenVisible::All),
-                                ..Default::default()
-                            },
-                            None,
-                            window,
-                            cx,
-                        )
-                    })?
-                    .await;
-                for result in results.into_iter().flatten() {
-                    result.log_err();
-                }
+            if let Some(paths) = paths.await? {
+                this.update_in(cx, |this, window, cx| {
+                    this.add_project_roots(paths, window, cx)
+                })?
+                .await?;
             }
             anyhow::Ok(())
         })
-        .detach_and_log_err(cx);
+        .detach_and_prompt_err(
+            "Failed to add folder to project",
+            window,
+            cx,
+            |_, _, _| None,
+        );
+    }
+
+    pub fn add_project_roots(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if let Some(identity) = self.host_workspace_identity().cloned() {
+            let Some(multi_workspace) = self.multi_workspace.as_ref().and_then(WeakEntity::upgrade)
+            else {
+                return Task::ready(Err(anyhow!("host workspace has no shell owner")));
+            };
+            let Some(host_session) = multi_workspace.read(cx).host_session().cloned() else {
+                return Task::ready(Err(anyhow!("host workspace has no session client")));
+            };
+            let Some(window) = window.window_handle().downcast::<MultiWorkspace>() else {
+                return Task::ready(Err(anyhow!("host workspace has no shell window")));
+            };
+            return HostSessionClient::add_project_roots(
+                &host_session,
+                window,
+                identity.workspace_id,
+                paths,
+                cx,
+            );
+        }
+
+        let open = self.open_paths(
+            paths,
+            OpenOptions {
+                visible: Some(OpenVisible::All),
+                ..Default::default()
+            },
+            None,
+            window,
+            cx,
+        );
+        cx.spawn(async move |_, _| {
+            for result in open.await.into_iter().flatten() {
+                result?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn remove_project_root(
+        &mut self,
+        path: PathBuf,
+        worktree_id: WorktreeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if let Some(identity) = self.host_workspace_identity().cloned() {
+            let Some(multi_workspace) = self.multi_workspace.as_ref().and_then(WeakEntity::upgrade)
+            else {
+                return Task::ready(Err(anyhow!("host workspace has no shell owner")));
+            };
+            let Some(host_session) = multi_workspace.read(cx).host_session().cloned() else {
+                return Task::ready(Err(anyhow!("host workspace has no session client")));
+            };
+            let Some(window) = window.window_handle().downcast::<MultiWorkspace>() else {
+                return Task::ready(Err(anyhow!("host workspace has no shell window")));
+            };
+            return HostSessionClient::remove_project_root(
+                &host_session,
+                window,
+                identity.workspace_id,
+                path,
+                cx,
+            );
+        }
+
+        self.project.update(cx, |project, cx| {
+            project.remove_worktree(worktree_id, cx);
+        });
+        Task::ready(Ok(()))
     }
 
     pub fn project_path_for_path(
@@ -5728,6 +5801,137 @@ impl Workspace {
         new_pane
     }
 
+    pub fn restore_superzed_layout(
+        &mut self,
+        layout: superzed_session::LayoutNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        fn build_member(
+            node: superzed_session::LayoutNode,
+            workspace: &mut Workspace,
+            first_pane: &mut Option<Entity<Pane>>,
+            panes: &mut Vec<(Entity<Pane>, superzed_session::PaneSnapshot)>,
+            window: &mut Window,
+            cx: &mut Context<Workspace>,
+        ) -> Member {
+            match node {
+                superzed_session::LayoutNode::Pane(snapshot) => {
+                    let pane = first_pane
+                        .take()
+                        .unwrap_or_else(|| workspace.add_pane(window, cx));
+                    workspace
+                        .superzed_pane_ids
+                        .get_mut()
+                        .insert(pane.entity_id(), snapshot.id);
+                    panes.push((pane.clone(), snapshot));
+                    Member::Pane(pane)
+                }
+                superzed_session::LayoutNode::Axis {
+                    axis,
+                    flexes,
+                    children,
+                } => {
+                    let members = children
+                        .into_iter()
+                        .map(|child| build_member(child, workspace, first_pane, panes, window, cx))
+                        .collect::<Vec<_>>();
+                    let flex_sum = flexes.iter().sum::<f32>();
+                    let normalized_flexes = if flex_sum > 0.0 {
+                        let scale = members.len() as f32 / flex_sum;
+                        Some(flexes.into_iter().map(|flex| flex * scale).collect())
+                    } else {
+                        None
+                    };
+                    Member::Axis(PaneAxis::load(
+                        match axis {
+                            superzed_session::LayoutAxis::Horizontal => Axis::Horizontal,
+                            superzed_session::LayoutAxis::Vertical => Axis::Vertical,
+                        },
+                        members,
+                        normalized_flexes,
+                    ))
+                }
+            }
+        }
+
+        let mut first_pane = Some(self.active_pane.clone());
+        let mut panes = Vec::new();
+        let root = build_member(layout, self, &mut first_pane, &mut panes, window, cx);
+        self.center = PaneGroup::with_root(root);
+        self.center.set_is_center(true);
+        self.center.mark_positions(cx);
+        if let Some((focused_pane, _)) = panes.iter().find(|(_, snapshot)| snapshot.focused) {
+            self.set_active_pane(focused_pane, window, cx);
+        } else {
+            self.set_active_pane(&self.center.first_pane(), window, cx);
+        }
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            for (pane, snapshot) in panes {
+                let active_item_index = snapshot.active_item_id.and_then(|active_item_id| {
+                    snapshot
+                        .items
+                        .iter()
+                        .position(|item| item.id == active_item_id)
+                });
+                let pinned_count = snapshot.items.iter().take_while(|item| item.pinned).count();
+                let preview_item_index = snapshot.items.iter().position(|item| item.preview);
+                let item_ids = snapshot
+                    .items
+                    .iter()
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>();
+                let paths = snapshot
+                    .items
+                    .into_iter()
+                    .map(|item| item.absolute_path)
+                    .collect::<Vec<_>>();
+                let opened_items = this
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.open_paths(
+                            paths,
+                            OpenOptions {
+                                visible: Some(OpenVisible::None),
+                                focus: Some(false),
+                                ..Default::default()
+                            },
+                            Some(pane.downgrade()),
+                            window,
+                            cx,
+                        )
+                    })?
+                    .await;
+                this.update(cx, |workspace, _| {
+                    for (opened_item, session_item_id) in opened_items.into_iter().zip(item_ids) {
+                        if let Some(Ok(item)) = opened_item {
+                            workspace
+                                .superzed_item_ids
+                                .get_mut()
+                                .insert(item.item_id(), session_item_id);
+                        }
+                    }
+                })?;
+                pane.update_in(cx, |pane, window, cx| {
+                    pane.set_pinned_count(pinned_count.min(pane.items_len()));
+                    let preview_item_id = preview_item_index.and_then(|preview_item_index| {
+                        pane.items()
+                            .nth(preview_item_index)
+                            .map(|item| item.item_id())
+                    });
+                    if preview_item_id.is_some() {
+                        pane.set_preview_item_id(preview_item_id, cx);
+                    }
+                    if let Some(active_item_index) = active_item_index {
+                        pane.activate_item(active_item_index, false, false, window, cx);
+                    }
+                })?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn split_and_move(
         &mut self,
         pane: Entity<Pane>,
@@ -5837,6 +6041,11 @@ impl Workspace {
 
     pub fn panes(&self) -> &[Entity<Pane>] {
         &self.panes
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn center_pane_group_for_test(&self) -> &PaneGroup {
+        &self.center
     }
 
     pub fn active_pane(&self) -> &Entity<Pane> {
@@ -6955,9 +7164,9 @@ impl Workspace {
 
         let bounds_task = self.save_window_bounds(window, cx);
         let serialize_task = self.serialize_workspace_internal(window, cx);
+        let superzed_task = self.serialize_superzed_layout(window, cx);
         cx.spawn(async move |_| {
-            bounds_task.await;
-            serialize_task.await;
+            futures::future::join3(bounds_task, serialize_task, superzed_task).await;
         })
     }
 
@@ -7022,13 +7231,108 @@ impl Workspace {
                         .timer(SERIALIZATION_THROTTLE_TIME)
                         .await;
                     this.update_in(cx, |this, window, cx| {
-                        this._serialize_workspace_task =
-                            Some(this.serialize_workspace_internal(window, cx));
+                        let database_task = this.serialize_workspace_internal(window, cx);
+                        let superzed_task = this.serialize_superzed_layout(window, cx);
+                        this._serialize_workspace_task = Some(cx.spawn(async move |_, _| {
+                            futures::future::join(database_task, superzed_task).await;
+                        }));
                         this._schedule_serialize_workspace.take();
                     })
                     .log_err();
                 }));
         }
+    }
+
+    fn serialize_superzed_layout(&self, window: &mut Window, cx: &mut App) -> Task<()> {
+        fn serialize_member(
+            member: &Member,
+            workspace: &Workspace,
+            project: &Project,
+            window: &mut Window,
+            cx: &App,
+        ) -> superzed_session::LayoutNode {
+            match member {
+                Member::Axis(axis) => superzed_session::LayoutNode::Axis {
+                    axis: match axis.axis {
+                        Axis::Horizontal => superzed_session::LayoutAxis::Horizontal,
+                        Axis::Vertical => superzed_session::LayoutAxis::Vertical,
+                    },
+                    flexes: axis.flexes.lock().clone(),
+                    children: axis
+                        .members
+                        .iter()
+                        .map(|member| serialize_member(member, workspace, project, window, cx))
+                        .collect(),
+                },
+                Member::Pane(pane) => {
+                    let pane_entity_id = pane.entity_id();
+                    let pane = pane.read(cx);
+                    let pane_id = *workspace
+                        .superzed_pane_ids
+                        .borrow_mut()
+                        .entry(pane_entity_id)
+                        .or_insert_with(superzed_session::PaneId::new);
+                    let active_item_id = pane.active_item().map(|item| item.item_id());
+                    let mut serialized_active_item_id = None;
+                    let items = pane
+                        .items()
+                        .enumerate()
+                        .filter_map(|(index, item)| {
+                            let project_path = item.project_path(cx)?;
+                            let absolute_path = project.absolute_path(&project_path, cx)?;
+                            let id = *workspace
+                                .superzed_item_ids
+                                .borrow_mut()
+                                .entry(item.item_id())
+                                .or_insert_with(superzed_session::SessionItemId::new);
+                            if Some(item.item_id()) == active_item_id {
+                                serialized_active_item_id = Some(id);
+                            }
+                            Some(superzed_session::FileEditorItem {
+                                id,
+                                absolute_path,
+                                pinned: index < pane.pinned_count(),
+                                preview: pane.is_active_preview_item(item.item_id()),
+                            })
+                        })
+                        .collect();
+                    superzed_session::LayoutNode::Pane(superzed_session::PaneSnapshot {
+                        id: pane_id,
+                        items,
+                        active_item_id: serialized_active_item_id,
+                        focused: pane.has_focus(window, cx),
+                    })
+                }
+            }
+        }
+
+        let Some(identity) = self.host_workspace_identity().cloned() else {
+            return Task::ready(());
+        };
+        let Some(multi_workspace) = self.multi_workspace.as_ref().and_then(WeakEntity::upgrade)
+        else {
+            return Task::ready(());
+        };
+        let Some(host_session) = multi_workspace.read(cx).host_session().cloned() else {
+            return Task::ready(());
+        };
+        let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
+            return Task::ready(());
+        };
+        let layout = serialize_member(&self.center.root, self, self.project.read(cx), window, cx);
+        let task = HostSessionClient::replace_layout(
+            &host_session,
+            window_handle,
+            identity.workspace_id,
+            layout,
+            cx,
+        )
+        .prompt_err("Failed to save workspace layout", window, cx, |_, _, _| {
+            None
+        });
+        cx.spawn(async move |_| {
+            task.await;
+        })
     }
 
     fn serialize_workspace_internal(&self, window: &mut Window, cx: &mut App) -> Task<()> {
@@ -7187,7 +7491,11 @@ impl Workspace {
     fn workspace_location(&self, cx: &App) -> WorkspaceLocation {
         let paths = PathList::new(&self.root_paths(cx));
         if let Some(connection) = self.project.read(cx).remote_connection_options(cx) {
-            WorkspaceLocation::Location(SerializedWorkspaceLocation::Remote(connection), paths)
+            if matches!(connection, RemoteConnectionOptions::Local(_)) {
+                WorkspaceLocation::Location(SerializedWorkspaceLocation::Local, paths)
+            } else {
+                WorkspaceLocation::Location(SerializedWorkspaceLocation::Remote(connection), paths)
+            }
         } else if self.project.read(cx).is_local() {
             if !paths.is_empty() || self.has_any_items_open(cx) {
                 WorkspaceLocation::Location(SerializedWorkspaceLocation::Local, paths)
@@ -7515,16 +7823,6 @@ impl Workspace {
             .on_action(cx.listener(|workspace, _: &FocusPreviousPart, window, cx| {
                 workspace.move_part_focus(false, window, cx);
             }))
-            .on_action(
-                cx.listener(|workspace, _: &ActivateNextWindow, _window, cx| {
-                    workspace.activate_next_window(cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|workspace, _: &ActivatePreviousWindow, _window, cx| {
-                    workspace.activate_previous_window(cx)
-                }),
-            )
             .on_action(cx.listener(|workspace, _: &ActivatePaneLeft, window, cx| {
                 workspace.activate_pane_in_direction(SplitDirection::Left, window, cx)
             }))
@@ -8821,6 +9119,7 @@ impl RegionFocusHandles {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn notify_if_database_failed(window: WindowHandle<MultiWorkspace>, cx: &mut AsyncApp) {
     window
         .update(cx, |multi_workspace, _, cx| {
@@ -9932,39 +10231,11 @@ pub fn join_channel(
         }
 
         // find an existing workspace to focus and show call controls
-        let mut active_window = requesting_window.or_else(|| activate_any_workspace_window(cx));
+        let active_window = requesting_window.or_else(|| activate_any_workspace_window(cx));
         if active_window.is_none() {
-            // no open workspaces, make one to show the error in (blergh)
-            let OpenResult {
-                window: window_handle,
-                ..
-            } = cx
-                .update(|cx| {
-                    Workspace::new_local(
-                        vec![],
-                        app_state.clone(),
-                        requesting_window,
-                        None,
-                        None,
-                        OpenMode::Activate,
-                        cx,
-                    )
-                })
-                .await?;
-
-            window_handle
-                .update(cx, |_, window, _cx| {
-                    window.activate_window();
-                })
-                .ok();
-
-            if result.is_ok() {
-                cx.update(|cx| {
-                    cx.dispatch_action(&OpenChannelNotes);
-                });
-            }
-
-            active_window = Some(window_handle);
+            return Err(anyhow::anyhow!(
+                "mandatory Super Zed host window is unavailable"
+            ));
         }
 
         if let Err(err) = result {
@@ -10013,26 +10284,10 @@ pub fn join_channel(
 }
 
 pub async fn get_any_active_multi_workspace(
-    app_state: Arc<AppState>,
+    _app_state: Arc<AppState>,
     mut cx: AsyncApp,
 ) -> anyhow::Result<WindowHandle<MultiWorkspace>> {
-    // find an existing workspace to focus and show call controls
-    let active_window = activate_any_workspace_window(&mut cx);
-    if active_window.is_none() {
-        cx.update(|cx| {
-            Workspace::new_local(
-                vec![],
-                app_state.clone(),
-                None,
-                None,
-                None,
-                OpenMode::Activate,
-                cx,
-            )
-        })
-        .await?;
-    }
-    activate_any_workspace_window(&mut cx).context("could not open zed")
+    activate_any_workspace_window(&mut cx).context("mandatory Super Zed host window is unavailable")
 }
 
 pub fn activate_any_workspace_window(cx: &mut AsyncApp) -> Option<WindowHandle<MultiWorkspace>> {
@@ -10065,6 +10320,7 @@ pub fn workspace_windows_for_location(
         .filter_map(|window| window.downcast::<MultiWorkspace>())
         .filter(|multi_workspace| {
             let same_host = |left: &RemoteConnectionOptions, right: &RemoteConnectionOptions| match (left, right) {
+                (RemoteConnectionOptions::Local(_), RemoteConnectionOptions::Local(_)) => true,
                 (RemoteConnectionOptions::Ssh(a), RemoteConnectionOptions::Ssh(b)) => {
                     (&a.host, &a.username, &a.port) == (&b.host, &b.username, &b.port)
                 }
@@ -10207,10 +10463,10 @@ pub enum WorkspaceMatching {
     /// worktree roots themselves.
     MatchSubpaths,
     /// Match paths against existing worktrees including subdirectories, and
-    /// fall back to any existing window if no worktree matched.
+    /// fall back to the existing shell if no worktree matched.
     ///
     /// For example, `zed -a foo/bar` will activate the `bar` workspace if it
-    /// exists, otherwise it will open a new window with `foo/bar` as the root.
+    /// exists, otherwise it will add `foo/bar` to the existing shell.
     MatchSubdirectory,
 }
 
@@ -10219,9 +10475,7 @@ pub struct OpenOptions {
     pub visible: Option<OpenVisible>,
     pub focus: Option<bool>,
     pub workspace_matching: WorkspaceMatching,
-    /// Whether to add unmatched directories to the existing window's sidebar
-    /// rather than opening a new window. Defaults to true, matching the default
-    /// `cli_default_open_behavior` setting.
+    /// Whether to add unmatched directories to the existing shell's sidebar.
     pub add_dirs_to_sidebar: bool,
     pub wait: bool,
     pub requesting_window: Option<WindowHandle<MultiWorkspace>>,
@@ -10251,7 +10505,7 @@ impl OpenOptions {
         !matches!(
             self.workspace_matching,
             WorkspaceMatching::None | WorkspaceMatching::MatchSubpaths
-        ) && self.open_mode != OpenMode::NewWindow
+        )
     }
 }
 
@@ -10263,7 +10517,176 @@ pub struct OpenResult {
     pub opened_items: Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>,
 }
 
+pub fn host_workspace_identity_for_open(
+    requesting_window: Option<WindowHandle<MultiWorkspace>>,
+    cx: &App,
+) -> Result<HostWorkspaceIdentity> {
+    let window = requesting_window
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .find_map(|window| window.downcast::<MultiWorkspace>())
+        })
+        .context("Super Zed has no workspace window")?;
+    window.read_with(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspace()
+            .read(cx)
+            .host_workspace_identity()
+            .cloned()
+            .context("requesting workspace has no host identity")
+    })?
+}
+
+pub fn open_superzed_paths(
+    target: HostWorkspaceIdentity,
+    project_paths: &[PathBuf],
+    paths_to_open: &[PathBuf],
+    open_options: OpenOptions,
+    cx: &mut App,
+) -> Task<anyhow::Result<OpenResult>> {
+    let project_paths = project_paths.to_vec();
+    let paths_to_open = paths_to_open.to_vec();
+    cx.spawn(async move |cx| {
+        let (host_window, host_session) = cx
+            .update(|cx| {
+                let session_in_window = |window: WindowHandle<MultiWorkspace>, cx: &App| {
+                    let multi_workspace = window.read(cx).ok()?;
+                    let host_session = multi_workspace.host_session_for_id(&target.host_id, cx)?;
+                    Some((window, host_session))
+                };
+                if let Some(window) = open_options.requesting_window {
+                    return session_in_window(window, cx);
+                }
+                cx.windows().into_iter().find_map(|window| {
+                    let window = window.downcast::<MultiWorkspace>()?;
+                    session_in_window(window, cx)
+                })
+            })
+            .context("target workspace host session has no connected window")?;
+        let (current_project_spec, workspace, fs) =
+            host_session.read_with(cx, |host_session, cx| {
+                let workspace_snapshot = host_session
+                    .snapshot()
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == target.workspace_id)
+                    .context("target workspace is absent from its host session")?;
+                anyhow::ensure!(
+                    workspace_snapshot.project_id == target.project_id,
+                    "target workspace project identity changed"
+                );
+                let workspace = host_session
+                    .projection(target.workspace_id)
+                    .map(|projection| projection.workspace.clone())
+                    .context("target workspace has no client projection")?;
+                let fs = workspace.read(cx).app_state.fs.clone();
+                Ok::<_, anyhow::Error>((workspace_snapshot.project_spec.clone(), workspace, fs))
+            })?;
+
+        let mut requested_directories = Vec::new();
+        let mut files_to_open = Vec::new();
+        let mut seen_candidates = HashSet::default();
+        for path in project_paths.iter().chain(&paths_to_open) {
+            if !seen_candidates.insert(path.clone()) {
+                continue;
+            }
+            let metadata = fs.metadata(path).await?;
+            if metadata.is_some_and(|metadata| metadata.is_dir) {
+                requested_directories.push(path.clone());
+            } else {
+                files_to_open.push(path.clone());
+            }
+        }
+
+        let has_explicit_directories = !requested_directories.is_empty();
+        let mut requested_roots = requested_directories;
+        for path in &files_to_open {
+            let covered_by_requested_root =
+                requested_roots.iter().any(|root| path.starts_with(root));
+            let covered_by_active_root = current_project_spec
+                .roots
+                .iter()
+                .any(|root| path.starts_with(&root.canonical_path));
+            if !covered_by_requested_root
+                && (!covered_by_active_root || has_explicit_directories)
+                && let Some(parent) = path.parent()
+            {
+                requested_roots.push(parent.to_path_buf());
+            }
+        }
+        if requested_roots.is_empty() {
+            requested_roots.extend(
+                current_project_spec
+                    .roots
+                    .iter()
+                    .map(|root| root.requested_path.clone()),
+            );
+        }
+        let mut seen_roots = HashSet::default();
+        requested_roots.retain(|root| seen_roots.insert(root.clone()));
+        let requested_project_spec = superzed_session::ProjectSpec {
+            roots: requested_roots
+                .into_iter()
+                .map(|path| superzed_session::ProjectRoot {
+                    requested_path: path.clone(),
+                    canonical_path: path,
+                })
+                .collect(),
+        };
+        let replace_project = cx.update(|cx| {
+            HostSessionClient::replace_workspace_project_roots(
+                &host_session,
+                host_window,
+                target.clone(),
+                requested_project_spec,
+                cx,
+            )
+        });
+        replace_project.await?;
+        let open_in_dev_container = open_options.open_in_dev_container;
+        let opened_items = host_window
+            .update(cx, |_, window, cx| {
+                window.activate_window();
+                workspace.update(cx, |workspace, cx| {
+                    if open_in_dev_container {
+                        workspace.set_open_in_dev_container(true);
+                    }
+                    workspace.open_paths(
+                        files_to_open,
+                        OpenOptions {
+                            visible: Some(open_options.visible.unwrap_or(OpenVisible::All)),
+                            ..Default::default()
+                        },
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+            })?
+            .await;
+        Ok(OpenResult {
+            window: host_window,
+            workspace,
+            opened_items,
+        })
+    })
+}
+
 /// Opens a workspace by its database ID, used for restoring empty workspaces with unsaved content.
+#[cfg(not(any(test, feature = "test-support")))]
+pub fn open_workspace_by_id(
+    _workspace_id: WorkspaceId,
+    _app_state: Arc<AppState>,
+    _requesting_window: Option<WindowHandle<MultiWorkspace>>,
+    _cx: &mut App,
+) -> Task<anyhow::Result<WindowHandle<MultiWorkspace>>> {
+    Task::ready(Err(anyhow!(
+        "legacy workspace database restoration is not supported by Super Zed"
+    )))
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub fn open_workspace_by_id(
     workspace_id: WorkspaceId,
     app_state: Arc<AppState>,
@@ -10385,6 +10808,20 @@ pub fn open_paths(
     mut open_options: OpenOptions,
     cx: &mut App,
 ) -> Task<anyhow::Result<OpenResult>> {
+    let host_session_is_attached = cx.windows().into_iter().any(|window| {
+        window
+            .downcast::<MultiWorkspace>()
+            .and_then(|window| window.read(cx).ok())
+            .is_some_and(|multi_workspace| multi_workspace.host_session().is_some())
+    });
+    if host_session_is_attached {
+        let target = match host_workspace_identity_for_open(open_options.requesting_window, cx) {
+            Ok(target) => target,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        return open_superzed_paths(target, abs_paths, abs_paths, open_options, cx);
+    }
+
     let abs_paths = abs_paths.to_vec();
     #[cfg(target_os = "windows")]
     let wsl_path = abs_paths
@@ -10431,10 +10868,8 @@ pub fn open_paths(
             }
         }
 
-        // Fallback for directories: when no flag is specified and no existing
-        // workspace matched, check the user's setting to decide whether to add
-        // the directory as a new workspace in the active window's MultiWorkspace
-        // or open a new window.
+        // Fallback for directories: when no existing workspace matched, add the
+        // directory to the active test shell when requested.
         // Skip when requesting_window is already set: the caller (e.g.
         // open_workspace_for_paths reusing an empty window) already chose the
         // target window, so we must not open the sidebar as a side-effect.
@@ -10518,29 +10953,57 @@ pub fn open_paths(
             } else {
                 None
             };
-            let result = cx
-                .update(move |cx| {
-                    Workspace::new_local(
-                        abs_paths,
-                        app_state.clone(),
-                        open_options.requesting_window,
-                        open_options.env,
-                        init,
-                        open_options.open_mode,
-                        cx,
-                    )
+            let requested_window = open_options.requesting_window.or_else(|| {
+                cx.update(|cx| {
+                    cx.active_window()
+                        .and_then(|window| window.downcast::<MultiWorkspace>())
+                        .or_else(|| {
+                            cx.windows()
+                                .into_iter()
+                                .find_map(|window| window.downcast::<MultiWorkspace>())
+                        })
                 })
-                .await;
+            });
+            let window = requested_window.context(
+                "Super Zed must connect to its host session before opening project paths",
+            )?;
+            let create_workspace = window.update(cx, |multi_workspace, window, cx| {
+                multi_workspace.find_or_create_local_workspace(
+                    PathList::new(&abs_paths),
+                    None,
+                    &[],
+                    init,
+                    OpenMode::Activate,
+                    window,
+                    cx,
+                )
+            })?;
+            let workspace = create_workspace.await?;
 
-            if let Ok(ref result) = result {
-                result.window
-                    .update(cx, |_, window, _cx| {
-                        window.activate_window();
+            let opened_items = window
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.open_paths(
+                            abs_paths,
+                            OpenOptions {
+                                visible: Some(open_visible),
+                                ..Default::default()
+                            },
+                            None,
+                            window,
+                            cx,
+                        )
                     })
-                    .log_err();
-            }
-
-            result
+                })?
+                .await;
+            window
+                .update(cx, |_, window, _| window.activate_window())
+                .log_err();
+            Ok(OpenResult {
+                window,
+                workspace,
+                opened_items,
+            })
         };
 
         #[cfg(target_os = "windows")]
@@ -10584,20 +11047,14 @@ pub fn open_new(
     cx: &mut App,
     init: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static + Send,
 ) -> Task<anyhow::Result<()>> {
-    let addition = open_options.open_mode;
-    let task = Workspace::new_local(
-        Vec::new(),
-        app_state,
-        open_options.requesting_window,
-        open_options.env,
-        Some(Box::new(init)),
-        addition,
-        cx,
-    );
+    let task = open_paths(&[], app_state, open_options, cx);
     cx.spawn(async move |cx| {
-        let OpenResult { window, .. } = task.await?;
+        let OpenResult {
+            window, workspace, ..
+        } = task.await?;
         window
-            .update(cx, |_, window, _cx| {
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| init(workspace, window, cx));
                 window.activate_window();
             })
             .ok();
@@ -10654,24 +11111,20 @@ pub fn create_and_open_local_file(
     })
 }
 
-pub fn open_remote_project_with_new_connection(
+pub fn connect_superzed_host_with_new_connection(
     window: WindowHandle<MultiWorkspace>,
     remote_connection: Arc<dyn RemoteConnection>,
     cancel_rx: oneshot::Receiver<()>,
     delegate: Arc<dyn RemoteClientDelegate>,
     app_state: Arc<AppState>,
-    paths: Vec<PathBuf>,
     cx: &mut App,
-) -> Task<Result<Vec<Option<Box<dyn ItemHandle>>>>> {
+) -> Task<Result<Entity<HostSessionClient>>> {
     cx.spawn(async move |cx| {
-        let (workspace_id, serialized_workspace) =
-            deserialize_remote_project(remote_connection.connection_options(), paths.clone(), cx)
-                .await?;
-
-        let session = match cx
+        let connection_options = remote_connection.connection_options();
+        let session = cx
             .update(|cx| {
                 remote::RemoteClient::new(
-                    ConnectionIdentifier::Workspace(workspace_id.0),
+                    ConnectionIdentifier::Host,
                     remote_connection,
                     cancel_rx,
                     delegate,
@@ -10679,40 +11132,295 @@ pub fn open_remote_project_with_new_connection(
                 )
             })
             .await?
-        {
-            Some(result) => result,
-            None => return Ok(Vec::new()),
-        };
-
-        let project = cx.update(|cx| {
-            project::Project::remote(
-                session,
-                app_state.client.clone(),
-                app_state.node_runtime.clone(),
-                app_state.user_store.clone(),
-                app_state.languages.clone(),
-                app_state.fs.clone(),
-                true,
-                cx,
-            )
-        });
-
-        open_remote_project_inner(
-            project,
-            paths,
-            workspace_id,
-            serialized_workspace,
-            app_state,
-            window,
-            None,
-            None,
-            cx,
-        )
-        .await
+            .context("Super Zed SSH host connection was cancelled")?;
+        let host_session =
+            attach_connected_superzed_host(window, session, connection_options, app_state, cx)
+                .await?;
+        Ok(host_session)
     })
 }
 
-pub fn open_remote_project_with_existing_connection(
+pub fn open_paths_in_host_workspace(
+    host_session: Entity<HostSessionClient>,
+    target: HostWorkspaceIdentity,
+    window: WindowHandle<MultiWorkspace>,
+    paths: Vec<PathBuf>,
+    cx: &mut App,
+) -> Task<Result<Vec<Option<Box<dyn ItemHandle>>>>> {
+    cx.spawn(async move |cx| {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let project_spec = superzed_session::ProjectSpec {
+            roots: paths
+                .iter()
+                .cloned()
+                .map(|path| superzed_session::ProjectRoot {
+                    requested_path: path.clone(),
+                    canonical_path: path,
+                })
+                .collect(),
+        };
+        let replace_project = cx.update(|cx| {
+            HostSessionClient::replace_workspace_project_roots(
+                &host_session,
+                window,
+                target.clone(),
+                project_spec,
+                cx,
+            )
+        });
+        replace_project.await?;
+        let workspace = host_session
+            .read_with(cx, |session, _| {
+                session
+                    .projection(target.workspace_id)
+                    .map(|projection| projection.workspace.clone())
+            })
+            .context("opened host workspace projection is missing")?;
+        let opened = window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.open_paths(
+                        paths,
+                        OpenOptions {
+                            visible: Some(OpenVisible::All),
+                            ..Default::default()
+                        },
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+            })?
+            .await;
+        Ok(opened
+            .into_iter()
+            .map(|result| result.and_then(Result::ok))
+            .collect())
+    })
+}
+
+pub async fn attach_connected_superzed_host(
+    window: WindowHandle<MultiWorkspace>,
+    session: Entity<RemoteClient>,
+    connection_options: RemoteConnectionOptions,
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<Entity<HostSessionClient>> {
+    let response = session
+        .read_with(cx, |session, _| {
+            session.proto_client().request(proto::GetSuperzedSession {})
+        })
+        .await
+        .context("loading the Super Zed host session")?;
+    let snapshot: superzed_session::HostSessionSnapshot =
+        serde_json::from_str(&response.snapshot_json)
+            .context("deserializing the Super Zed host session")?;
+    snapshot
+        .validate()
+        .context("validating the Super Zed host session")?;
+    let host_session =
+        HostSessionClient::remote(session, app_state, snapshot.clone(), &connection_options)?;
+    let host_session = cx.update(|cx| cx.new(|_| host_session));
+    window.update(cx, |multi_workspace, window, cx| {
+        multi_workspace.attach_host_session(host_session.clone(), window, cx)
+    })??;
+    HostSessionClient::reconcile(host_session.clone(), window, snapshot, cx).await?;
+    Ok(host_session)
+}
+
+type PendingSuperzedHostOpen =
+    Shared<Task<Result<WindowHandle<MultiWorkspace>, Arc<anyhow::Error>>>>;
+
+#[derive(Default)]
+struct SuperzedHostOpenState {
+    window: Option<WindowHandle<MultiWorkspace>>,
+    pending: Option<PendingSuperzedHostOpen>,
+}
+
+impl Global for SuperzedHostOpenState {}
+
+pub async fn open_superzed_host(
+    connection_options: RemoteConnectionOptions,
+    delegate: Arc<dyn RemoteClientDelegate>,
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<WindowHandle<MultiWorkspace>> {
+    let (window, pending) = cx.update(|cx| {
+        let state = cx.default_global::<SuperzedHostOpenState>();
+        (state.window, state.pending.clone())
+    });
+    if let Some(window) = window {
+        if window.read_with(cx, |_, _| ()).is_ok() {
+            window.update(cx, |_, window, cx| {
+                cx.activate(true);
+                window.activate_window();
+            })?;
+            return Ok(window);
+        }
+        cx.update(|cx| cx.default_global::<SuperzedHostOpenState>().window = None);
+    }
+
+    let pending = if let Some(pending) = pending {
+        pending
+    } else {
+        let candidate = cx
+            .spawn(async move |cx| {
+                open_superzed_host_inner(connection_options, delegate, app_state, cx)
+                    .await
+                    .map_err(Arc::new)
+            })
+            .shared();
+        cx.update(|cx| {
+            let state = cx.default_global::<SuperzedHostOpenState>();
+            state
+                .pending
+                .get_or_insert_with(|| candidate.clone())
+                .clone()
+        })
+    };
+
+    match pending.await {
+        Ok(window) => {
+            cx.update(|cx| {
+                let state = cx.default_global::<SuperzedHostOpenState>();
+                state.window = Some(window);
+                state.pending = None;
+            });
+            Ok(window)
+        }
+        Err(error) => {
+            cx.update(|cx| cx.default_global::<SuperzedHostOpenState>().pending = None);
+            Err(anyhow!("{error:#}"))
+        }
+    }
+}
+
+async fn open_superzed_host_inner(
+    connection_options: RemoteConnectionOptions,
+    delegate: Arc<dyn RemoteClientDelegate>,
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<WindowHandle<MultiWorkspace>> {
+    let remote_connection = remote::connect(connection_options, delegate.clone(), cx).await?;
+    let (cancellation_guard, cancellation) = oneshot::channel();
+    let session = cx
+        .update(|cx| {
+            remote::RemoteClient::new(
+                ConnectionIdentifier::Host,
+                remote_connection,
+                cancellation,
+                delegate,
+                cx,
+            )
+        })
+        .await?
+        .context("Super Zed host connection was cancelled")?;
+    drop(cancellation_guard);
+
+    let response = session
+        .read_with(cx, |session, _| {
+            session.proto_client().request(proto::GetSuperzedSession {})
+        })
+        .await
+        .context("loading the Super Zed host session")?;
+    let snapshot: superzed_session::HostSessionSnapshot =
+        serde_json::from_str(&response.snapshot_json)
+            .context("deserializing the Super Zed host session")?;
+    snapshot
+        .validate()
+        .context("validating the Super Zed host session")?;
+
+    let initial_snapshot = HostSessionClient::initial_workspace_snapshot(&snapshot)?.clone();
+    let context_servers = HostContextServerRegistry::default();
+    let initial_project = cx.update(|cx| {
+        Project::remote_for_project(
+            session.clone(),
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            initial_snapshot.project_id.get(),
+            true,
+            context_servers.clone(),
+            cx,
+        )
+    });
+    let host_session = cx.update(|cx| {
+        cx.new(|_| {
+            HostSessionClient::local(
+                session,
+                app_state.clone(),
+                snapshot.clone(),
+                context_servers,
+            )
+        })
+    });
+
+    let mut options = cx.update(|cx| (app_state.build_window_options)(None, cx));
+    options.show = false;
+    let window = cx.update(|cx| {
+        cx.open_window(options, |window, cx| {
+            let identity = HostWorkspaceIdentity {
+                host_id: HostId::Local,
+                workspace_id: initial_snapshot.id,
+                project_id: initial_snapshot.project_id,
+            };
+            let workspace = cx.new(|cx| {
+                Workspace::new_for_host(
+                    None,
+                    initial_project.clone(),
+                    app_state.clone(),
+                    identity,
+                    window,
+                    cx,
+                )
+            });
+            cx.new(|cx| MultiWorkspace::new_for_host(workspace, host_session.clone(), window, cx))
+        })
+    })?;
+
+    window.update(cx, |multi_workspace, _, cx| {
+        host_session.update(cx, |host_session, cx| {
+            host_session.attach_initial_projection(
+                &initial_snapshot,
+                initial_project.clone(),
+                multi_workspace.workspace().clone(),
+                cx,
+            )
+        })
+    })??;
+
+    window.update(cx, |_, window, cx| {
+        cx.activate(true);
+        window.activate_window();
+    })?;
+
+    cx.spawn(async move |cx| {
+        let result = async {
+            Project::initialize_superzed_project(initial_project, cx)
+                .await
+                .with_context(|| {
+                    format!(
+                        "initializing host project {}",
+                        initial_snapshot.project_id.get()
+                    )
+                })?;
+            HostSessionClient::reconcile(host_session, window, snapshot, cx).await
+        }
+        .await;
+        if let Err(error) = result {
+            log::error!("failed to initialize the Super Zed host session: {error:#}");
+        }
+    })
+    .detach();
+
+    Ok(window)
+}
+
+pub fn open_non_ssh_remote_project_with_existing_connection(
     connection_options: RemoteConnectionOptions,
     project: Entity<Project>,
     paths: Vec<PathBuf>,
@@ -10726,7 +11434,7 @@ pub fn open_remote_project_with_existing_connection(
         let (workspace_id, serialized_workspace) =
             deserialize_remote_project(connection_options.clone(), paths.clone(), cx).await?;
 
-        open_remote_project_inner(
+        open_non_ssh_remote_project_inner(
             project,
             paths,
             workspace_id,
@@ -10741,7 +11449,7 @@ pub fn open_remote_project_with_existing_connection(
     })
 }
 
-async fn open_remote_project_inner(
+async fn open_non_ssh_remote_project_inner(
     project: Entity<Project>,
     paths: Vec<PathBuf>,
     workspace_id: WorkspaceId,
@@ -10793,7 +11501,7 @@ async fn open_remote_project_inner(
         };
     }
 
-    if project_paths_to_open.is_empty() {
+    if project_paths_to_open.is_empty() && !project_path_errors.is_empty() {
         return Err(project_path_errors.pop().context("no paths given")?);
     }
 
@@ -10854,6 +11562,17 @@ fn deserialize_remote_project(
 ) -> Task<Result<(WorkspaceId, Option<SerializedWorkspace>)>> {
     let db = cx.update(|cx| WorkspaceDb::global(cx));
     cx.background_spawn(async move {
+        if matches!(connection_options, RemoteConnectionOptions::Local(_)) {
+            let serialized_workspace = db.workspace_for_roots(&paths);
+            let workspace_id = if let Some(workspace_id) =
+                serialized_workspace.as_ref().map(|workspace| workspace.id)
+            {
+                workspace_id
+            } else {
+                db.next_id().await?
+            };
+            return Ok((workspace_id, None));
+        }
         let remote_connection_id = db
             .get_or_create_remote_connection(connection_options)
             .await?;
@@ -10868,14 +11587,14 @@ fn deserialize_remote_project(
             db.next_id().await?
         };
 
-        Ok((workspace_id, serialized_workspace))
+        Ok((workspace_id, None))
     })
 }
 
 pub fn join_in_room_project(
     project_id: u64,
     follow_user_id: u64,
-    app_state: Arc<AppState>,
+    _app_state: Arc<AppState>,
     cx: &mut App,
 ) -> Task<Result<()>> {
     let windows = cx.windows();
@@ -10901,41 +11620,16 @@ pub fn join_in_room_project(
                 })
         });
 
-        let multi_workspace_window = if let Some((existing_window, target_workspace)) =
-            existing_window_and_workspace
-        {
-            existing_window
-                .update(cx, |multi_workspace, window, cx| {
-                    multi_workspace.activate(target_workspace, None, window, cx);
-                })
-                .ok();
-            existing_window
-        } else {
-            let active_call = cx.update(|cx| GlobalAnyActiveCall::global(cx).clone());
-            let project = cx
-                .update(|cx| {
-                    active_call.0.join_project(
-                        project_id,
-                        app_state.languages.clone(),
-                        app_state.fs.clone(),
-                        cx,
-                    )
-                })
-                .await?;
-
-            let window_bounds_override = window_bounds_env_override();
-            cx.update(|cx| {
-                let mut options = (app_state.build_window_options)(None, cx);
-                options.window_bounds = window_bounds_override.map(WindowBounds::Windowed);
-                cx.open_window(options, |window, cx| {
-                    let workspace = cx.new(|cx| {
-                        Workspace::new(Default::default(), project, app_state.clone(), window, cx)
-                    });
-                    cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
-                })
-            })?
+        let Some((multi_workspace_window, target_workspace)) = existing_window_and_workspace else {
+            anyhow::bail!(
+                "joining a collaboration project that is not already in the Super Zed shell is not supported"
+            );
         };
-
+        multi_workspace_window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(target_workspace, None, window, cx);
+            })
+            .ok();
         multi_workspace_window.update(cx, |multi_workspace, window, cx| {
             cx.activate(true);
             window.activate_window();
@@ -11506,6 +12200,30 @@ pub fn with_active_or_new_workspace(
             .detach_and_log_err(cx);
         }
     }
+}
+
+pub fn with_active_workspace(
+    cx: &mut App,
+    f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send + 'static,
+) -> Result<()> {
+    let multi_workspace = cx
+        .active_window()
+        .and_then(|window| window.downcast::<MultiWorkspace>())
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .find_map(|window| window.downcast::<MultiWorkspace>())
+        })
+        .context("mandatory Super Zed host window is unavailable")?;
+    cx.defer(move |cx| {
+        multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| f(workspace, window, cx));
+            })
+            .log_err();
+    });
+    Ok(())
 }
 
 /// Reads a panel's pixel size from its legacy KVP format and deletes the legacy

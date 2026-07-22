@@ -7,6 +7,7 @@ pub mod pending_op;
 use crate::{
     ProjectEnvironment, ProjectItem, ProjectPath,
     buffer_store::{BufferStore, BufferStoreEvent},
+    host_resource_registry::HostResourceRegistry,
     project_settings::ProjectSettings,
     trusted_worktrees::{
         PathTrust, TrustedWorktrees, TrustedWorktreesEvent, TrustedWorktreesStore,
@@ -99,6 +100,8 @@ pub struct GitStore {
     state: GitStoreState,
     buffer_store: Entity<BufferStore>,
     worktree_store: Entity<WorktreeStore>,
+    host_resource_registry: HostResourceRegistry,
+    host_resource_repositories: HashSet<PathBuf>,
     repositories: HashMap<RepositoryId, Entity<Repository>>,
     worktree_ids: HashMap<RepositoryId, HashSet<WorktreeId>>,
     active_repo_id: Option<RepositoryId>,
@@ -477,7 +480,7 @@ pub struct Repository {
     this: WeakEntity<Self>,
     snapshot: RepositorySnapshot,
     commit_message_buffer: Option<Entity<Buffer>>,
-    git_store: WeakEntity<GitStore>,
+    git_stores: Vec<WeakEntity<GitStore>>,
     // For a local repository, holds paths that have had worktree events since the last status scan completed,
     // and that should be examined during the next status scan.
     paths_needing_status_update: Vec<Vec<RepoPath>>,
@@ -604,6 +607,12 @@ impl EventEmitter<RepositoryEvent> for Repository {}
 impl EventEmitter<JobsUpdated> for Repository {}
 impl EventEmitter<GitStoreEvent> for GitStore {}
 
+impl Drop for GitStore {
+    fn drop(&mut self) {
+        self.release_host_resources();
+    }
+}
+
 pub struct GitJob {
     id: JobId,
     job: Box<dyn FnOnce(RepositoryState, &mut AsyncApp) -> Task<()>>,
@@ -619,6 +628,13 @@ enum GitJobKey {
 }
 
 impl GitStore {
+    pub fn release_host_resources(&mut self) {
+        for common_directory in self.host_resource_repositories.drain() {
+            self.host_resource_registry
+                .release_repository(&common_directory);
+        }
+    }
+
     pub fn local(
         worktree_store: &Entity<WorktreeStore>,
         buffer_store: Entity<BufferStore>,
@@ -626,6 +642,7 @@ impl GitStore {
         fs: Arc<dyn Fs>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let host_resource_registry = worktree_store.read(cx).host_resource_registry();
         let _fs_watches = if fs.is_fake() {
             Box::new([])
         } else {
@@ -689,7 +706,7 @@ impl GitStore {
             worktree_store.clone(),
             buffer_store,
             GitStoreState::Local {
-                next_repository_id: Arc::new(AtomicU64::new(1)),
+                next_repository_id: host_resource_registry.repository_id_counter(),
                 downstream: None,
                 project_environment: environment,
                 _fs_watches,
@@ -736,6 +753,8 @@ impl GitStore {
         GitStore {
             state,
             buffer_store,
+            host_resource_registry: worktree_store.read(cx).host_resource_registry(),
+            host_resource_repositories: Default::default(),
             worktree_store,
             repositories: HashMap::default(),
             worktree_ids: HashMap::default(),
@@ -2272,30 +2291,46 @@ impl GitStore {
                 ..
             } = update
             {
-                let id = RepositoryId(next_repository_id.fetch_add(1, atomic::Ordering::Release));
-                let git_store = cx.weak_entity();
-                let repo = cx.new(|cx| {
-                    let mut repo = Repository::local(
-                        id,
-                        work_directory_abs_path.clone(),
-                        repository_dir_abs_path.clone(),
-                        common_dir_abs_path.clone(),
-                        dot_git_abs_path.clone(),
-                        project_environment.downgrade(),
-                        fs.clone(),
-                        is_trusted,
-                        git_store,
-                        cx,
-                    );
-                    if let Some(updates_tx) = updates_tx.as_ref() {
-                        // trigger an empty `UpdateRepository` to ensure remote active_repo_id is set correctly
-                        updates_tx
-                            .unbounded_send(DownstreamUpdate::UpdateRepository(repo.snapshot()))
-                            .ok();
-                    }
-                    repo.schedule_scan(updates_tx.clone(), cx);
-                    repo
-                });
+                let existing_repository =
+                    self.host_resource_registry.repository(common_dir_abs_path);
+                let (id, repo) = if let Some(repo) = existing_repository {
+                    let git_store = cx.weak_entity();
+                    repo.update(cx, |repo, _| repo.attach_git_store(git_store));
+                    (repo.read(cx).id, repo)
+                } else {
+                    let id =
+                        RepositoryId(next_repository_id.fetch_add(1, atomic::Ordering::Release));
+                    let git_store = cx.weak_entity();
+                    let repo = cx.new(|cx| {
+                        let mut repo = Repository::local(
+                            id,
+                            work_directory_abs_path.clone(),
+                            repository_dir_abs_path.clone(),
+                            common_dir_abs_path.clone(),
+                            dot_git_abs_path.clone(),
+                            project_environment.downgrade(),
+                            fs.clone(),
+                            is_trusted,
+                            git_store,
+                            cx,
+                        );
+                        repo.schedule_scan(None, cx);
+                        repo
+                    });
+                    let repo = self
+                        .host_resource_registry
+                        .insert_repository(common_dir_abs_path, repo);
+                    (id, repo)
+                };
+                self.host_resource_repositories
+                    .insert(common_dir_abs_path.to_path_buf());
+                if let Some(updates_tx) = updates_tx.as_ref() {
+                    updates_tx
+                        .unbounded_send(DownstreamUpdate::UpdateRepository(
+                            repo.read(cx).snapshot(),
+                        ))
+                        .ok();
+                }
                 self._subscriptions
                     .push(cx.subscribe(&repo, Self::on_repository_event));
                 self._subscriptions
@@ -2315,7 +2350,16 @@ impl GitStore {
                 self.active_repo_id = None;
                 cx.emit(GitStoreEvent::ActiveRepositoryChanged(None));
             }
-            self.repositories.remove(&id);
+            if let Some(repository) = self.repositories.remove(&id) {
+                let common_directory = repository.read(cx).common_dir_abs_path.clone();
+                if self
+                    .host_resource_repositories
+                    .remove(common_directory.as_ref())
+                {
+                    self.host_resource_registry
+                        .release_repository(&common_directory);
+                }
+            }
             if let Some(updates_tx) = updates_tx.as_ref() {
                 updates_tx
                     .unbounded_send(DownstreamUpdate::RemoveRepository(id))
@@ -5515,7 +5559,7 @@ impl Repository {
 
         let mut repo = Repository {
             this: cx.weak_entity(),
-            git_store,
+            git_stores: vec![git_store],
             snapshot,
             pending_ops: Default::default(),
             repository_state: Task::ready(Err("not yet initialized".into())).shared(),
@@ -5566,7 +5610,7 @@ impl Repository {
             this: cx.weak_entity(),
             snapshot,
             commit_message_buffer: None,
-            git_store,
+            git_stores: vec![git_store],
             pending_ops: Default::default(),
             paths_needing_status_update: Default::default(),
             job_sender,
@@ -5603,12 +5647,22 @@ impl Repository {
     }
 
     pub fn git_store(&self) -> Option<Entity<GitStore>> {
-        self.git_store.upgrade()
+        self.git_stores.iter().find_map(WeakEntity::upgrade)
+    }
+
+    fn attach_git_store(&mut self, git_store: WeakEntity<GitStore>) {
+        self.git_stores
+            .retain(|git_store| git_store.upgrade().is_some());
+        if !self.git_stores.contains(&git_store) {
+            self.git_stores.push(git_store);
+        }
     }
 
     fn reload_buffer_diff_bases(&mut self, cx: &mut Context<Self>) {
         let this = cx.weak_entity();
-        let git_store = self.git_store.clone();
+        let Some(git_store) = self.git_store() else {
+            return;
+        };
         let _ = self.send_keyed_job(
             "reload_buffer_diff_bases",
             Some(GitJobKey::ReloadBufferDiffBases),
@@ -5616,11 +5670,11 @@ impl Repository {
             |state, mut cx| async move {
                 let RepositoryState::Local(LocalRepositoryState { backend, .. }) = state else {
                     log::error!("tried to recompute diffs for a non-local repository");
-                    return Ok(());
+                    return anyhow::Ok(());
                 };
 
                 let Some(this) = this.upgrade() else {
-                    return Ok(());
+                    return anyhow::Ok(());
                 };
 
                 let repo_diff_state_updates = this.update(&mut cx, |this, cx| {
@@ -5666,7 +5720,7 @@ impl Repository {
                             })
                             .collect::<Vec<_>>()
                     })
-                })?;
+                });
 
                 let buffer_diff_base_changes = cx
                     .background_spawn(async move {
@@ -5788,7 +5842,8 @@ impl Repository {
                             diff_state.diff_bases_changed(buffer_snapshot, diff_bases_change, cx);
                         });
                     }
-                })
+                });
+                anyhow::Ok(())
             },
         );
     }
@@ -5869,7 +5924,7 @@ impl Repository {
     }
 
     pub fn set_as_active_repository(&self, cx: &mut Context<Self>) {
-        let Some(git_store) = self.git_store.upgrade() else {
+        let Some(git_store) = self.git_store() else {
             return;
         };
         let entity = cx.entity();
@@ -5899,7 +5954,7 @@ impl Repository {
     }
 
     pub fn repo_path_to_project_path(&self, path: &RepoPath, cx: &App) -> Option<ProjectPath> {
-        let git_store = self.git_store.upgrade()?;
+        let git_store = self.git_store()?;
         let worktree_store = git_store.read(cx).worktree_store.read(cx);
         let abs_path = self.snapshot.repo_path_to_abs_path(path);
         let abs_path = SanitizedPath::new(&abs_path);
@@ -5911,7 +5966,7 @@ impl Repository {
     }
 
     pub fn project_path_to_repo_path(&self, path: &ProjectPath, cx: &App) -> Option<RepoPath> {
-        let git_store = self.git_store.upgrade()?;
+        let git_store = self.git_store()?;
         let worktree_store = git_store.read(cx).worktree_store.read(cx);
         let abs_path = worktree_store.absolutize(path, cx)?;
         self.snapshot.abs_path_to_repo_path(&abs_path)
@@ -6852,7 +6907,7 @@ impl Repository {
     }
 
     fn buffer_store(&self, cx: &App) -> Option<Entity<BufferStore>> {
-        Some(self.git_store.upgrade()?.read(cx).buffer_store.clone())
+        Some(self.git_store()?.read(cx).buffer_store.clone())
     }
 
     fn save_buffers<'a>(
@@ -6907,7 +6962,7 @@ impl Repository {
         if entries.is_empty() {
             return Task::ready(Ok(()));
         }
-        let Some(git_store) = self.git_store.upgrade() else {
+        let Some(git_store) = self.git_store() else {
             return Task::ready(Ok(()));
         };
         let id = self.id;
@@ -7689,7 +7744,7 @@ impl Repository {
     ) -> oneshot::Receiver<anyhow::Result<()>> {
         let id = self.id;
         let this = cx.weak_entity();
-        let git_store = self.git_store.clone();
+        let git_store = self.git_store();
         let abs_path = self.snapshot.repo_path_to_abs_path(&path);
         self.send_keyed_job(
             "spawn_set_index_text_job",
@@ -7739,6 +7794,7 @@ impl Repository {
                         .ok()
                         .flatten();
                     git_store
+                        .context("Git store dropped")?
                         .update(&mut cx, |git_store, cx| {
                             let buffer_id = git_store
                                 .buffer_store

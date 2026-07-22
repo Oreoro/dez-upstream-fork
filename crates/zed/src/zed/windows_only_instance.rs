@@ -186,11 +186,6 @@ fn send_args_to_instance(args: &Args) -> anyhow::Result<()> {
                             exit_status.lock().replace(status);
                             return Ok(());
                         }
-                        CliResponse::PromptOpenBehavior => {
-                            tx.send(CliRequest::SetOpenBehavior {
-                                behavior: cli::CliBehaviorSetting::ExistingWindow,
-                            })?;
-                        }
                     }
                 }
                 Ok(())

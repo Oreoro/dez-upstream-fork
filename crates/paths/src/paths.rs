@@ -15,7 +15,7 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 /// and state directory paths.
 ///
 /// Forks should change this to avoid colliding with Zed's user data.
-pub const APP_NAME: &str = "Zed";
+pub const APP_NAME: &str = "SuperZed";
 
 /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
 /// Linux/FreeBSD and the macOS `~/.config` fallback.
@@ -68,7 +68,7 @@ static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Returns the relative path to the zed_server directory on the ssh host.
 pub fn remote_server_dir_relative() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::unix(".zed_server").unwrap());
+        LazyLock::new(|| RelPath::unix(".superzed_server").unwrap());
     *CACHED
 }
 
@@ -76,7 +76,7 @@ pub fn remote_server_dir_relative() -> &'static RelPath {
 /// Returns the relative path to the zed_wsl_server directory on the wsl host.
 pub fn remote_wsl_server_dir_relative() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
-        LazyLock::new(|| RelPath::unix(".zed_wsl_server").unwrap());
+        LazyLock::new(|| RelPath::unix(".superzed_wsl_server").unwrap());
     *CACHED
 }
 
@@ -116,6 +116,10 @@ pub fn set_custom_data_dir(dir: &str) -> &'static PathBuf {
         // don't choke on the verbatim syntax.
         SanitizedPath::new(&canonicalized).as_path().to_path_buf()
     })
+}
+
+pub fn custom_data_dir() -> Option<&'static PathBuf> {
+    CUSTOM_DATA_DIR.get()
 }
 
 /// Returns the path to the configuration directory used by Zed.
@@ -228,7 +232,9 @@ pub fn hang_traces_dir() -> &'static PathBuf {
 pub fn logs_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
     LOGS_DIR.get_or_init(|| {
-        if cfg!(target_os = "macos") {
+        if let Some(custom_dir) = custom_data_dir() {
+            custom_dir.join("logs")
+        } else if cfg!(target_os = "macos") {
             home_dir().join("Library/Logs").join(APP_NAME)
         } else {
             data_dir().join("logs")

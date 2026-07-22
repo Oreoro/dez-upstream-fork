@@ -386,7 +386,7 @@ fn resolve_context_server_extension(
         .map(|(id, entry)| (id.clone(), entry.manifest.clone()));
     cx.spawn(async move |cx| {
         let installation = descriptor
-            .configuration(worktree_store, cx)
+            .configuration(Some(worktree_store), cx)
             .await
             .context("Failed to resolve context server configuration")
             .log_err()

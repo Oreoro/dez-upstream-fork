@@ -1,7 +1,7 @@
 use crate::{
     remote_connections::{
         Connection, RemoteConnectionModal, RemoteConnectionPrompt, RemoteSettings, SshConnection,
-        SshConnectionHeader, connect, determine_paths_with_positions, open_remote_project,
+        SshConnectionHeader, connect, determine_paths_with_positions, open_non_ssh_remote_project,
     },
     ssh_config::parse_ssh_config_hosts,
 };
@@ -51,7 +51,7 @@ use util::{
 use workspace::{
     AppState, DismissDecision, ModalView, MultiWorkspace, OpenLog, OpenOptions, Toast, Workspace,
     notifications::{DetachAndPromptErr, NotificationId},
-    open_remote_project_with_existing_connection,
+    open_non_ssh_remote_project_with_existing_connection,
 };
 
 pub struct RemoteServerProjects {
@@ -62,7 +62,7 @@ pub struct RemoteServerProjects {
     retained_connections: Vec<Entity<RemoteClient>>,
     ssh_config_updates: Task<()>,
     ssh_config_servers: BTreeSet<SharedString>,
-    create_new_window: bool,
+    connect_ssh_host_only: bool,
     dev_container_picker: Option<Entity<Picker<DevContainerPickerDelegate>>>,
     _subscriptions: Vec<Subscription>,
     allow_dismissal: bool,
@@ -381,7 +381,6 @@ impl Focusable for ProjectPicker {
 
 impl ProjectPicker {
     fn new(
-        create_new_window: bool,
         index: ServerIndex,
         connection: RemoteConnectionOptions,
         project: Entity<Project>,
@@ -401,6 +400,10 @@ impl ProjectPicker {
         });
 
         let data = match &connection {
+            RemoteConnectionOptions::Local(_) => ProjectPickerData::Ssh {
+                connection_string: "Local".into(),
+                nickname: None,
+            },
             RemoteConnectionOptions::Ssh(connection) => ProjectPickerData::Ssh {
                 connection_string: connection.connection_string().into(),
                 nickname: connection.nickname.clone().map(|nick| nick.into()),
@@ -429,13 +432,7 @@ impl ProjectPicker {
                                 let fs = workspace.project().read(cx).fs().clone();
                                 let weak = cx.entity().downgrade();
                                 workspace.toggle_modal(window, cx, |window, cx| {
-                                    RemoteServerProjects::new(
-                                        create_new_window,
-                                        fs,
-                                        window,
-                                        weak,
-                                        cx,
-                                    )
+                                    RemoteServerProjects::new(fs, window, weak, cx)
                                 });
                             })
                             .log_err()?;
@@ -486,23 +483,9 @@ impl ProjectPicker {
                     })
                     .log_err();
 
-                    let window = if create_new_window {
-                        let options = cx
-                            .update(|_, cx| (app_state.build_window_options)(None, cx))
-                            .log_err()?;
-                        cx.open_window(options, |window, cx| {
-                            let workspace = cx.new(|cx| {
-                                telemetry::event!("SSH Project Created");
-                                Workspace::new(None, project.clone(), app_state.clone(), window, cx)
-                            });
-                            cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
-                        })
-                        .log_err()
-                    } else {
-                        cx.window_handle().downcast::<MultiWorkspace>()
-                    }?;
+                    let window = cx.window_handle().downcast::<MultiWorkspace>()?;
 
-                    let items = open_remote_project_with_existing_connection(
+                    let items = open_non_ssh_remote_project_with_existing_connection(
                         connection, project, paths, app_state, window, None, None, cx,
                     )
                     .await
@@ -1187,9 +1170,7 @@ impl PickerDelegate for RemoteServerPickerDelegate {
                 let project = project_entry.project.clone();
                 remote_server_projects
                     .update(cx, |this, cx| {
-                        this.open_remote_project_entry(
-                            index, project, connection, secondary, window, cx,
-                        );
+                        this.open_remote_entry(index, project, connection, secondary, window, cx);
                     })
                     .ok();
             }
@@ -1356,17 +1337,7 @@ impl PickerDelegate for RemoteServerPickerDelegate {
         };
 
         let buttons = if is_project_selected {
-            h_flex()
-                .gap_1()
-                .child(
-                    Button::new("open_new_window", "New Window")
-                        .key_binding(KeyBinding::for_action(&menu::SecondaryConfirm, cx))
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
-                        }),
-                )
-                .child(confirm_button("Open".into()))
-                .into_any_element()
+            confirm_button("Open".into()).into_any_element()
         } else {
             confirm_button("Select".into()).into_any_element()
         };
@@ -1387,7 +1358,6 @@ impl PickerDelegate for RemoteServerPickerDelegate {
 impl RemoteServerProjects {
     #[cfg(target_os = "windows")]
     pub fn wsl(
-        create_new_window: bool,
         fs: Arc<dyn Fs>,
         window: &mut Window,
         workspace: WeakEntity<Workspace>,
@@ -1395,16 +1365,15 @@ impl RemoteServerProjects {
     ) -> Self {
         Self::new_inner(
             Mode::AddWslDistro(AddWslDistro::new(window, cx)),
-            create_new_window,
             fs,
             window,
             workspace,
+            false,
             cx,
         )
     }
 
     pub fn new(
-        create_new_window: bool,
         fs: Arc<dyn Fs>,
         window: &mut Window,
         workspace: WeakEntity<Workspace>,
@@ -1412,10 +1381,26 @@ impl RemoteServerProjects {
     ) -> Self {
         Self::new_inner(
             Mode::default_mode(&BTreeSet::new(), cx),
-            create_new_window,
             fs,
             window,
             workspace,
+            false,
+            cx,
+        )
+    }
+
+    pub fn connect_ssh_host(
+        fs: Arc<dyn Fs>,
+        window: &mut Window,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_inner(
+            Mode::CreateRemoteServer(CreateRemoteServer::new(window, cx)),
+            fs,
+            window,
+            workspace,
+            true,
             cx,
         )
     }
@@ -1439,10 +1424,10 @@ impl RemoteServerProjects {
 
         let mut this = Self::new_inner(
             Mode::CreateRemoteDevContainer(CreateRemoteDevContainer::new(initial_mode, cx)),
-            false,
             fs,
             window,
             workspace,
+            false,
             cx,
         );
 
@@ -1464,14 +1449,11 @@ impl RemoteServerProjects {
     pub fn popover(
         fs: Arc<dyn Fs>,
         workspace: WeakEntity<Workspace>,
-        create_new_window: Option<bool>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        let create_new_window =
-            create_new_window.unwrap_or_else(|| crate::default_open_in_new_window(cx));
         cx.new(|cx| {
-            let server = Self::new(create_new_window, fs, window, workspace, cx);
+            let server = Self::new(fs, window, workspace, cx);
             server.focus_handle(cx).focus(window, cx);
             server
         })
@@ -1479,10 +1461,10 @@ impl RemoteServerProjects {
 
     fn new_inner(
         mode: Mode,
-        create_new_window: bool,
         fs: Arc<dyn Fs>,
         window: &mut Window,
         workspace: WeakEntity<Workspace>,
+        connect_ssh_host_only: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
@@ -1538,7 +1520,7 @@ impl RemoteServerProjects {
             retained_connections: Vec::new(),
             ssh_config_updates,
             ssh_config_servers: BTreeSet::new(),
-            create_new_window,
+            connect_ssh_host_only,
             dev_container_picker: None,
             _subscriptions: vec![settings_subscription, dismiss_subscription],
             allow_dismissal: true,
@@ -1546,7 +1528,6 @@ impl RemoteServerProjects {
     }
 
     fn project_picker(
-        create_new_window: bool,
         index: ServerIndex,
         connection_options: remote::RemoteConnectionOptions,
         project: Entity<Project>,
@@ -1556,9 +1537,8 @@ impl RemoteServerProjects {
         workspace: WeakEntity<Workspace>,
     ) -> Self {
         let fs = project.read(cx).fs().clone();
-        let mut this = Self::new(create_new_window, fs, window, workspace.clone(), cx);
+        let mut this = Self::new(fs, window, workspace.clone(), cx);
         this.mode = Mode::ProjectPicker(ProjectPicker::new(
-            create_new_window,
             index,
             connection_options,
             project,
@@ -1595,6 +1575,39 @@ impl RemoteServerProjects {
                 return;
             }
         };
+        if self.connect_ssh_host_only {
+            let Some((app_state, host_window)) = self
+                .workspace
+                .read_with(cx, |workspace, _| {
+                    Some((
+                        workspace.app_state().clone(),
+                        window.window_handle().downcast::<MultiWorkspace>()?,
+                    ))
+                })
+                .log_err()
+                .flatten()
+            else {
+                return;
+            };
+            cx.emit(DismissEvent);
+            cx.spawn_in(window, async move |_, cx| {
+                crate::connect_ssh_host(
+                    RemoteConnectionOptions::Ssh(connection_options),
+                    app_state,
+                    host_window,
+                    cx,
+                )
+                .await
+                .map(|_| ())
+            })
+            .detach_and_prompt_err(
+                "Failed to connect SSH host",
+                window,
+                cx,
+                |_, _, _| None,
+            );
+            return;
+        }
         let ssh_prompt = cx.new(|cx| {
             RemoteConnectionPrompt::new(
                 connection_options.connection_string(),
@@ -1782,7 +1795,6 @@ impl RemoteServerProjects {
             return;
         };
 
-        let create_new_window = self.create_new_window;
         workspace.update(cx, |_, cx| {
             cx.defer_in(window, move |workspace, window, cx| {
                 let app_state = workspace.app_state().clone();
@@ -1818,7 +1830,7 @@ impl RemoteServerProjects {
                             let weak = cx.entity().downgrade();
                             let fs = workspace.project().read(cx).fs().clone();
                             workspace.toggle_modal(window, cx, |window, cx| {
-                                RemoteServerProjects::new(create_new_window, fs, window, weak, cx)
+                                RemoteServerProjects::new(fs, window, weak, cx)
                             });
                         });
                     };
@@ -1856,7 +1868,6 @@ impl RemoteServerProjects {
                             let weak = cx.entity().downgrade();
                             workspace.toggle_modal(window, cx, |window, cx| {
                                 RemoteServerProjects::project_picker(
-                                    create_new_window,
                                     index,
                                     connection_options,
                                     project,
@@ -1914,6 +1925,9 @@ impl RemoteServerProjects {
 
     fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
         match &self.mode {
+            _ if self.connect_ssh_host_only => {
+                cx.emit(DismissEvent);
+            }
             Mode::Default => {
                 cx.emit(DismissEvent);
             }
@@ -1975,15 +1989,12 @@ impl RemoteServerProjects {
         });
     }
 
-    /// Opens a saved remote project, mirroring whether a new window should be
-    /// created based on the modal's `create_new_window` preference and whether
-    /// the confirm was a secondary (platform-modifier) confirm.
-    fn open_remote_project_entry(
+    fn open_remote_entry(
         &mut self,
         _index: ServerIndex,
         project: RemoteProject,
         connection: Connection,
-        secondary_confirm: bool,
+        _secondary_confirm: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1994,26 +2005,32 @@ impl RemoteServerProjects {
         else {
             return;
         };
-        let create_new_window = self.create_new_window;
         cx.emit(DismissEvent);
-
-        let replace_window = match (create_new_window, secondary_confirm) {
-            (true, false) | (false, true) => None,
-            (true, true) | (false, false) => window.window_handle().downcast::<MultiWorkspace>(),
-        };
+        let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
 
         cx.spawn_in(window, async move |_, cx| {
-            let result = open_remote_project(
-                connection.into(),
-                project.paths.into_iter().map(PathBuf::from).collect(),
-                app_state,
-                OpenOptions {
-                    requesting_window: replace_window,
-                    ..OpenOptions::default()
-                },
-                cx,
-            )
-            .await;
+            let connection_options = connection.into();
+            let result = if matches!(connection_options, RemoteConnectionOptions::Ssh(_)) {
+                if let Some(host_window) = cx.window_handle().downcast::<MultiWorkspace>() {
+                    crate::connect_ssh_host(connection_options, app_state, host_window, cx).await
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Super Zed requires its existing host window"
+                    ))
+                }
+            } else {
+                open_non_ssh_remote_project(
+                    connection_options,
+                    project.paths.into_iter().map(PathBuf::from).collect(),
+                    app_state,
+                    OpenOptions {
+                        requesting_window,
+                        ..OpenOptions::default()
+                    },
+                    cx,
+                )
+                .await
+            };
             if let Err(e) = result {
                 log::error!("Failed to connect: {e:#}");
                 cx.prompt(
@@ -2291,7 +2308,7 @@ impl RemoteServerProjects {
             let Some(app_state) = app_state.upgrade() else {
                 return;
             };
-            let result = open_remote_project(
+            let result = open_non_ssh_remote_project(
                 Connection::DevContainer(dev_container_connection).into(),
                 vec![starting_dir].into_iter().map(PathBuf::from).collect(),
                 app_state,
@@ -3188,7 +3205,7 @@ mod create_host_tests {
 
         let modal = workspace.update_in(cx, |_workspace, window, cx| {
             let weak = cx.weak_entity();
-            cx.new(|cx| RemoteServerProjects::new(false, fs.clone(), window, weak, cx))
+            cx.new(|cx| RemoteServerProjects::new(fs.clone(), window, weak, cx))
         });
 
         let host_b = SharedString::from("host-b.example");

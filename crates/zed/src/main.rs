@@ -23,21 +23,16 @@ use collab_ui::channel_view::ChannelView;
 use collections::HashMap;
 use crashes::InitCrashHandler;
 use db::kvp::{GlobalKeyValueStore, KeyValueStore};
-use editor::Editor;
 use extension::ExtensionHostProxy;
+use extension_host::ExtensionStore;
 use fs::{Fs, RealFs};
-use futures::{StreamExt, channel::oneshot, future};
+use futures::{FutureExt as _, StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
-use git_ui::clone::clone_and_open;
-use gpui::{
-    App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _, block_on,
-};
+use gpui::{App, AppContext, Application, AsyncApp, TaskExt, UpdateGlobal as _, block_on};
 use gpui_platform;
 
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
-use onboarding::{FIRST_OPEN, show_onboarding_view};
-use project_panel::ProjectPanel;
 use prompt_store::PromptBuilder;
 use remote::RemoteConnectionOptions;
 use reqwest_client::ReqwestClient;
@@ -46,18 +41,16 @@ use assets::Assets;
 use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
 use project::{project_settings::ProjectSettings, trusted_worktrees};
-use recent_projects::{RemoteSettings, open_remote_project};
+use recent_projects::{connect_ssh_host, open_non_ssh_remote_project};
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use session::{AppSession, Session};
 use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
 use smol::future::poll_once;
 use std::{
-    cell::RefCell,
     env,
     io::{self, IsTerminal},
     path::{Path, PathBuf},
     process,
-    rc::Rc,
     sync::{Arc, LazyLock, OnceLock},
     time::Instant,
 };
@@ -65,16 +58,11 @@ use theme::{ActiveTheme, GlobalTheme, ThemeRegistry};
 use theme_settings::load_user_theme;
 use util::{ResultExt, maybe};
 use uuid::Uuid;
-use workspace::{
-    AppState, MultiWorkspace, SerializedWorkspaceLocation, SessionWorkspace, Toast,
-    WorkspaceSettings, WorkspaceStore,
-    notifications::{NotificationId, NotifyResultExt},
-    restore_multiworkspace,
-};
+use workspace::{AppState, WorkspaceSettings, WorkspaceStore, notifications::NotifyResultExt};
 use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
     derive_paths_with_position, edit_prediction_registry, handle_cli_connection,
-    handle_keymap_file_changes, initialize_workspace, open_paths_with_positions,
+    handle_keymap_file_changes, initialize_workspace, open_superzed_paths_with_positions,
 };
 
 use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon_theme};
@@ -120,37 +108,25 @@ fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
         .collect::<Vec<_>>().join("\n\n");
 
     eprintln!("{message}: {error_details}");
-    build_application()
-        .with_quit_mode(QuitMode::Explicit)
-        .run(move |cx| {
-            if let Ok(window) = cx.open_window(gpui::WindowOptions::default(), |_, cx| {
-                cx.new(|_| gpui::Empty)
-            }) {
-                window
-                    .update(cx, |_, window, cx| {
-                        let response = window.prompt(
-                            gpui::PromptLevel::Critical,
-                            message,
-                            Some(&error_details),
-                            &["Exit"],
-                            cx,
-                        );
-
-                        cx.spawn_in(window, async move |_, cx| {
-                            response.await?;
-                            cx.update(|_, cx| cx.quit())
-                        })
-                        .detach_and_log_err(cx);
-                    })
-                    .log_err();
-            } else {
-                fail_to_open_window(anyhow::anyhow!("{message}: {error_details}"), cx)
-            }
-        })
+    process::exit(1);
 }
 
 fn fail_to_open_window_async(e: anyhow::Error, cx: &mut AsyncApp) {
     cx.update(|cx| fail_to_open_window(e, cx));
+}
+
+fn fail_mandatory_host_startup(error: &str) -> ! {
+    eprintln!("Super Zed failed to connect to its mandatory host: {error}");
+    process::exit(1);
+}
+
+pub(crate) fn continue_after_mandatory_host<T>(
+    startup: Result<T>,
+    after_startup: impl FnOnce(T),
+) -> Result<()> {
+    let value = startup?;
+    after_startup(value);
+    Ok(())
 }
 
 fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
@@ -205,6 +181,36 @@ fn main() {
     // args are appended verbatim and would otherwise be misinterpreted as Zed's
     // own arguments.
     sandbox::run_sandbox_launcher_if_invoked();
+
+    if std::env::var_os(remote::EMBEDDED_REMOTE_SERVER_ENV).is_some() {
+        if let Ok(data_dir) = std::env::var(remote::EMBEDDED_REMOTE_SERVER_DATA_DIR_ENV) {
+            paths::set_custom_data_dir(&data_dir);
+        }
+
+        #[derive(Parser)]
+        struct EmbeddedRemoteServerArgs {
+            #[command(subcommand)]
+            command: remote_server::Commands,
+        }
+
+        let args = EmbeddedRemoteServerArgs::parse();
+        if matches!(&args.command, remote_server::Commands::Run { .. }) {
+            // The daemon launches this executable for helpers such as `--printenv`; those
+            // children must enter the normal CLI path instead of recursively acting as servers.
+            unsafe {
+                std::env::remove_var(remote::EMBEDDED_REMOTE_SERVER_ENV);
+                std::env::remove_var(remote::EMBEDDED_REMOTE_SERVER_DATA_DIR_ENV);
+            }
+        }
+        if let Err(error) = remote_server::run(args.command) {
+            eprintln!("{error:#}");
+            let exit_code = error
+                .downcast_ref::<remote_server::ExecuteProxyError>()
+                .map_or(1, remote_server::ExecuteProxyError::to_exit_code);
+            process::exit(exit_code);
+        }
+        return;
+    }
 
     #[cfg(unix)]
     util::prevent_root_execution();
@@ -499,7 +505,6 @@ fn main() {
         settings::init(cx);
         zlog_settings::init(cx);
         zed::watch_settings_files(fs.clone(), cx);
-        handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
 
         let user_agent = format!(
             "Zed/{} ({}; {})",
@@ -787,6 +792,9 @@ fn main() {
         #[cfg(target_os = "windows")]
         etw_tracing::init(cx);
 
+        zed::validate_product_keymaps(cx).expect("product keymaps must load after action setup");
+        handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
+
         cx.observe_global::<SettingsStore>({
             let http = app_state.client.http_client();
             let client = app_state.client.clone();
@@ -871,8 +879,6 @@ fn main() {
 
         initialize_workspace(app_state.clone(), cx);
 
-        cx.activate(true);
-
         cx.spawn({
             let client = app_state.client.clone();
             async move |cx| authenticate(client, cx).await
@@ -921,38 +927,45 @@ fn main() {
             )
         };
 
-        let restore_task = match open_rx
+        let initial_request = open_rx
             .try_recv()
             .ok()
-            .and_then(|request| OpenRequest::parse(request, cx).log_err())
-        {
-            Some(request) if request.is_focus_app_only() => cx.spawn({
+            .and_then(|request| OpenRequest::parse(request, cx).log_err());
+        let restore_task = cx
+            .spawn({
                 let app_state = app_state.clone();
                 async move |cx| {
-                    if let Err(e) = restore_or_create_workspace(app_state, cx).await {
-                        fail_to_open_window_async(e, cx)
-                    }
+                    let result = restore_or_create_workspace(app_state.clone(), cx).await;
+                    continue_after_mandatory_host(result, |()| {
+                        if let Some(request) = initial_request
+                            && !request.is_focus_app_only()
+                        {
+                            cx.update(|cx| handle_open_request(request, app_state, cx));
+                        }
+                    })
+                    .map_err(|error| Arc::<str>::from(format!("{error:#}")))
                 }
-            }),
-            Some(request) => {
-                handle_open_request(request, app_state.clone(), cx);
-                Task::ready(())
+            })
+            .shared();
+
+        cx.spawn({
+            let restore_task = restore_task.clone();
+            async move |_cx| {
+                if let Err(error) = restore_task.await {
+                    fail_mandatory_host_startup(&error);
+                }
             }
-            None => cx.spawn({
-                let app_state = app_state.clone();
-                async move |cx| {
-                    if let Err(e) = restore_or_create_workspace(app_state, cx).await {
-                        fail_to_open_window_async(e, cx)
-                    }
-                }
-            }),
-        };
+        })
+        .detach();
 
         cx.spawn({
             let db = workspace::WorkspaceDb::global(cx);
             let fs = app_state.fs.clone();
+            let restore_task = restore_task.clone();
             async move |_cx| {
-                restore_task.await;
+                if restore_task.await.is_err() {
+                    return Ok(());
+                }
                 db.garbage_collect_workspaces(
                     fs.as_ref(),
                     &current_session_id,
@@ -968,6 +981,9 @@ fn main() {
         component_preview::init(app_state.clone(), cx);
 
         cx.spawn(async move |cx| {
+            if restore_task.await.is_err() {
+                return;
+            }
             while let Some(urls) = open_rx.next().await {
                 cx.update(|cx| {
                     if let Some(request) = OpenRequest::parse(urls, cx).log_err() {
@@ -1068,7 +1084,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 cx.perform_dock_menu_action(index);
             }
             OpenRequestKind::BuiltinJsonSchema { schema_path } => {
-                workspace::with_active_or_new_workspace(cx, |_workspace, window, cx| {
+                workspace::with_active_workspace(cx, |_workspace, window, cx| {
                     cx.spawn_in(window, async move |workspace, cx| {
                         let res = async move {
                             let json = app_state.languages.language_for_name("JSONC").await.ok();
@@ -1123,7 +1139,8 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                         res.context("Failed to open builtin JSON Schema").log_err();
                     })
                     .detach();
-                });
+                })
+                .log_err();
             }
             OpenRequestKind::Setting { setting_path } => {
                 // zed://settings/languages/$(language)/tab_size  - DONT SUPPORT
@@ -1148,50 +1165,22 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 .detach_and_log_err(cx);
             }
             OpenRequestKind::GitClone { repo_url } => {
-                workspace::with_active_or_new_workspace(cx, |_workspace, window, cx| {
-                    if window.is_window_active() {
-                        clone_and_open(
-                            repo_url,
-                            cx.weak_entity(),
-                            window,
-                            cx,
-                            Arc::new(|workspace: &mut workspace::Workspace, window, cx| {
-                                workspace.focus_panel::<ProjectPanel>(window, cx);
-                            }),
-                        );
-                        return;
-                    }
-
-                    let subscription = Rc::new(RefCell::new(None));
-                    subscription.replace(Some(cx.observe_in(&cx.entity(), window, {
-                        let subscription = subscription.clone();
-                        let repo_url = repo_url;
-                        move |_, workspace_entity, window, cx| {
-                            if window.is_window_active() && subscription.take().is_some() {
-                                clone_and_open(
-                                    repo_url.clone(),
-                                    workspace_entity.downgrade(),
-                                    window,
-                                    cx,
-                                    Arc::new(|workspace: &mut workspace::Workspace, window, cx| {
-                                        workspace.focus_panel::<ProjectPanel>(window, cx);
-                                    }),
-                                );
-                            }
-                        }
-                    })));
-                });
+                log::error!(
+                    "cannot open git clone link for {repo_url}: host-side clone is not implemented"
+                );
             }
             OpenRequestKind::GitCommit { sha } => {
                 let base_open_options = zed::open_options_for_request(
                     request.open_behavior,
-                    &workspace::SerializedWorkspaceLocation::Local,
+                    &workspace::SerializedWorkspaceLocation::Remote(
+                        RemoteConnectionOptions::Local(remote::LocalConnectionOptions),
+                    ),
                     cx,
                 );
                 cx.spawn(async move |cx| {
                     let paths_with_position =
                         derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
-                    let (workspace, _results) = open_paths_with_positions(
+                    let (workspace, _results) = open_superzed_paths_with_positions(
                         &paths_with_position,
                         &[],
                         false,
@@ -1241,9 +1230,33 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
         let open_behavior = request.open_behavior;
         let location = workspace::SerializedWorkspaceLocation::Remote(connection_options.clone());
         let base_open_options = zed::open_options_for_request(open_behavior, &location, cx);
+        let host_window = base_open_options.requesting_window.or_else(|| {
+            cx.windows().into_iter().find_map(|window| {
+                let window = window.downcast::<workspace::MultiWorkspace>()?;
+                window
+                    .read(cx)
+                    .ok()?
+                    .host_session()
+                    .is_some()
+                    .then_some(window)
+            })
+        });
         cx.spawn(async move |cx| {
             let paths: Vec<PathBuf> = request.open_paths.into_iter().map(PathBuf::from).collect();
-            open_remote_project(connection_options, paths, app_state, base_open_options, cx).await
+            if matches!(connection_options, RemoteConnectionOptions::Ssh(_)) {
+                let host_window =
+                    host_window.context("Super Zed requires its existing host window")?;
+                connect_ssh_host(connection_options, app_state, host_window, cx).await
+            } else {
+                open_non_ssh_remote_project(
+                    connection_options,
+                    paths,
+                    app_state,
+                    base_open_options,
+                    cx,
+                )
+                .await
+            }
         })
         .detach_and_log_err(cx);
         return;
@@ -1255,13 +1268,15 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
         let app_state = app_state.clone();
         let base_open_options = zed::open_options_for_request(
             request.open_behavior,
-            &workspace::SerializedWorkspaceLocation::Local,
+            &workspace::SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Local(
+                remote::LocalConnectionOptions,
+            )),
             cx,
         );
         task = Some(cx.spawn(async move |cx| {
             let paths_with_position =
                 derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
-            let (_window, results) = open_paths_with_positions(
+            let (_window, results) = open_superzed_paths_with_positions(
                 &paths_with_position,
                 &request.diff_paths,
                 request.diff_all,
@@ -1400,238 +1415,24 @@ pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    let kvp = cx.update(|cx| KeyValueStore::global(cx));
-    if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
-        let mut error_count = 0;
-        for multi_workspace in multi_workspaces {
-            let result = match &multi_workspace.active_workspace.location {
-                SerializedWorkspaceLocation::Local => {
-                    restore_multiworkspace(multi_workspace, app_state.clone(), cx)
-                        .await
-                        .map(|_| ())
-                }
-                SerializedWorkspaceLocation::Remote(connection_options) => {
-                    let mut connection_options = connection_options.clone();
-                    if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
-                        cx.update(|cx| {
-                            RemoteSettings::get_global(cx)
-                                .fill_connection_options_from_settings(options)
-                        });
-                    }
-
-                    let paths = multi_workspace
-                        .active_workspace
-                        .paths
-                        .paths()
-                        .iter()
-                        .map(PathBuf::from)
-                        .collect::<Vec<_>>();
-                    let state = multi_workspace.state.clone();
-                    async {
-                        let window = open_remote_project(
-                            connection_options,
-                            paths,
-                            app_state.clone(),
-                            workspace::OpenOptions::default(),
-                            cx,
-                        )
-                        .await?;
-                        workspace::apply_restored_multiworkspace_state(
-                            window,
-                            &state,
-                            app_state.fs.clone(),
-                            cx,
-                        )
-                        .await;
-                        Ok::<(), anyhow::Error>(())
-                    }
-                    .await
-                }
-            };
-
-            if let Err(error) = result {
-                log::error!("Failed to restore workspace: {error:#}");
-                error_count += 1;
+    let window = workspace::open_superzed_host(
+        RemoteConnectionOptions::Local(remote::LocalConnectionOptions),
+        Arc::new(remote::LocalRemoteClientDelegate),
+        app_state,
+        cx,
+    )
+    .await?;
+    window.update(cx, |multi_workspace, _, cx| {
+        let workspace = multi_workspace.workspace().clone();
+        workspace.update(cx, |workspace, cx| {
+            if let Some(client) = workspace.project().read(cx).remote_client()
+                && let Some(extension_store) = ExtensionStore::try_global(cx)
+            {
+                extension_store.update(cx, |store, cx| store.register_remote_client(client, cx));
             }
-        }
-
-        if error_count > 0 {
-            let message = if error_count == 1 {
-                "Failed to restore 1 workspace. Check logs for details.".to_string()
-            } else {
-                format!(
-                    "Failed to restore {} workspaces. Check logs for details.",
-                    error_count
-                )
-            };
-
-            // Try to find an active workspace to show the toast
-            let toast_shown = cx.update(|cx| {
-                if let Some(window) = cx.active_window()
-                    && let Some(multi_workspace) = window.downcast::<MultiWorkspace>()
-                {
-                    multi_workspace
-                        .update(cx, |multi_workspace, _, cx| {
-                            multi_workspace.workspace().update(cx, |workspace, cx| {
-                                workspace.show_toast(
-                                    Toast::new(NotificationId::unique::<()>(), message.clone()),
-                                    cx,
-                                )
-                            });
-                        })
-                        .ok();
-                    return true;
-                }
-                false
-            });
-
-            // If we couldn't show a toast (no windows opened successfully),
-            // open a fallback empty workspace and show the error there
-            if !toast_shown {
-                log::error!("All workspace restorations failed. Opening fallback empty workspace.");
-                cx.update(|cx| {
-                    workspace::open_new(
-                        Default::default(),
-                        app_state.clone(),
-                        cx,
-                        |workspace, _window, cx| {
-                            workspace.show_toast(
-                                Toast::new(NotificationId::unique::<()>(), message),
-                                cx,
-                            );
-                        },
-                    )
-                })
-                .await?;
-            }
-        }
-
-        // If the user cancelled a failed remote connection at startup,
-        // open_remote_project returns Ok but removes the window, so error_count
-        // stays 0 and the toast fallback above does not trigger. Without this
-        // check, Zed would exit silently.
-        if cx.update(|cx| cx.windows().is_empty()) {
-            cx.update(|cx| {
-                workspace::open_new(
-                    Default::default(),
-                    app_state.clone(),
-                    cx,
-                    |workspace, window, cx| {
-                        let restore_on_startup =
-                            WorkspaceSettings::get_global(cx).restore_on_startup;
-                        match restore_on_startup {
-                            workspace::RestoreOnStartupBehavior::Launchpad => {}
-                            _ => {
-                                Editor::new_file(workspace, &Default::default(), window, cx);
-                            }
-                        }
-                    },
-                )
-            })
-            .await?;
-        }
-    } else if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
-        cx.update(|cx| show_onboarding_view(app_state, cx)).await?;
-    } else {
-        cx.update(|cx| {
-            workspace::open_new(
-                Default::default(),
-                app_state,
-                cx,
-                |workspace, window, cx| {
-                    let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
-                    match restore_on_startup {
-                        workspace::RestoreOnStartupBehavior::Launchpad => {}
-                        _ => {
-                            Editor::new_file(workspace, &Default::default(), window, cx);
-                        }
-                    }
-                },
-            )
-        })
-        .await?;
-    }
-
+        });
+    })?;
     Ok(())
-}
-
-async fn restorable_workspaces(
-    cx: &mut AsyncApp,
-    app_state: &Arc<AppState>,
-) -> Option<Vec<workspace::SerializedMultiWorkspace>> {
-    let locations = restorable_workspace_locations(cx, app_state).await?;
-    Some(cx.update(|cx| workspace::read_serialized_multi_workspaces(locations, cx)))
-}
-
-pub(crate) async fn restorable_workspace_locations(
-    cx: &mut AsyncApp,
-    app_state: &Arc<AppState>,
-) -> Option<Vec<SessionWorkspace>> {
-    let (mut restore_behavior, db) = cx.update(|cx| {
-        (
-            WorkspaceSettings::get(None, cx).restore_on_startup,
-            workspace::WorkspaceDb::global(cx),
-        )
-    });
-
-    let session_handle = app_state.session.clone();
-    let (last_session_id, last_session_window_stack) = cx.update(|cx| {
-        let session = session_handle.read(cx);
-
-        (
-            session.last_session_id().map(|id| id.to_string()),
-            session.last_session_window_stack(),
-        )
-    });
-
-    if last_session_id.is_none()
-        && matches!(
-            restore_behavior,
-            workspace::RestoreOnStartupBehavior::LastSession
-        )
-    {
-        restore_behavior = workspace::RestoreOnStartupBehavior::LastWorkspace;
-    }
-
-    match restore_behavior {
-        workspace::RestoreOnStartupBehavior::LastWorkspace => {
-            workspace::last_opened_workspace_location(&db, app_state.fs.as_ref())
-                .await
-                .map(|(workspace_id, location, paths)| {
-                    vec![SessionWorkspace {
-                        workspace_id,
-                        location,
-                        paths,
-                        window_id: None,
-                    }]
-                })
-        }
-        workspace::RestoreOnStartupBehavior::LastSession => {
-            if let Some(last_session_id) = last_session_id {
-                let ordered = last_session_window_stack.is_some();
-
-                let mut locations = workspace::last_session_workspace_locations(
-                    &db,
-                    &last_session_id,
-                    last_session_window_stack,
-                    app_state.fs.as_ref(),
-                )
-                .await
-                .filter(|locations| !locations.is_empty());
-
-                // Since last_session_window_order returns the windows ordered front-to-back
-                // we need to open the window that was frontmost last.
-                if ordered && let Some(locations) = locations.as_mut() {
-                    locations.reverse();
-                }
-
-                locations
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
 }
 
 fn init_paths() -> HashMap<io::ErrorKind, Vec<&'static Path>> {
@@ -1665,7 +1466,7 @@ fn stdout_is_a_pty() -> bool {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "zed", disable_version_flag = true, max_term_width = 100)]
+#[command(name = "superzed", disable_version_flag = true, max_term_width = 100)]
 struct Args {
     /// A sequence of space-separated paths or urls that you want to open.
     ///

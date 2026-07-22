@@ -7,7 +7,7 @@ use workspace::{
     ModalView, MultiWorkspace, OpenOptions, Workspace, notifications::DetachAndPromptErr,
 };
 
-use crate::open_remote_project;
+use crate::{connect_ssh_host, open_non_ssh_remote_project};
 
 enum Host {
     CollabGuestProject,
@@ -120,17 +120,21 @@ impl DisconnectedOverlay {
             .collect();
 
         cx.spawn_in(window, async move |_, cx| {
-            open_remote_project(
-                connection_options,
-                paths,
-                app_state,
-                OpenOptions {
-                    requesting_window: Some(window_handle),
-                    ..Default::default()
-                },
-                cx,
-            )
-            .await?;
+            if matches!(connection_options, RemoteConnectionOptions::Ssh(_)) {
+                connect_ssh_host(connection_options, app_state, window_handle, cx).await?;
+            } else {
+                open_non_ssh_remote_project(
+                    connection_options,
+                    paths,
+                    app_state,
+                    OpenOptions {
+                        requesting_window: Some(window_handle),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+                .await?;
+            }
             Ok(())
         })
         .detach_and_prompt_err("Failed to reconnect", window, cx, |_, _, _| None);

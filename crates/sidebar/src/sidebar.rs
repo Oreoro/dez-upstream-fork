@@ -55,9 +55,9 @@ use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
-    HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    HighlightedLabel, KeyBinding, ListItem, PopoverMenu, PopoverMenuHandle, ProjectEmptyState,
+    ScrollAxes, Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip,
+    WithScrollbar, prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -66,7 +66,8 @@ use workspace::{
     CloseWindow, FocusWorkspaceSidebar, MultiWorkspace, MultiWorkspaceEvent, NextProject,
     NextThread, Open, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey, SaveIntent,
     Sidebar as WorkspaceSidebar, SidebarSide, Toast, ToggleWorkspaceSidebar, Workspace,
-    notifications::NotificationId, sidebar_side_context_menu,
+    notifications::{DetachAndPromptErr as _, NotificationId},
+    sidebar_side_context_menu,
 };
 
 use git_ui::worktree_service::{RemoteBranchName, worktree_create_targets};
@@ -2815,12 +2816,6 @@ impl Sidebar {
         let multi_workspace = self.multi_workspace.clone();
         let project_group_key = project_group_key.clone();
 
-        let show_multi_project_entries = multi_workspace
-            .read_with(cx, |mw, _| {
-                project_group_key.host().is_none() && mw.project_group_keys().len() >= 2
-            })
-            .unwrap_or(false);
-
         let this = cx.weak_entity();
 
         let trigger_id = SharedString::from(format!("{id_prefix}-ellipsis-menu-{ix}"));
@@ -2893,30 +2888,6 @@ impl Sidebar {
                     ContextMenu::build_persistent(window, cx, move |menu, _window, menu_cx| {
                         let menu = menu.end_slot_action(Box::new(menu::SecondaryConfirm));
                         let weak_menu = menu_cx.weak_entity();
-
-                        let menu = menu.when(show_multi_project_entries, |this| {
-                            this.entry(
-                                "Open Project in New Window",
-                                Some(Box::new(workspace::MoveProjectToNewWindow)),
-                                {
-                                    let project_group_key = project_group_key.clone();
-                                    let multi_workspace = multi_workspace.clone();
-                                    move |window, cx| {
-                                        multi_workspace
-                                            .update(cx, |multi_workspace, cx| {
-                                                multi_workspace
-                                                    .open_project_group_in_new_window(
-                                                        &project_group_key,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                    .detach_and_log_err(cx);
-                                            })
-                                            .ok();
-                                    }
-                                },
-                            )
-                        });
 
                         let menu = menu
                             .custom_entry(
@@ -6767,7 +6738,7 @@ impl Sidebar {
                 IconButton::new("open-project", IconName::FolderAdd)
                     .icon_size(IconSize::Small)
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent)),
-                |_window, cx| Tooltip::for_action("Add Project", &OpenRecent::default(), cx),
+                |_window, cx| Tooltip::for_action("Add Project", &OpenRecent, cx),
             )
             .offset(gpui::Point {
                 x: px(-2.0),
@@ -7453,7 +7424,7 @@ impl Sidebar {
         ProjectEmptyState::new(
             "Threads Sidebar",
             self.focus_handle(cx),
-            KeyBinding::for_action(&workspace::Open::default(), cx),
+            KeyBinding::for_action(&workspace::Open, cx),
         )
         .on_open_project(|_, window, cx| {
             let side = match AgentSettings::get_global(cx).sidebar_side() {
@@ -7461,13 +7432,7 @@ impl Sidebar {
                 SidebarSide::Right => "right",
             };
             telemetry::event!("Sidebar Add Project Clicked", side = side);
-            window.dispatch_action(
-                Open {
-                    create_new_window: Some(false),
-                }
-                .boxed_clone(),
-                cx,
-            );
+            window.dispatch_action(Open.boxed_clone(), cx);
         })
         .on_clone_repo(|_, window, cx| {
             window.dispatch_action(git::Clone.boxed_clone(), cx);
@@ -7546,6 +7511,199 @@ impl Sidebar {
             .when(right_window_controls, |this| {
                 this.children(Self::render_right_window_controls(window, cx))
             })
+    }
+
+    fn superzed_workspace_label(identity: &workspace::HostWorkspaceIdentity) -> SharedString {
+        let stable_id = identity.workspace_id.as_uuid().simple().to_string();
+        let short_id = stable_id.get(..8).unwrap_or(stable_id.as_str());
+        format!("Workspace {short_id}").into()
+    }
+
+    fn render_superzed_workspace_switcher(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let multi_workspace = self.multi_workspace.upgrade()?;
+        let host_window = window.window_handle().downcast::<MultiWorkspace>()?;
+        let (host_sessions, active_workspace, workspaces) = {
+            let multi_workspace = multi_workspace.read(cx);
+            let host_sessions = multi_workspace.host_sessions().to_vec();
+            let workspaces = multi_workspace
+                .workspaces()
+                .filter_map(|workspace| {
+                    Some((
+                        workspace.clone(),
+                        workspace.read(cx).host_workspace_identity()?.clone(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            (
+                host_sessions,
+                multi_workspace.workspace().clone(),
+                workspaces,
+            )
+        };
+        if host_sessions.is_empty() || workspaces.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .id("superzed-workspaces")
+                .py_1()
+                .border_b_1()
+                .border_color(cx.theme().colors().border)
+                .children(host_sessions.into_iter().map(|host_session| {
+                    let host_id = host_session.read(cx).host_id().clone();
+                    let host_workspaces = workspaces
+                        .iter()
+                        .filter(|(_, identity)| identity.host_id == host_id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let create_host_session = host_session.clone();
+                    let create_window = host_window;
+                    let active_workspace = active_workspace.clone();
+                    let display_name = host_session.read(cx).display_name().to_owned();
+                    let status_color = match host_session.read(cx).connection_state(cx) {
+                        remote::ConnectionState::Connected => Color::Success,
+                        remote::ConnectionState::Connecting
+                        | remote::ConnectionState::HeartbeatMissed
+                        | remote::ConnectionState::Reconnecting => Color::Warning,
+                        remote::ConnectionState::Disconnected => Color::Muted,
+                    };
+                    v_flex()
+                        .child(
+                            h_flex()
+                                .h_7()
+                                .px_2()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            Icon::new(IconName::Circle)
+                                                .size(IconSize::XSmall)
+                                                .color(status_color),
+                                        )
+                                        .child(
+                                            Label::new(display_name)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .debug_selector(|| "SUPERZED_NEW_WORKSPACE".to_string())
+                                        .child(
+                                            IconButton::new(
+                                                format!("new-superzed-workspace-{host_id:?}"),
+                                                IconName::Plus,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(Tooltip::text("New workspace"))
+                                            .on_click(move |_, window, cx| {
+                                                workspace::HostSessionClient::create_workspace(
+                                                    &create_host_session,
+                                                    create_window,
+                                                    Default::default(),
+                                                    cx,
+                                                )
+                                                .detach_and_prompt_err(
+                                                    "Failed to create workspace",
+                                                    window,
+                                                    cx,
+                                                    |_, _, _| None,
+                                                );
+                                            }),
+                                        ),
+                                ),
+                        )
+                        .children(host_workspaces.into_iter().map(
+                            move |(workspace, identity)| {
+                                let is_active = workspace == active_workspace;
+                                let workspace_id = identity.workspace_id;
+                                let activate_host_session = host_session.clone();
+                                let close_host_session = host_session.clone();
+                                let activate_window = host_window;
+                                let close_window = activate_window;
+                                let label = Self::superzed_workspace_label(&identity);
+                                let element_id = workspace_id.as_uuid().simple().to_string();
+                                let close_element_id = element_id.clone();
+                                let numeric_element_id = workspace_id.as_uuid().as_u128() as u64;
+                                div()
+                                    .debug_selector(move || {
+                                        format!("SUPERZED_WORKSPACE-{element_id}")
+                                    })
+                                    .child(
+                                        ListItem::new((
+                                            "superzed-workspace",
+                                            numeric_element_id,
+                                        ))
+                                        .inset(true)
+                                        .toggle_state(is_active)
+                                        .aria_label(label.clone())
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .justify_between()
+                                                .child(Label::new(label).size(LabelSize::Small))
+                                                .child(
+                                                    div()
+                                                        .debug_selector(move || {
+                                                            format!(
+                                                                "SUPERZED_CLOSE_WORKSPACE-{close_element_id}"
+                                                            )
+                                                        })
+                                                        .child(
+                                                            IconButton::new(
+                                                                (
+                                                                    "close-superzed-workspace",
+                                                                    numeric_element_id,
+                                                                ),
+                                                                IconName::Close,
+                                                            )
+                                                            .icon_size(IconSize::Small)
+                                                            .tooltip(Tooltip::text(
+                                                                "Close workspace",
+                                                            ))
+                                                            .on_click(move |_, window, cx| {
+                                                                cx.stop_propagation();
+                                                                workspace::HostSessionClient::close_workspace(
+                                                                    &close_host_session,
+                                                                    close_window,
+                                                                    workspace_id,
+                                                                    cx,
+                                                                )
+                                                                .detach_and_prompt_err(
+                                                                    "Failed to close workspace",
+                                                                    window,
+                                                                    cx,
+                                                                    |_, _, _| None,
+                                                                );
+                                                            }),
+                                                        ),
+                                                ),
+                                        )
+                                        .on_click(move |_, window, cx| {
+                                            workspace::HostSessionClient::activate_workspace(
+                                                &activate_host_session,
+                                                activate_window,
+                                                workspace_id,
+                                                cx,
+                                            )
+                                            .detach_and_prompt_err(
+                                                "Failed to activate workspace",
+                                                window,
+                                                cx,
+                                                |_, _, _| None,
+                                            );
+                                        }),
+                                    )
+                            },
+                        ))
+                }))
+                .into_any_element(),
+        )
     }
 
     fn render_left_window_controls(window: &Window, cx: &mut App) -> Option<AnyElement> {
@@ -8035,13 +8193,14 @@ impl Render for Sidebar {
         let _titlebar_height = ui::utils::platform_title_bar_height(window);
         let ui_font = theme_settings::setup_ui_font(window, cx);
         let sticky_header = self.render_sticky_header(window, cx);
+        let workspace_switcher = self.render_superzed_workspace_switcher(window, cx);
 
         let color = cx.theme().colors();
         let bg = color
             .title_bar_background
             .blend(color.panel_background.opacity(0.25));
 
-        let no_open_projects = !self.contents.has_open_projects;
+        let no_open_projects = !self.contents.has_open_projects && workspace_switcher.is_none();
         let no_search_results = self.contents.entries.is_empty();
 
         v_flex()
@@ -8085,6 +8244,7 @@ impl Render for Sidebar {
             .map(|this| match &self.view {
                 SidebarView::ThreadList => this
                     .child(self.render_sidebar_header(no_open_projects, window, cx))
+                    .children(workspace_switcher)
                     .map(|this| {
                         if no_open_projects {
                             this.child(self.render_empty_state(cx))

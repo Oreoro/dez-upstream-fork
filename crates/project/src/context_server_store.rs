@@ -12,12 +12,13 @@ use context_server::transport::HttpTransport;
 use context_server::{ContextServer, ContextServerCommand, ContextServerId};
 use credentials_provider::CredentialsProvider;
 use futures::future::Either;
-use futures::{FutureExt as _, StreamExt as _, future::join_all};
+use futures::{FutureExt as _, StreamExt as _, future::Shared, future::join_all};
 use gpui::{
     App, AsyncApp, Context, Entity, EventEmitter, Subscription, Task, TaskExt, WeakEntity, actions,
 };
 use http_client::HttpClient;
 use itertools::Itertools;
+use parking_lot::Mutex;
 use rand::Rng as _;
 use registry::ContextServerDescriptorRegistry;
 use remote::{Interactive, RemoteClient};
@@ -156,7 +157,7 @@ impl ContextServerState {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContextServerConfiguration {
     Custom {
         command: ContextServerCommand,
@@ -201,13 +202,13 @@ impl ContextServerConfiguration {
         }
     }
 
-    pub async fn from_settings(
+    async fn from_settings(
         settings: ContextServerSettings,
         id: ContextServerId,
         registry: Entity<ContextServerDescriptorRegistry>,
-        worktree_store: Entity<WorktreeStore>,
+        project_context: Option<Entity<WorktreeStore>>,
         cx: &AsyncApp,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>> {
         const EXTENSION_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
         match settings {
@@ -215,36 +216,33 @@ impl ContextServerConfiguration {
                 enabled: _,
                 command,
                 remote,
-            } => Some(ContextServerConfiguration::Custom { command, remote }),
+            } => Ok(Some(ContextServerConfiguration::Custom { command, remote })),
             ContextServerSettings::Extension {
                 enabled: _,
                 settings,
                 remote,
             } => {
-                let descriptor =
-                    cx.update(|cx| registry.read(cx).context_server_descriptor(&id.0))?;
+                let Some(descriptor) =
+                    cx.update(|cx| registry.read(cx).context_server_descriptor(&id.0))
+                else {
+                    return Ok(None);
+                };
 
-                let command_future = descriptor.command(worktree_store, cx);
+                let command_future = descriptor.command(project_context, cx);
                 let timeout_future = cx.background_executor().timer(EXTENSION_COMMAND_TIMEOUT);
 
                 match futures::future::select(command_future, timeout_future).await {
-                    Either::Left((Ok(command), _)) => Some(ContextServerConfiguration::Extension {
-                        command,
-                        settings,
-                        remote,
-                    }),
-                    Either::Left((Err(e), _)) => {
-                        log::error!(
-                            "Failed to create context server configuration from settings: {e:#}"
-                        );
-                        None
+                    Either::Left((Ok(command), _)) => {
+                        Ok(Some(ContextServerConfiguration::Extension {
+                            command,
+                            settings,
+                            remote,
+                        }))
                     }
-                    Either::Right(_) => {
-                        log::error!(
-                            "Timed out resolving command for extension context server {id}"
-                        );
-                        None
-                    }
+                    Either::Left((Err(error), _)) => Err(error),
+                    Either::Right(_) => anyhow::bail!(
+                        "timed out resolving command for extension context server {id}"
+                    ),
                 }
             }
             ContextServerSettings::Http {
@@ -254,14 +252,191 @@ impl ContextServerConfiguration {
                 timeout,
                 oauth,
             } => {
-                let url = url::Url::parse(&url).log_err()?;
-                Some(ContextServerConfiguration::Http {
+                let url = url::Url::parse(&url)?;
+                Ok(Some(ContextServerConfiguration::Http {
                     url,
                     headers: auth,
                     timeout,
                     oauth,
-                })
+                }))
             }
+        }
+    }
+}
+
+type SharedContextServerConfiguration =
+    Shared<Task<Result<Option<Arc<ContextServerConfiguration>>, Arc<anyhow::Error>>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ContextServerDefinitionKey {
+    id: Arc<str>,
+    settings: Arc<str>,
+    registry_revision: u64,
+    project_scope: Option<Vec<WorktreeId>>,
+}
+
+#[derive(Clone)]
+struct ResolvedContextServerConfiguration {
+    key: ContextServerDefinitionKey,
+    configuration: Arc<ContextServerConfiguration>,
+}
+
+#[derive(Clone)]
+enum HostContextServerRuntimeStatus {
+    Running,
+    Error(Arc<str>),
+}
+
+struct HostContextServerRuntime {
+    server: Arc<ContextServer>,
+    configuration: Arc<ContextServerConfiguration>,
+    status: HostContextServerRuntimeStatus,
+}
+
+type SharedHostContextServerRuntime =
+    Shared<Task<Result<Arc<HostContextServerRuntime>, Arc<anyhow::Error>>>>;
+
+struct HostContextServerRuntimeEntry {
+    runtime: SharedHostContextServerRuntime,
+    users: usize,
+}
+
+#[derive(Clone)]
+pub struct HostContextServerRegistry {
+    configurations:
+        Arc<Mutex<HashMap<ContextServerDefinitionKey, SharedContextServerConfiguration>>>,
+    runtimes: Arc<Mutex<HashMap<ContextServerDefinitionKey, HostContextServerRuntimeEntry>>>,
+    share_runtimes: bool,
+}
+
+impl Default for HostContextServerRegistry {
+    fn default() -> Self {
+        Self {
+            configurations: Default::default(),
+            runtimes: Default::default(),
+            share_runtimes: true,
+        }
+    }
+}
+
+impl HostContextServerRegistry {
+    #[cfg(feature = "test-support")]
+    pub fn without_shared_runtimes_for_test() -> Self {
+        Self {
+            share_runtimes: false,
+            ..Default::default()
+        }
+    }
+
+    fn share_runtimes(&self) -> bool {
+        self.share_runtimes
+    }
+
+    async fn resolve_configuration(
+        &self,
+        id: ContextServerId,
+        settings_entry: ContextServerSettingsEntry,
+        registry: Entity<ContextServerDescriptorRegistry>,
+        worktree_store: Entity<WorktreeStore>,
+        cx: &AsyncApp,
+    ) -> Option<ResolvedContextServerConfiguration> {
+        let registry_revision =
+            registry.read_with(cx, |registry, _| registry.descriptor_revision(&id.0));
+        let settings = match serde_json::to_string(&settings_entry.settings) {
+            Ok(settings) => settings,
+            Err(error) => {
+                log::error!("Failed to serialize context server configuration for {id}: {error:#}");
+                return None;
+            }
+        };
+        let project_scope = settings_entry.worktree_id.map(|_| {
+            worktree_store.read_with(cx, |worktree_store, cx| {
+                let mut worktree_ids = worktree_store
+                    .visible_worktrees(cx)
+                    .map(|worktree| worktree.read(cx).id())
+                    .collect::<Vec<_>>();
+                worktree_ids.sort_unstable();
+                worktree_ids
+            })
+        });
+        let project_context = project_scope.is_some().then_some(worktree_store);
+        let key = ContextServerDefinitionKey {
+            id: id.0.clone(),
+            settings: settings.into(),
+            registry_revision,
+            project_scope,
+        };
+        let configuration = self
+            .configurations
+            .lock()
+            .entry(key.clone())
+            .or_insert_with(|| {
+                cx.spawn(async move |cx| {
+                    match ContextServerConfiguration::from_settings(
+                        settings_entry.settings,
+                        id,
+                        registry,
+                        project_context,
+                        cx,
+                    )
+                    .await
+                    {
+                        Ok(configuration) => Ok(configuration.map(Arc::new)),
+                        Err(error) => {
+                            log::error!(
+                                "Failed to create context server configuration from settings: {error:#}"
+                            );
+                            Err(Arc::new(error))
+                        }
+                    }
+                })
+                .shared()
+            })
+            .clone();
+        configuration
+            .await
+            .ok()
+            .flatten()
+            .map(|configuration| ResolvedContextServerConfiguration { key, configuration })
+    }
+
+    fn acquire_runtime(
+        &self,
+        key: ContextServerDefinitionKey,
+        create: impl FnOnce() -> SharedHostContextServerRuntime,
+    ) -> SharedHostContextServerRuntime {
+        self.runtimes
+            .lock()
+            .entry(key)
+            .and_modify(|runtime| runtime.users += 1)
+            .or_insert_with(|| HostContextServerRuntimeEntry {
+                runtime: create(),
+                users: 1,
+            })
+            .runtime
+            .clone()
+    }
+
+    fn release_runtime(&self, key: &ContextServerDefinitionKey, cx: &mut App) {
+        let runtime = {
+            let mut runtimes = self.runtimes.lock();
+            let Some(entry) = runtimes.get_mut(key) else {
+                return;
+            };
+            if entry.users > 1 {
+                entry.users -= 1;
+                None
+            } else {
+                runtimes.remove(key).map(|entry| entry.runtime)
+            }
+        };
+        if let Some(runtime) = runtime {
+            cx.spawn(async move |_cx| {
+                if let Ok(runtime) = runtime.await {
+                    runtime.server.stop().log_err();
+                }
+            })
+            .detach();
         }
     }
 }
@@ -288,6 +463,9 @@ struct ContextServerSettingsEntry {
 
 pub struct ContextServerStore {
     state: ContextServerStoreState,
+    host_registry: HostContextServerRegistry,
+    host_runtime_keys: HashMap<ContextServerId, ContextServerDefinitionKey>,
+    share_host_runtimes: bool,
     context_server_settings: HashMap<Arc<str>, ContextServerSettingsEntry>,
     servers: HashMap<ContextServerId, ContextServerState>,
     server_ids: Vec<ContextServerId>,
@@ -313,11 +491,15 @@ impl ContextServerStore {
         worktree_store: Entity<WorktreeStore>,
         weak_project: Option<WeakEntity<Project>>,
         headless: bool,
+        host_registry: HostContextServerRegistry,
         cx: &mut Context<Self>,
     ) -> Self {
+        let share_host_runtimes = host_registry.share_runtimes();
         Self::new_internal(
             !headless,
             None,
+            host_registry,
+            share_host_runtimes,
             ContextServerDescriptorRegistry::default_global(cx),
             worktree_store,
             weak_project,
@@ -334,11 +516,15 @@ impl ContextServerStore {
         upstream_client: Entity<RemoteClient>,
         worktree_store: Entity<WorktreeStore>,
         weak_project: Option<WeakEntity<Project>>,
+        host_registry: HostContextServerRegistry,
         cx: &mut Context<Self>,
     ) -> Self {
+        let share_host_runtimes = host_registry.share_runtimes();
         Self::new_internal(
             true,
             None,
+            host_registry,
+            share_host_runtimes,
             ContextServerDescriptorRegistry::default_global(cx),
             worktree_store,
             weak_project,
@@ -386,6 +572,8 @@ impl ContextServerStore {
         Self::new_internal(
             false,
             None,
+            HostContextServerRegistry::default(),
+            false,
             registry,
             worktree_store,
             weak_project,
@@ -408,6 +596,8 @@ impl ContextServerStore {
         Self::new_internal(
             true,
             context_server_factory,
+            HostContextServerRegistry::default(),
+            false,
             registry,
             worktree_store,
             weak_project,
@@ -446,6 +636,8 @@ impl ContextServerStore {
     fn new_internal(
         maintain_server_loop: bool,
         context_server_factory: Option<ContextServerFactory>,
+        host_registry: HostContextServerRegistry,
+        share_host_runtimes: bool,
         registry: Entity<ContextServerDescriptorRegistry>,
         worktree_store: Entity<WorktreeStore>,
         weak_project: Option<WeakEntity<Project>>,
@@ -457,12 +649,7 @@ impl ContextServerStore {
             let ai_was_disabled = this.ai_disabled;
             this.ai_disabled = ai_disabled;
 
-            let settings = Self::resolve_all_context_server_settings(&this.worktree_store, cx);
-            let settings_changed = this.context_server_settings != settings;
-
-            if settings_changed {
-                this.context_server_settings = settings;
-            }
+            let settings_changed = this.refresh_context_server_settings(cx);
 
             // When AI is disabled, stop all running servers
             if ai_disabled {
@@ -492,14 +679,24 @@ impl ContextServerStore {
                         | WorktreeStoreEvent::WorktreeRemoved(_, _)
                 ) && !DisableAiSettings::get_global(cx).disable_ai
                 {
+                    this.refresh_context_server_settings(cx);
                     this.available_context_servers_changed(cx);
+                    cx.notify();
                 }
             }));
         }
+        subscriptions.push(cx.on_release(|this, cx| {
+            for key in this.host_runtime_keys.drain().map(|(_, key)| key) {
+                this.host_registry.release_runtime(&key, cx);
+            }
+        }));
 
         let ai_disabled = DisableAiSettings::get_global(cx).disable_ai;
         let mut this = Self {
             state,
+            host_registry,
+            host_runtime_keys: HashMap::default(),
+            share_host_runtimes,
             _subscriptions: subscriptions,
             context_server_settings: Self::resolve_all_context_server_settings(&worktree_store, cx),
             worktree_store,
@@ -639,22 +836,20 @@ impl ContextServerStore {
                 return anyhow::Ok(());
             }
 
-            let (registry, worktree_store) = this.update(cx, |this, _| {
-                (this.registry.clone(), this.worktree_store.clone())
+            let (host_registry, registry, worktree_store) = this.update(cx, |this, _| {
+                (
+                    this.host_registry.clone(),
+                    this.registry.clone(),
+                    this.worktree_store.clone(),
+                )
             });
-            let configuration = ContextServerConfiguration::from_settings(
-                settings_entry.settings,
-                id.clone(),
-                registry,
-                worktree_store,
-                cx,
-            )
-            .await
-            .context("Failed to create context server configuration")?;
+            let configuration = host_registry
+                .resolve_configuration(id.clone(), settings_entry, registry, worktree_store, cx)
+                .await
+                .context("Failed to create context server configuration")?
+                .configuration;
 
-            this.update(cx, |this, cx| {
-                this.run_server(server, Arc::new(configuration), cx)
-            });
+            this.update(cx, |this, cx| this.run_server(server, configuration, cx));
             Ok(())
         })
         .detach_and_log_err(cx);
@@ -675,7 +870,12 @@ impl ContextServerStore {
 
         let server = state.server();
         let configuration = state.configuration();
-        let result = server.stop();
+        let result = if let Some(key) = self.host_runtime_keys.remove(id) {
+            self.host_registry.release_runtime(&key, cx);
+            Ok(())
+        } else {
+            server.stop()
+        };
         drop(state);
 
         self.update_server_state(
@@ -841,6 +1041,10 @@ impl ContextServerStore {
             .remove(id)
             .context("Context server not found")?;
 
+        if let Some(key) = self.host_runtime_keys.remove(id) {
+            self.host_registry.release_runtime(&key, cx);
+        }
+
         if let ContextServerConfiguration::Http { url, .. } = state.configuration().as_ref() {
             let server_url = url.clone();
             let id = id.clone();
@@ -868,6 +1072,16 @@ impl ContextServerStore {
         configuration: Arc<ContextServerConfiguration>,
         cx: &mut AsyncApp,
     ) -> Result<(Arc<ContextServer>, Arc<ContextServerConfiguration>)> {
+        Self::create_context_server_for_scope(this, id, configuration, true, cx).await
+    }
+
+    async fn create_context_server_for_scope(
+        this: WeakEntity<Self>,
+        id: ContextServerId,
+        configuration: Arc<ContextServerConfiguration>,
+        project_scoped: bool,
+        cx: &mut AsyncApp,
+    ) -> Result<(Arc<ContextServer>, Arc<ContextServerConfiguration>)> {
         let remote = configuration.remote();
         let needs_remote_command = match configuration.as_ref() {
             ContextServerConfiguration::Custom { .. }
@@ -886,27 +1100,31 @@ impl ContextServerStore {
             (remote_state, this.is_remote_project())
         })?;
 
-        let root_path: Option<Arc<Path>> = this.update(cx, |this, cx| {
-            this.project
-                .as_ref()
-                .and_then(|project| {
-                    project
-                        .read_with(cx, |project, cx| project.active_project_directory(cx))
-                        .ok()
-                        .flatten()
-                })
-                .or_else(|| {
-                    this.worktree_store.read_with(cx, |store, cx| {
-                        store.visible_worktrees(cx).fold(None, |acc, item| {
-                            if acc.is_none() {
-                                item.read(cx).root_dir()
-                            } else {
-                                acc
-                            }
+        let root_path: Option<Arc<Path>> = if project_scoped {
+            this.update(cx, |this, cx| {
+                this.project
+                    .as_ref()
+                    .and_then(|project| {
+                        project
+                            .read_with(cx, |project, cx| project.active_project_directory(cx))
+                            .ok()
+                            .flatten()
+                    })
+                    .or_else(|| {
+                        this.worktree_store.read_with(cx, |store, cx| {
+                            store.visible_worktrees(cx).fold(None, |acc, item| {
+                                if acc.is_none() {
+                                    item.read(cx).root_dir()
+                                } else {
+                                    acc
+                                }
+                            })
                         })
                     })
-                })
-        })?;
+            })?
+        } else {
+            None
+        };
 
         let configuration = if let Some((project_id, upstream_client)) = remote_state {
             let root_dir = root_path.as_ref().map(|p| p.display().to_string());
@@ -1043,7 +1261,7 @@ impl ContextServerStore {
     ) -> Result<proto::ContextServerCommand> {
         let server_id = ContextServerId(envelope.payload.server_id.into());
 
-        let (settings_entry, registry, worktree_store) =
+        let (settings_entry, host_registry, registry, worktree_store) =
             this.update(&mut cx, |this, inner_cx| {
                 let ContextServerStoreState::Local {
                     is_headless: true, ..
@@ -1069,18 +1287,25 @@ impl ContextServerStore {
                     })
                     .with_context(|| format!("context server `{}` not found", server_id))?;
 
-                anyhow::Ok((settings, this.registry.clone(), this.worktree_store.clone()))
+                anyhow::Ok((
+                    settings,
+                    this.host_registry.clone(),
+                    this.registry.clone(),
+                    this.worktree_store.clone(),
+                ))
             })?;
 
-        let configuration = ContextServerConfiguration::from_settings(
-            settings_entry.settings,
-            server_id.clone(),
-            registry,
-            worktree_store,
-            &cx,
-        )
-        .await
-        .with_context(|| format!("failed to build configuration for `{}`", server_id))?;
+        let configuration = host_registry
+            .resolve_configuration(
+                server_id.clone(),
+                settings_entry,
+                registry,
+                worktree_store,
+                &cx,
+            )
+            .await
+            .with_context(|| format!("failed to build configuration for `{}`", server_id))?
+            .configuration;
 
         let command = configuration
             .command()
@@ -1103,7 +1328,20 @@ impl ContextServerStore {
         worktree_store: &Entity<WorktreeStore>,
         cx: &App,
     ) -> HashMap<Arc<str>, ContextServerSettingsEntry> {
-        let mut merged = HashMap::default();
+        let global_settings = &ProjectSettings::get_global(cx).context_servers;
+        let mut merged = global_settings
+            .iter()
+            .map(|(id, settings)| {
+                (
+                    id.clone(),
+                    ContextServerSettingsEntry {
+                        worktree_id: None,
+                        settings: settings.clone(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut scoped_server_ids = HashSet::default();
         for worktree in worktree_store.read(cx).visible_worktrees(cx) {
             let worktree_id = worktree.read(cx).id();
             let location = settings::SettingsLocation {
@@ -1111,15 +1349,31 @@ impl ContextServerStore {
                 path: RelPath::empty(),
             };
             for (id, settings) in &ProjectSettings::get(Some(location), cx).context_servers {
-                merged
-                    .entry(id.clone())
-                    .or_insert_with(|| ContextServerSettingsEntry {
-                        worktree_id: Some(worktree_id),
-                        settings: settings.clone(),
-                    });
+                if global_settings.get(id) == Some(settings) {
+                    continue;
+                }
+                if scoped_server_ids.insert(id.clone()) {
+                    merged.insert(
+                        id.clone(),
+                        ContextServerSettingsEntry {
+                            worktree_id: Some(worktree_id),
+                            settings: settings.clone(),
+                        },
+                    );
+                }
             }
         }
         merged
+    }
+
+    fn refresh_context_server_settings(&mut self, cx: &App) -> bool {
+        let settings = Self::resolve_all_context_server_settings(&self.worktree_store, cx);
+        if self.context_server_settings == settings {
+            false
+        } else {
+            self.context_server_settings = settings;
+            true
+        }
     }
 
     fn create_oauth_token_provider(
@@ -1669,6 +1923,27 @@ impl ContextServerStore {
         });
     }
 
+    fn attach_host_runtime(
+        &mut self,
+        id: ContextServerId,
+        runtime: Arc<HostContextServerRuntime>,
+        cx: &mut Context<Self>,
+    ) {
+        let state = match &runtime.status {
+            HostContextServerRuntimeStatus::Running => ContextServerState::Running {
+                server: runtime.server.clone(),
+                configuration: runtime.configuration.clone(),
+                _transport_watch: Task::ready(()),
+            },
+            HostContextServerRuntimeStatus::Error(error) => ContextServerState::Error {
+                server: runtime.server.clone(),
+                configuration: runtime.configuration.clone(),
+                error: error.clone(),
+            },
+        };
+        self.update_server_state(id, state, cx);
+    }
+
     fn available_context_servers_changed(&mut self, cx: &mut Context<Self>) {
         if self.update_servers_task.is_some() {
             self.needs_server_update = true;
@@ -1707,13 +1982,15 @@ impl ContextServerStore {
             return Ok(());
         }
 
-        let (mut configured_servers, registry, worktree_store) = this.update(cx, |this, _| {
-            (
-                this.context_server_settings.clone(),
-                this.registry.clone(),
-                this.worktree_store.clone(),
-            )
-        })?;
+        let (mut configured_servers, host_registry, registry, worktree_store) =
+            this.update(cx, |this, _| {
+                (
+                    this.context_server_settings.clone(),
+                    this.host_registry.clone(),
+                    this.registry.clone(),
+                    this.worktree_store.clone(),
+                )
+            })?;
 
         for (id, _) in registry.read_with(cx, |registry, _| registry.context_server_descriptors()) {
             configured_servers
@@ -1732,14 +2009,15 @@ impl ContextServerStore {
         let configured_servers =
             join_all(enabled_servers.into_iter().map(|(id, settings_entry)| {
                 let id = ContextServerId(id);
-                ContextServerConfiguration::from_settings(
-                    settings_entry.settings,
-                    id.clone(),
-                    registry.clone(),
-                    worktree_store.clone(),
-                    cx,
-                )
-                .map(move |config| (id, config))
+                host_registry
+                    .resolve_configuration(
+                        id.clone(),
+                        settings_entry,
+                        registry.clone(),
+                        worktree_store.clone(),
+                        cx,
+                    )
+                    .map(move |config| (id, config))
             }))
             .await
             .into_iter()
@@ -1767,8 +2045,7 @@ impl ContextServerStore {
                 let state = this.servers.get(&id);
                 let is_stopped = matches!(state, Some(ContextServerState::Stopped { .. }));
                 let existing_config = state.as_ref().map(|state| state.configuration());
-                if existing_config.as_deref() != Some(&config) || is_stopped {
-                    let config = Arc::new(config);
+                if existing_config.as_ref() != Some(&config.configuration) || is_stopped {
                     servers_to_start.push((id.clone(), config));
                     if this.servers.contains_key(&id) {
                         servers_to_stop.insert(id);
@@ -1790,7 +2067,69 @@ impl ContextServerStore {
         })??;
 
         for (id, config) in servers_to_start {
-            match Self::create_context_server(this.clone(), id.clone(), config, cx).await {
+            let (share_host_runtimes, host_registry) = this.update(cx, |this, _| {
+                (this.share_host_runtimes, this.host_registry.clone())
+            })?;
+            if share_host_runtimes {
+                let key = config.key.clone();
+                let project_scoped = key.project_scope.is_some();
+                let runtime = host_registry.acquire_runtime(key.clone(), || {
+                    let this = this.clone();
+                    let id = id.clone();
+                    let configuration = config.configuration.clone();
+                    cx.spawn(async move |cx| {
+                        let (server, configuration) = match Self::create_context_server_for_scope(
+                            this,
+                            id.clone(),
+                            configuration,
+                            project_scoped,
+                            cx,
+                        )
+                        .await
+                        {
+                            Ok(runtime) => runtime,
+                            Err(error) => {
+                                log::error!("{id} host context server failed to create: {error:#}");
+                                return Err(Arc::new(error));
+                            }
+                        };
+                        let status = match server.clone().start(cx).await {
+                            Ok(_) => HostContextServerRuntimeStatus::Running,
+                            Err(error) => {
+                                HostContextServerRuntimeStatus::Error(error.to_string().into())
+                            }
+                        };
+                        Ok(Arc::new(HostContextServerRuntime {
+                            server,
+                            configuration,
+                            status,
+                        }))
+                    })
+                    .shared()
+                });
+                match runtime.await {
+                    Ok(runtime) => {
+                        this.update(cx, |this, cx| {
+                            this.host_runtime_keys.insert(id.clone(), key);
+                            this.attach_host_runtime(id, runtime, cx);
+                        })?;
+                    }
+                    Err(error) => {
+                        this.update(cx, |_this, cx| {
+                            cx.emit(ServerStatusChangedEvent {
+                                server_id: id,
+                                status: ContextServerStatus::Error(error.to_string().into()),
+                            });
+                            cx.notify();
+                        })?;
+                    }
+                }
+                continue;
+            }
+
+            match Self::create_context_server(this.clone(), id.clone(), config.configuration, cx)
+                .await
+            {
                 Ok((server, config)) => {
                     this.update(cx, |this, cx| {
                         this.run_server(server, config, cx);

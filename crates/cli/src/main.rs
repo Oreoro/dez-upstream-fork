@@ -29,6 +29,7 @@ use tempfile::{NamedTempFile, TempDir};
 use util::paths::PathWithPosition;
 use walkdir::WalkDir;
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::io::IsTerminal;
 
 const URL_PREFIX: [&'static str; 5] = ["zed://", "http://", "https://", "file://", "ssh://"];
@@ -59,9 +60,7 @@ Examples:
     `zed --foreground`
           Runs in foreground (shows all logs)
     `zed path-to-your-project`
-          Open your project in Zed
-    `zed -n path-to-file `
-          Open file/folder in a new window",
+          Open your project in Zed",
     after_help = "To read from stdin, append '-', e.g. 'ps axf | zed -'"
 )]
 struct Args {
@@ -71,20 +70,14 @@ struct Args {
     #[arg(short, long)]
     wait: bool,
     /// Add files to the currently open workspace
-    #[arg(short, long, overrides_with_all = ["new", "reuse", "existing", "classic"])]
+    #[arg(short, long, overrides_with_all = ["reuse", "existing"])]
     add: bool,
-    /// Create a new workspace
-    #[arg(short, long, overrides_with_all = ["add", "reuse", "existing", "classic"])]
-    new: bool,
     /// Reuse an existing window, replacing its workspace
-    #[arg(short, long, overrides_with_all = ["add", "new", "existing", "classic"], hide = true)]
+    #[arg(short, long, overrides_with_all = ["add", "existing"], hide = true)]
     reuse: bool,
     /// Open in existing Zed window
-    #[arg(short = 'e', long = "existing", overrides_with_all = ["add", "new", "reuse", "classic"])]
+    #[arg(short = 'e', long = "existing", overrides_with_all = ["add", "reuse"])]
     existing: bool,
-    /// Use the classic open behavior: new window for directories, reuse for files
-    #[arg(long, hide = true, overrides_with_all = ["add", "new", "reuse", "existing"])]
-    classic: bool,
     /// Sets a custom directory for all user data (e.g., database, extensions, logs).
     /// This overrides the default platform-specific data directory location:
     #[cfg_attr(target_os = "macos", doc = "`~/Library/Application Support/Zed`.")]
@@ -322,6 +315,13 @@ mod tests {
     }
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn rejects_multi_window_flags() {
+        assert!(Args::try_parse_from(["zed", "-n"]).is_err());
+        assert!(Args::try_parse_from(["zed", "--new"]).is_err());
+        assert!(Args::try_parse_from(["zed", "--classic"]).is_err());
+    }
 
     fn with_cwd<T>(path: &Path, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
         let _lock = CWD_LOCK.lock();
@@ -578,14 +578,10 @@ fn run() -> Result<()> {
         IpcOneShotServer::<IpcHandshake>::new().context("Handshake before Zed spawn")?;
     let url = format!("zed-cli://{server_name}");
 
-    let open_behavior = if args.new {
-        cli::OpenBehavior::AlwaysNew
-    } else if args.add {
+    let open_behavior = if args.add {
         cli::OpenBehavior::Add
     } else if args.existing {
         cli::OpenBehavior::ExistingWindow
-    } else if args.classic {
-        cli::OpenBehavior::Classic
     } else if args.reuse {
         cli::OpenBehavior::Reuse
     } else {
@@ -735,11 +731,6 @@ fn run() -> Result<()> {
                             exit_status.lock().replace(status);
                             return Ok(());
                         }
-                        CliResponse::PromptOpenBehavior => {
-                            let behavior = prompt_open_behavior()
-                                .unwrap_or(cli::CliBehaviorSetting::ExistingWindow);
-                            tx.send(CliRequest::SetOpenBehavior { behavior })?;
-                        }
                     }
                 }
 
@@ -831,43 +822,6 @@ fn anonymous_fd(path: &str) -> Option<fs::File> {
         // not implemented for bsd, windows. Could be, but isn't yet
         None
     }
-}
-
-/// Shows an interactive prompt asking the user to choose the default open
-/// behavior for `zed <path>`. Returns `None` if the prompt cannot be shown
-/// (e.g. stdin is not a terminal) or the user cancels.
-fn prompt_open_behavior() -> Option<cli::CliBehaviorSetting> {
-    if !std::io::stdin().is_terminal() {
-        return None;
-    }
-
-    let blue = console::Style::new().blue();
-    let items = [
-        format!(
-            "Add to existing Zed window ({})",
-            blue.apply_to("zed --existing")
-        ),
-        format!("Open a new window ({})", blue.apply_to("zed --classic")),
-    ];
-
-    let prompt = format!(
-        "Configure default behavior for {}\n{}",
-        blue.apply_to("zed <path>"),
-        console::style("You can change this later in Zed settings"),
-    );
-
-    let selection = dialoguer::Select::new()
-        .with_prompt(&prompt)
-        .items(&items)
-        .default(0)
-        .interact()
-        .ok()?;
-
-    Some(if selection == 0 {
-        cli::CliBehaviorSetting::ExistingWindow
-    } else {
-        cli::CliBehaviorSetting::NewWindow
-    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]

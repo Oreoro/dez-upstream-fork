@@ -71,4 +71,6 @@ remote_connection = { workspace = true, features = ["test-support"] }
 remote_server.workspace = true
 serde_json.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+superzed_session.workspace = true
+tempfile.workspace = true
 workspace = { workspace = true, features = ["test-support"] }

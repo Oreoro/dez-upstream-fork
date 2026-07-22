@@ -11209,6 +11209,2013 @@ async fn add_test_project(
     workspace
 }
 
+fn apply_superzed_session_mutation(
+    snapshot: &mut superzed_session::HostSessionSnapshot,
+    mutation: superzed_session::SessionMutation,
+) {
+    snapshot
+        .apply(superzed_session::MutationRequest {
+            expected_revision: snapshot.revision,
+            mutation,
+        })
+        .expect("acceptance fixture mutation should be valid");
+}
+
+fn superzed_project_spec(paths: &[&str]) -> superzed_session::ProjectSpec {
+    superzed_session::ProjectSpec {
+        roots: paths
+            .iter()
+            .map(|path| superzed_session::ProjectRoot {
+                requested_path: PathBuf::from(path),
+                canonical_path: PathBuf::from(path),
+            })
+            .collect(),
+    }
+}
+
+fn superzed_file_item(path: &str) -> superzed_session::FileEditorItem {
+    superzed_session::FileEditorItem {
+        id: superzed_session::SessionItemId::new(),
+        absolute_path: PathBuf::from(path),
+        pinned: false,
+        preview: false,
+    }
+}
+
+async fn connect_mock_host_to_window(
+    connection_options: remote::RemoteConnectionOptions,
+    connect_guard: futures::channel::oneshot::Sender<()>,
+    window: gpui::WindowHandle<MultiWorkspace>,
+    app_state: Arc<workspace::AppState>,
+    cx: &mut TestAppContext,
+) {
+    let delegate = Arc::new(remote::MockDelegate);
+    let connection = {
+        let mut async_cx = cx.to_async();
+        let connection = remote::connect(connection_options, delegate.clone(), &mut async_cx);
+        drop(connect_guard);
+        connection.await.expect("mock SSH transport should connect")
+    };
+    let (cancellation_guard, cancellation) = futures::channel::oneshot::channel();
+    let attach = cx.update(|cx| {
+        workspace::connect_superzed_host_with_new_connection(
+            window,
+            connection,
+            cancellation,
+            delegate,
+            app_state,
+            cx,
+        )
+    });
+    attach.await.expect("mock SSH host session should attach");
+    drop(cancellation_guard);
+}
+
+#[gpui::test]
+async fn test_superzed_host_client_serializes_workspace_creation_and_preserves_entities(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+
+    let database_directory = tempfile::tempdir().expect("temporary database directory should open");
+    let database_path = database_directory.path().join("host-session.sqlite");
+    let (database, snapshot) = remote_server::SuperzedHost::load(database_path.clone())
+        .expect("blank host session should load");
+    assert_eq!(snapshot.workspaces.len(), 1);
+    assert!(snapshot.workspaces[0].project_spec.roots.is_empty());
+
+    let server_fs = FakeFs::new(server_cx.executor());
+    let (connection_options, server_session, connect_guard) =
+        remote::RemoteClient::fake_server(cx, server_cx);
+    server_cx.update(remote_server::HeadlessProject::init);
+    let server_executor = server_cx.executor();
+    let _host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: server_session,
+                fs: server_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            database,
+            snapshot,
+            cx,
+        )
+    });
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+    let mut async_cx = cx.to_async();
+    let attach = workspace::open_superzed_host(
+        connection_options,
+        Arc::new(remote::MockDelegate),
+        app_state,
+        &mut async_cx,
+    );
+    drop(connect_guard);
+    let window = attach.await.expect("blank local host should attach");
+    let multi_workspace = window.root(cx).expect("host window should have a root");
+    let host_session = multi_workspace.read_with(cx, |multi_workspace, _| {
+        multi_workspace
+            .host_session()
+            .expect("host window should own a session client")
+            .clone()
+    });
+
+    let initial_workspace = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let workspace = multi_workspace.workspace().clone();
+        let identity = workspace
+            .read(cx)
+            .host_workspace_identity()
+            .expect("blank workspace should have host identity")
+            .clone();
+        (identity.workspace_id, workspace)
+    });
+
+    let (client, request) = host_session.read_with(cx, |host_session, cx| {
+        (
+            host_session.remote_client().read(cx).proto_client(),
+            superzed_session::MutationRequest {
+                expected_revision: host_session.snapshot().revision,
+                mutation: superzed_session::SessionMutation::CreateWorkspace {
+                    after: Some(initial_workspace.0),
+                    project_spec: superzed_session::ProjectSpec::default(),
+                },
+            },
+        )
+    });
+    let response = client
+        .request(client::proto::MutateSuperzedSession {
+            mutation_json: serde_json::to_string(&request).unwrap(),
+        })
+        .await
+        .expect("server should create a workspace for concurrent reconciliation");
+    let concurrent_snapshot: superzed_session::HostSessionSnapshot =
+        serde_json::from_str(&response.snapshot_json).unwrap();
+    let mut first_async_cx = cx.to_async();
+    let mut second_async_cx = cx.to_async();
+    let (first_reconciliation, second_reconciliation) = futures::future::join(
+        workspace::HostSessionClient::reconcile(
+            host_session.clone(),
+            window,
+            concurrent_snapshot.clone(),
+            &mut first_async_cx,
+        ),
+        workspace::HostSessionClient::reconcile(
+            host_session.clone(),
+            window,
+            concurrent_snapshot,
+            &mut second_async_cx,
+        ),
+    )
+    .await;
+    first_reconciliation.expect("first concurrent snapshot should reconcile");
+    second_reconciliation.expect("second concurrent snapshot should reuse projections");
+
+    let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(400.), gpui::px(600.)),
+        |_, _| sidebar.clone().into_any_element(),
+    );
+
+    for _ in 0..3 {
+        let plus = cx
+            .debug_bounds("SUPERZED_NEW_WORKSPACE")
+            .expect("workspace plus button should render");
+        cx.simulate_click(plus.center(), gpui::Modifiers::none());
+        cx.draw(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(400.), gpui::px(600.)),
+            |_, _| sidebar.clone().into_any_element(),
+        );
+    }
+
+    let concurrent_creates = cx.update(|_, cx| {
+        (0..3)
+            .map(|_| {
+                workspace::HostSessionClient::create_workspace(
+                    &host_session,
+                    window,
+                    superzed_session::ProjectSpec::default(),
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    futures::future::try_join_all(concurrent_creates)
+        .await
+        .expect("concurrent creates should serialize without stale revisions");
+
+    let (snapshot_ids, projected) = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let snapshot_ids = multi_workspace
+            .host_session()
+            .expect("host session should remain attached")
+            .read(cx)
+            .snapshot()
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>();
+        let projected = multi_workspace
+            .workspaces()
+            .map(|workspace| {
+                let workspace_id = workspace
+                    .read(cx)
+                    .host_workspace_identity()
+                    .expect("projection should have host identity")
+                    .workspace_id;
+                (workspace_id, workspace.clone())
+            })
+            .collect::<Vec<_>>();
+        (snapshot_ids, projected)
+    });
+    assert_eq!(snapshot_ids.len(), 8);
+    assert_eq!(
+        projected
+            .iter()
+            .map(|(workspace_id, _)| *workspace_id)
+            .collect::<Vec<_>>(),
+        snapshot_ids,
+        "projection order must exactly match authoritative server order"
+    );
+    assert_eq!(
+        projected
+            .iter()
+            .find(|(workspace_id, _)| *workspace_id == initial_workspace.0)
+            .map(|(_, workspace)| workspace),
+        Some(&initial_workspace.1),
+        "creating workspaces must preserve the original projection entity"
+    );
+
+    for (workspace_id, expected_entity) in projected {
+        assert_eq!(
+            expected_entity.read_with(cx, |workspace, cx| {
+                workspace
+                    .project()
+                    .read(cx)
+                    .collab_forwarding_project_id_for_test()
+            }),
+            None,
+            "a server-owned workspace must never route project traffic to cloud collaboration"
+        );
+        let selector = format!("SUPERZED_WORKSPACE-{}", workspace_id.as_uuid().simple());
+        let selector = Box::leak(selector.into_boxed_str());
+        let row = cx
+            .debug_bounds(selector)
+            .expect("workspace row should render");
+        cx.simulate_click(row.center(), gpui::Modifiers::none());
+        assert_eq!(
+            multi_workspace.read_with(cx, |multi_workspace, _| {
+                multi_workspace.workspace().clone()
+            }),
+            expected_entity,
+            "activation must reuse the existing workspace entity"
+        );
+        cx.draw(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(400.), gpui::px(600.)),
+            |_, _| sidebar.clone().into_any_element(),
+        );
+    }
+
+    let active_workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    active_workspace.update_in(cx, |workspace, window, cx| {
+        workspace.split_pane(
+            workspace.active_pane().clone(),
+            workspace::SplitDirection::Right,
+            window,
+            cx,
+        );
+    });
+    let flush_layout = active_workspace.update_in(cx, |workspace, window, cx| {
+        workspace.flush_serialization(window, cx)
+    });
+    flush_layout.await;
+    let active_layout = host_session.read_with(cx, |host_session, _| {
+        host_session
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == host_session.snapshot().active_workspace_id)
+            .expect("active workspace should remain in the host snapshot")
+            .clone()
+    });
+    assert_eq!(active_layout.layout_revision, 1);
+    assert!(matches!(
+        active_layout.layout,
+        superzed_session::LayoutNode::Axis { ref children, .. } if children.len() == 2
+    ));
+
+    let workspace_to_close = host_session.read_with(cx, |host_session, _| {
+        host_session
+            .snapshot()
+            .workspaces
+            .last()
+            .expect("host should have a workspace to close")
+            .id
+    });
+    let close_selector = format!(
+        "SUPERZED_CLOSE_WORKSPACE-{}",
+        workspace_to_close.as_uuid().simple()
+    );
+    let close_selector = Box::leak(close_selector.into_boxed_str());
+    let close = cx
+        .debug_bounds(close_selector)
+        .expect("workspace close button should render");
+    cx.simulate_click(close.center(), gpui::Modifiers::none());
+    assert!(
+        host_session.read_with(cx, |host_session, _| host_session
+            .snapshot()
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != workspace_to_close)),
+        "close click must remove the workspace from authoritative state"
+    );
+    let persisted_snapshot = superzed_session::HostSessionDb::open(&database_path)
+        .expect("host database should reopen after close")
+        .load()
+        .expect("persisted host snapshot should load")
+        .expect("host database should contain a snapshot");
+    assert!(
+        persisted_snapshot
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != workspace_to_close),
+        "a closed workspace must remain deleted when the server database reopens"
+    );
+}
+
+#[gpui::test]
+async fn test_superzed_host_client_recovers_from_stale_revision_before_mutating(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+
+    let database_directory = tempfile::tempdir().expect("temporary database directory");
+    let (database, snapshot) =
+        remote_server::SuperzedHost::load(database_directory.path().join("host-session.sqlite"))
+            .expect("blank host session should load");
+    let server_fs = FakeFs::new(server_cx.executor());
+    let (connection_options, server_session, connect_guard) =
+        remote::RemoteClient::fake_server(cx, server_cx);
+    server_cx.update(remote_server::HeadlessProject::init);
+    let server_executor = server_cx.executor();
+    let _host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: server_session,
+                fs: server_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            database,
+            snapshot,
+            cx,
+        )
+    });
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+    let mut async_cx = cx.to_async();
+    let attach = workspace::open_superzed_host(
+        connection_options,
+        Arc::new(remote::MockDelegate),
+        app_state,
+        &mut async_cx,
+    );
+    drop(connect_guard);
+    let window = attach.await.expect("blank local host should attach");
+    let multi_workspace = window.root(cx).expect("host window should have a root");
+    let host_session = multi_workspace.read_with(cx, |multi_workspace, _| {
+        multi_workspace
+            .host_session()
+            .expect("host window should own a session client")
+            .clone()
+    });
+    let (client, stale_revision, initial_workspace_id) =
+        host_session.read_with(cx, |host_session, cx| {
+            (
+                host_session.remote_client().read(cx).proto_client(),
+                host_session.snapshot().revision,
+                host_session.snapshot().active_workspace_id,
+            )
+        });
+
+    let response = client
+        .request(client::proto::MutateSuperzedSession {
+            mutation_json: serde_json::to_string(&superzed_session::MutationRequest {
+                expected_revision: stale_revision,
+                mutation: superzed_session::SessionMutation::CreateWorkspace {
+                    after: Some(initial_workspace_id),
+                    project_spec: superzed_session::ProjectSpec::default(),
+                },
+            })
+            .expect("serialize out-of-band mutation"),
+        })
+        .await
+        .expect("advance the server without reconciling the host client");
+    assert!(response.applied);
+    let advanced_snapshot: superzed_session::HostSessionSnapshot =
+        serde_json::from_str(&response.snapshot_json).expect("deserialize advanced snapshot");
+    assert_eq!(advanced_snapshot.revision, stale_revision + 1);
+    assert_eq!(
+        host_session.read_with(cx, |host_session, _| host_session.snapshot().revision),
+        stale_revision,
+        "out-of-band mutation must leave the client stale for this regression"
+    );
+
+    let create = cx.update(|cx| {
+        workspace::HostSessionClient::create_workspace(
+            &host_session,
+            window,
+            superzed_session::ProjectSpec::default(),
+            cx,
+        )
+    });
+    create
+        .await
+        .expect("stale host client should reconcile and retry its mutation once");
+
+    host_session.read_with(cx, |host_session, _| {
+        assert_eq!(
+            host_session.snapshot().revision,
+            advanced_snapshot.revision + 1
+        );
+        assert_eq!(host_session.snapshot().workspaces.len(), 3);
+    });
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let authoritative_ids = host_session
+            .read(cx)
+            .snapshot()
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>();
+        let projected_ids = multi_workspace
+            .workspaces()
+            .map(|workspace| {
+                workspace
+                    .read(cx)
+                    .host_workspace_identity()
+                    .expect("projection should have host identity")
+                    .workspace_id
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(projected_ids, authoritative_ids);
+    });
+}
+
+#[gpui::test]
+async fn test_superzed_layout_close_and_close_last_survive_full_restart(
+    client_cx: &mut TestAppContext,
+    restarted_client_cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(client_cx);
+    init_test(restarted_client_cx);
+    client_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    restarted_client_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(remote_server::HeadlessProject::init);
+
+    let project_root = PathBuf::from("/layout-project");
+    let first_file = project_root.join("first.rs");
+    let second_file = project_root.join("second.rs");
+    let database_directory = tempfile::tempdir().expect("temporary host database directory");
+    let database_path = database_directory.path().join("host-session.sqlite");
+
+    let app_state = client_cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            &project_root,
+            serde_json::json!({
+                "first.rs": "pub fn first() {}",
+                "second.rs": "pub fn second() {}"
+            }),
+        )
+        .await;
+    let server_fs = FakeFs::new(server_cx.executor());
+    server_fs
+        .insert_tree(
+            &project_root,
+            serde_json::json!({
+                "first.rs": "pub fn first() {}",
+                "second.rs": "pub fn second() {}"
+            }),
+        )
+        .await;
+    let (database, snapshot) = remote_server::SuperzedHost::load(database_path.clone())
+        .expect("blank host session should load");
+    let (connection_options, server_session, connect_guard) =
+        remote::RemoteClient::fake_server(client_cx, server_cx);
+    let server_executor = server_cx.executor();
+    let host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: server_session,
+                fs: server_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            database,
+            snapshot,
+            cx,
+        )
+    });
+    let first_window = {
+        let mut async_cx = client_cx.to_async();
+        let attach = workspace::open_superzed_host(
+            connection_options,
+            Arc::new(remote::MockDelegate),
+            app_state,
+            &mut async_cx,
+        );
+        drop(connect_guard);
+        attach.await.expect("first GUI should attach")
+    };
+    let first_multi_workspace = first_window
+        .root(client_cx)
+        .expect("first GUI should contain the host shell");
+    let target = first_multi_workspace.read_with(client_cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspace()
+            .read(cx)
+            .host_workspace_identity()
+            .expect("initial workspace should have host identity")
+            .clone()
+    });
+    let open = client_cx.update(|cx| {
+        workspace::open_superzed_paths(
+            target,
+            std::slice::from_ref(&project_root),
+            &[first_file.clone(), second_file.clone()],
+            workspace::OpenOptions {
+                requesting_window: Some(first_window),
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    let opened = open
+        .await
+        .expect("project files should open through the host session");
+    assert_eq!(opened.opened_items.len(), 2);
+    assert!(
+        opened
+            .opened_items
+            .iter()
+            .all(|item| item.as_ref().is_some_and(|item| item.is_ok()))
+    );
+
+    let layout_workspace = opened.workspace;
+    let layout_workspace_id = layout_workspace.read_with(client_cx, |workspace, _| {
+        workspace
+            .host_workspace_identity()
+            .expect("layout workspace should have host identity")
+            .workspace_id
+    });
+    let original_pane =
+        layout_workspace.read_with(client_cx, |workspace, _| workspace.active_pane().clone());
+    first_window
+        .update(client_cx, |_, window, cx| {
+            original_pane.update(cx, |pane, cx| {
+                assert_eq!(pane.items().count(), 2);
+                pane.set_pinned_count(1);
+                let preview_item_id = pane
+                    .active_item()
+                    .expect("second file should be active")
+                    .item_id();
+                pane.replace_preview_item_id(preview_item_id, window, cx);
+            });
+        })
+        .expect("first GUI window should remain open");
+    let focused_empty_pane = first_window
+        .update(client_cx, |_, window, cx| {
+            layout_workspace.update(cx, |workspace, cx| {
+                workspace.split_pane(
+                    original_pane.clone(),
+                    workspace::SplitDirection::Right,
+                    window,
+                    cx,
+                )
+            })
+        })
+        .expect("first GUI window should remain open");
+    layout_workspace.read_with(client_cx, |workspace, _| {
+        let workspace::Member::Axis(axis) = &workspace.center_pane_group_for_test().root else {
+            panic!("split workspace should have an axis root");
+        };
+        *axis.flexes.lock() = vec![0.4, 1.6];
+    });
+    first_window
+        .update(client_cx, |_, window, cx| {
+            focused_empty_pane.update(cx, |pane, cx| {
+                pane.focus_handle(cx).focus(window, cx);
+            });
+        })
+        .expect("first GUI window should remain open");
+    {
+        let visual_cx = &mut gpui::VisualTestContext::from_window(first_window.into(), client_cx);
+        let flush = layout_workspace.update_in(visual_cx, |workspace, window, cx| {
+            workspace.flush_serialization(window, cx)
+        });
+        flush.await;
+    }
+
+    let expected_snapshot = {
+        let visual_cx = &mut gpui::VisualTestContext::from_window(first_window.into(), client_cx);
+        let sidebar = setup_sidebar(&first_multi_workspace, visual_cx);
+        visual_cx.draw(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(400.), gpui::px(600.)),
+            |_, _| sidebar.clone().into_any_element(),
+        );
+        let plus = visual_cx
+            .debug_bounds("SUPERZED_NEW_WORKSPACE")
+            .expect("workspace plus button should render");
+        visual_cx.simulate_click(plus.center(), gpui::Modifiers::none());
+        visual_cx.draw(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(400.), gpui::px(600.)),
+            |_, _| sidebar.clone().into_any_element(),
+        );
+        let host_session = first_multi_workspace.read_with(visual_cx, |multi_workspace, _| {
+            multi_workspace
+                .host_session()
+                .expect("first GUI should retain its host session")
+                .clone()
+        });
+        let workspace_to_close = host_session.read_with(visual_cx, |host_session, _| {
+            let snapshot = host_session.snapshot();
+            assert_eq!(snapshot.workspaces.len(), 2);
+            assert_eq!(snapshot.active_workspace_id, snapshot.workspaces[1].id);
+            snapshot.active_workspace_id
+        });
+        let close_selector = format!(
+            "SUPERZED_CLOSE_WORKSPACE-{}",
+            workspace_to_close.as_uuid().simple()
+        );
+        let close_selector = Box::leak(close_selector.into_boxed_str());
+        let close = visual_cx
+            .debug_bounds(close_selector)
+            .expect("new workspace close button should render");
+        visual_cx.simulate_click(close.center(), gpui::Modifiers::none());
+        visual_cx.run_until_parked();
+        let snapshot =
+            host_session.read_with(visual_cx, |host_session, _| host_session.snapshot().clone());
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].id, layout_workspace_id);
+        assert!(
+            snapshot
+                .workspaces
+                .iter()
+                .all(|workspace| workspace.id != workspace_to_close),
+            "sidebar close must delete the workspace before restart"
+        );
+        let superzed_session::LayoutNode::Axis {
+            flexes, children, ..
+        } = &snapshot.workspaces[0].layout
+        else {
+            panic!("captured layout should contain the split");
+        };
+        assert_eq!(flexes, &[0.4, 1.6]);
+        assert_eq!(children.len(), 2);
+        let superzed_session::LayoutNode::Pane(first_pane) = &children[0] else {
+            panic!("first split member should be a pane");
+        };
+        assert_eq!(first_pane.items.len(), 2);
+        assert!(first_pane.items[0].pinned);
+        assert!(first_pane.items[1].preview);
+        let superzed_session::LayoutNode::Pane(second_pane) = &children[1] else {
+            panic!("second split member should be a pane");
+        };
+        assert!(second_pane.items.is_empty());
+        assert!(second_pane.focused);
+        drop(sidebar);
+        snapshot
+    };
+
+    first_window
+        .update(client_cx, |_, window, _| window.remove_window())
+        .expect("first GUI window should close");
+    drop(first_multi_workspace);
+    drop(layout_workspace);
+    drop(original_pane);
+    drop(focused_empty_pane);
+    drop(host);
+    client_cx.run_until_parked();
+    server_cx.run_until_parked();
+
+    let restarted_app_state = restarted_client_cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+    restarted_app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            &project_root,
+            serde_json::json!({
+                "first.rs": "pub fn first() {}",
+                "second.rs": "pub fn second() {}"
+            }),
+        )
+        .await;
+    let restarted_server_fs = FakeFs::new(server_cx.executor());
+    restarted_server_fs
+        .insert_tree(
+            &project_root,
+            serde_json::json!({
+                "first.rs": "pub fn first() {}",
+                "second.rs": "pub fn second() {}"
+            }),
+        )
+        .await;
+    let (database, reloaded_snapshot) = remote_server::SuperzedHost::load(database_path.clone())
+        .expect("host database should reopen after server restart");
+    assert_eq!(reloaded_snapshot, expected_snapshot);
+    let (connection_options, server_session, connect_guard) =
+        remote::RemoteClient::fake_server(restarted_client_cx, server_cx);
+    let server_executor = server_cx.executor();
+    let _restarted_host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: server_session,
+                fs: restarted_server_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            database,
+            reloaded_snapshot,
+            cx,
+        )
+    });
+    let restarted_window = {
+        let mut async_cx = restarted_client_cx.to_async();
+        let attach = workspace::open_superzed_host(
+            connection_options,
+            Arc::new(remote::MockDelegate),
+            restarted_app_state,
+            &mut async_cx,
+        );
+        drop(connect_guard);
+        attach.await.expect("restarted GUI should attach")
+    };
+    let restarted_multi_workspace = restarted_window
+        .root(restarted_client_cx)
+        .expect("restarted GUI should contain the host shell");
+    let restored_workspace = restarted_multi_workspace
+        .read_with(restarted_client_cx, |multi_workspace, _| {
+            multi_workspace.workspace().clone()
+        });
+    restored_workspace.read_with(restarted_client_cx, |workspace, cx| {
+        assert_eq!(
+            workspace
+                .host_workspace_identity()
+                .expect("restored workspace should have host identity")
+                .workspace_id,
+            layout_workspace_id
+        );
+        let workspace::Member::Axis(axis) = &workspace.center_pane_group_for_test().root else {
+            panic!("restored workspace should retain its split");
+        };
+        assert_eq!(*axis.flexes.lock(), vec![0.4, 1.6]);
+        assert_eq!(workspace.panes().len(), 2);
+        assert_eq!(workspace.panes()[0].read(cx).items().count(), 2);
+        assert_eq!(workspace.panes()[0].read(cx).pinned_count(), 1);
+        let preview_pane = workspace.panes()[0].read(cx);
+        let preview_item = preview_pane
+            .active_item()
+            .expect("restored pane should have an active preview item");
+        assert!(preview_pane.is_active_preview_item(preview_item.item_id()));
+        assert!(workspace.panes()[1].read(cx).items().next().is_none());
+    });
+
+    let visual_cx =
+        &mut gpui::VisualTestContext::from_window(restarted_window.into(), restarted_client_cx);
+    let sidebar = setup_sidebar(&restarted_multi_workspace, visual_cx);
+    visual_cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(400.), gpui::px(600.)),
+        |_, _| sidebar.clone().into_any_element(),
+    );
+    let close_selector = format!(
+        "SUPERZED_CLOSE_WORKSPACE-{}",
+        layout_workspace_id.as_uuid().simple()
+    );
+    let close_selector = Box::leak(close_selector.into_boxed_str());
+    let close = visual_cx
+        .debug_bounds(close_selector)
+        .expect("restored final workspace close button should render");
+    visual_cx.simulate_click(close.center(), gpui::Modifiers::none());
+    visual_cx.run_until_parked();
+    let replacement = restarted_multi_workspace.read_with(visual_cx, |multi_workspace, cx| {
+        let session = multi_workspace
+            .host_session()
+            .expect("restarted GUI should retain its host session")
+            .read(cx);
+        assert_eq!(session.snapshot().workspaces.len(), 1);
+        let replacement = &session.snapshot().workspaces[0];
+        assert_ne!(replacement.id, layout_workspace_id);
+        assert!(replacement.project_spec.roots.is_empty());
+        assert_eq!(session.snapshot().active_workspace_id, replacement.id);
+        assert_eq!(multi_workspace.workspaces().count(), 1);
+        assert_eq!(
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .host_workspace_identity()
+                .expect("blank replacement should have host identity")
+                .workspace_id,
+            replacement.id
+        );
+        replacement.clone()
+    });
+    let persisted_replacement = superzed_session::HostSessionDb::open(&database_path)
+        .expect("host database should reopen after close-last")
+        .load()
+        .expect("replacement snapshot should load")
+        .expect("replacement snapshot should exist");
+    assert_eq!(persisted_replacement.workspaces, vec![replacement]);
+    drop(sidebar);
+}
+
+#[gpui::test]
+async fn test_superzed_sidebar_remains_connected_while_switching_and_closing_many_workspaces(
+    client_cx: &mut TestAppContext,
+    restarted_client_cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(client_cx);
+    init_test(restarted_client_cx);
+    client_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    restarted_client_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+        remote_server::HeadlessProject::init(cx);
+    });
+
+    let database_directory = tempfile::tempdir().expect("temporary host database directory");
+    let database_path = database_directory.path().join("host-session.sqlite");
+    let (database, snapshot) = remote_server::SuperzedHost::load(database_path.clone())
+        .expect("blank host session should load");
+    let server_fs = FakeFs::new(server_cx.executor());
+    let (connection_options, server_session, connect_guard) =
+        remote::RemoteClient::fake_server(client_cx, server_cx);
+    let server_executor = server_cx.executor();
+    let host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: server_session,
+                fs: server_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            database,
+            snapshot,
+            cx,
+        )
+    });
+    let app_state = client_cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+    let first_window = {
+        let mut async_cx = client_cx.to_async();
+        let attach = workspace::open_superzed_host(
+            connection_options,
+            Arc::new(remote::MockDelegate),
+            app_state,
+            &mut async_cx,
+        );
+        drop(connect_guard);
+        attach.await.expect("first GUI should attach")
+    };
+    let first_multi_workspace = first_window
+        .root(client_cx)
+        .expect("first GUI should contain the host shell");
+
+    {
+        let visual_cx = &mut gpui::VisualTestContext::from_window(first_window.into(), client_cx);
+        let sidebar = setup_sidebar(&first_multi_workspace, visual_cx);
+        let draw_sidebar = |cx: &mut gpui::VisualTestContext| {
+            cx.draw(
+                gpui::point(gpui::px(0.), gpui::px(0.)),
+                gpui::size(gpui::px(400.), gpui::px(900.)),
+                |_, _| sidebar.clone().into_any_element(),
+            );
+        };
+        draw_sidebar(visual_cx);
+
+        for _ in 0..7 {
+            let plus = visual_cx
+                .debug_bounds("SUPERZED_NEW_WORKSPACE")
+                .expect("workspace plus button should remain rendered");
+            visual_cx.simulate_click(plus.center(), gpui::Modifiers::none());
+            visual_cx.run_until_parked();
+            draw_sidebar(visual_cx);
+        }
+
+        let host_session = first_multi_workspace.read_with(visual_cx, |multi_workspace, _| {
+            multi_workspace
+                .host_session()
+                .expect("host session should remain attached")
+                .clone()
+        });
+        let assert_coherent = |cx: &gpui::VisualTestContext| {
+            first_multi_workspace.read_with(cx, |multi_workspace, cx| {
+                let session = multi_workspace
+                    .host_session()
+                    .expect("host session must not detach while closing workspaces")
+                    .read(cx);
+                assert_eq!(
+                    session.connection_state(cx),
+                    remote::ConnectionState::Connected,
+                    "workspace mutations must not disconnect the host"
+                );
+                let snapshot_ids = session
+                    .snapshot()
+                    .workspaces
+                    .iter()
+                    .map(|workspace| workspace.id)
+                    .collect::<Vec<_>>();
+                let projected_ids = multi_workspace
+                    .workspaces()
+                    .map(|workspace| {
+                        workspace
+                            .read(cx)
+                            .host_workspace_identity()
+                            .expect("every projection should retain host identity")
+                            .workspace_id
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(projected_ids, snapshot_ids);
+                let active_workspace_id = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .host_workspace_identity()
+                    .expect("active projection should retain host identity")
+                    .workspace_id;
+                assert_eq!(active_workspace_id, session.snapshot().active_workspace_id);
+            });
+        };
+        assert_coherent(visual_cx);
+
+        let workspace_ids = host_session.read_with(visual_cx, |session, _| {
+            session
+                .snapshot()
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.id)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(workspace_ids.len(), 8);
+        for workspace_id in workspace_ids {
+            let selector = format!("SUPERZED_WORKSPACE-{}", workspace_id.as_uuid().simple());
+            let selector = Box::leak(selector.into_boxed_str());
+            let row = visual_cx
+                .debug_bounds(selector)
+                .expect("every workspace row should be switchable");
+            visual_cx.simulate_click(row.center(), gpui::Modifiers::none());
+            visual_cx.run_until_parked();
+            draw_sidebar(visual_cx);
+            assert_coherent(visual_cx);
+            assert_eq!(
+                host_session.read_with(visual_cx, |session, _| {
+                    session.snapshot().active_workspace_id
+                }),
+                workspace_id
+            );
+        }
+
+        visual_cx
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(250));
+
+        loop {
+            draw_sidebar(visual_cx);
+            let workspace_ids = host_session.read_with(visual_cx, |session, _| {
+                session
+                    .snapshot()
+                    .workspaces
+                    .iter()
+                    .map(|workspace| workspace.id)
+                    .collect::<Vec<_>>()
+            });
+            if workspace_ids.len() <= 1 {
+                break;
+            }
+            let close_count = workspace_ids.len().saturating_sub(1).min(3);
+            let workspace_ids = workspace_ids
+                .into_iter()
+                .rev()
+                .take(close_count)
+                .collect::<Vec<_>>();
+            let close_buttons = workspace_ids
+                .iter()
+                .map(|workspace_id| {
+                    let selector = format!(
+                        "SUPERZED_CLOSE_WORKSPACE-{}",
+                        workspace_id.as_uuid().simple()
+                    );
+                    let selector = Box::leak(selector.into_boxed_str());
+                    visual_cx
+                        .debug_bounds(selector)
+                        .expect("every remaining workspace should have a close button")
+                })
+                .collect::<Vec<_>>();
+            for close in close_buttons {
+                visual_cx.simulate_click(close.center(), gpui::Modifiers::none());
+            }
+            visual_cx.run_until_parked();
+            draw_sidebar(visual_cx);
+            assert_coherent(visual_cx);
+            host_session.read_with(visual_cx, |session, _| {
+                for workspace_id in &workspace_ids {
+                    assert!(
+                        session
+                            .snapshot()
+                            .workspaces
+                            .iter()
+                            .all(|workspace| workspace.id != *workspace_id),
+                        "every clicked workspace must be deleted"
+                    );
+                }
+            });
+
+            let remaining_ids = host_session.read_with(visual_cx, |session, _| {
+                session
+                    .snapshot()
+                    .workspaces
+                    .iter()
+                    .map(|workspace| workspace.id)
+                    .collect::<Vec<_>>()
+            });
+            for workspace_id in remaining_ids {
+                let selector = format!("SUPERZED_WORKSPACE-{}", workspace_id.as_uuid().simple());
+                let selector = Box::leak(selector.into_boxed_str());
+                let row = visual_cx
+                    .debug_bounds(selector)
+                    .expect("remaining workspace must stay switchable");
+                visual_cx.simulate_click(row.center(), gpui::Modifiers::none());
+                visual_cx.run_until_parked();
+                draw_sidebar(visual_cx);
+                assert_coherent(visual_cx);
+            }
+        }
+
+        let final_workspace_id = host_session.read_with(visual_cx, |session, _| {
+            assert_eq!(session.snapshot().workspaces.len(), 1);
+            session.snapshot().workspaces[0].id
+        });
+        let close_selector = format!(
+            "SUPERZED_CLOSE_WORKSPACE-{}",
+            final_workspace_id.as_uuid().simple()
+        );
+        let close_selector = Box::leak(close_selector.into_boxed_str());
+        let close = visual_cx
+            .debug_bounds(close_selector)
+            .expect("final workspace should have a close button");
+        visual_cx.simulate_click(close.center(), gpui::Modifiers::none());
+        visual_cx.run_until_parked();
+        draw_sidebar(visual_cx);
+        assert_coherent(visual_cx);
+        host_session.read_with(visual_cx, |session, _| {
+            assert_eq!(session.snapshot().workspaces.len(), 1);
+            assert_ne!(session.snapshot().workspaces[0].id, final_workspace_id);
+            assert!(
+                session.snapshot().workspaces[0]
+                    .project_spec
+                    .roots
+                    .is_empty()
+            );
+        });
+        drop(sidebar);
+    }
+
+    first_window
+        .update(client_cx, |_, window, _| window.remove_window())
+        .expect("first GUI window should close");
+    drop(first_multi_workspace);
+    drop(host);
+    client_cx.run_until_parked();
+    server_cx.run_until_parked();
+
+    let restarted_app_state = restarted_client_cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+    let (database, reloaded_snapshot) = remote_server::SuperzedHost::load(database_path.clone())
+        .expect("host database should reopen after restart");
+    assert_eq!(reloaded_snapshot.workspaces.len(), 1);
+    let (connection_options, server_session, connect_guard) =
+        remote::RemoteClient::fake_server(restarted_client_cx, server_cx);
+    let server_executor = server_cx.executor();
+    let restarted_server_fs = FakeFs::new(server_cx.executor());
+    let _restarted_host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: server_session,
+                fs: restarted_server_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            database,
+            reloaded_snapshot,
+            cx,
+        )
+    });
+    let restarted_window = {
+        let mut async_cx = restarted_client_cx.to_async();
+        let attach = workspace::open_superzed_host(
+            connection_options,
+            Arc::new(remote::MockDelegate),
+            restarted_app_state,
+            &mut async_cx,
+        );
+        drop(connect_guard);
+        attach.await.expect("restarted GUI should attach")
+    };
+    let restarted_multi_workspace = restarted_window
+        .root(restarted_client_cx)
+        .expect("restarted GUI should restore the host shell");
+    let visual_cx =
+        &mut gpui::VisualTestContext::from_window(restarted_window.into(), restarted_client_cx);
+    let sidebar = setup_sidebar(&restarted_multi_workspace, visual_cx);
+    visual_cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(400.), gpui::px(900.)),
+        |_, _| sidebar.clone().into_any_element(),
+    );
+    let host_session = restarted_multi_workspace.read_with(visual_cx, |multi_workspace, _| {
+        multi_workspace
+            .host_session()
+            .expect("restarted host session should attach")
+            .clone()
+    });
+    assert_eq!(
+        host_session.read_with(visual_cx, |session, cx| session.connection_state(cx)),
+        remote::ConnectionState::Connected
+    );
+    let restored_workspace_id = host_session.read_with(visual_cx, |session, _| {
+        session.snapshot().active_workspace_id
+    });
+    let row_selector = format!(
+        "SUPERZED_WORKSPACE-{}",
+        restored_workspace_id.as_uuid().simple()
+    );
+    let row_selector = Box::leak(row_selector.into_boxed_str());
+    let row = visual_cx
+        .debug_bounds(row_selector)
+        .expect("restored workspace should remain switchable");
+    visual_cx.simulate_click(row.center(), gpui::Modifiers::none());
+    visual_cx.run_until_parked();
+    let close_selector = format!(
+        "SUPERZED_CLOSE_WORKSPACE-{}",
+        restored_workspace_id.as_uuid().simple()
+    );
+    let close_selector = Box::leak(close_selector.into_boxed_str());
+    let close = visual_cx
+        .debug_bounds(close_selector)
+        .expect("restored workspace should remain closable");
+    visual_cx.simulate_click(close.center(), gpui::Modifiers::none());
+    visual_cx.run_until_parked();
+    host_session.read_with(visual_cx, |session, cx| {
+        assert_eq!(
+            session.connection_state(cx),
+            remote::ConnectionState::Connected
+        );
+        assert_eq!(session.snapshot().workspaces.len(), 1);
+        assert_ne!(
+            session.snapshot().active_workspace_id,
+            restored_workspace_id
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_connecting_ssh_host_only_attaches_and_restores_its_session(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(remote_server::HeadlessProject::init);
+
+    let local_directory = tempfile::tempdir().expect("local host database directory");
+    let (local_database, local_snapshot) =
+        remote_server::SuperzedHost::load(local_directory.path().join("local.sqlite"))
+            .expect("local host database");
+    let authoritative_local_snapshot = local_snapshot.clone();
+    let (local_options, local_server_session, local_connect_guard) =
+        remote::RemoteClient::fake_server(cx, server_cx);
+
+    let remote_directory = tempfile::tempdir().expect("remote host database directory");
+    let (remote_database, mut remote_snapshot) =
+        remote_server::SuperzedHost::load(remote_directory.path().join("remote.sqlite"))
+            .expect("remote host database");
+    let first_remote_workspace_id = remote_snapshot.active_workspace_id;
+    apply_superzed_session_mutation(
+        &mut remote_snapshot,
+        superzed_session::SessionMutation::SetWorkspaceProjectRoots {
+            workspace_id: first_remote_workspace_id,
+            project_spec: superzed_project_spec(&["/remote/one"]),
+        },
+    );
+    apply_superzed_session_mutation(
+        &mut remote_snapshot,
+        superzed_session::SessionMutation::CreateWorkspace {
+            after: Some(first_remote_workspace_id),
+            project_spec: superzed_project_spec(&["/remote/two"]),
+        },
+    );
+    let authoritative_remote_snapshot = remote_snapshot.clone();
+    let (remote_options, remote_server_session, remote_connect_guard) =
+        remote::RemoteClient::fake_server(cx, server_cx);
+    let remote_host_id =
+        workspace::HostSessionClient::host_id_for_connection(&remote_options).unwrap();
+
+    let local_fs = FakeFs::new(server_cx.executor());
+    let remote_fs = FakeFs::new(server_cx.executor());
+    remote_fs
+        .insert_tree(
+            "/remote",
+            serde_json::json!({
+                "one": {},
+                "two": {},
+                "selected": {}
+            }),
+        )
+        .await;
+    let server_executor = server_cx.executor();
+    let _local_host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: local_server_session,
+                fs: local_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor.clone())),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            local_database,
+            local_snapshot,
+            cx,
+        )
+    });
+    let _remote_host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: remote_server_session,
+                fs: remote_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            remote_database,
+            remote_snapshot,
+            cx,
+        )
+    });
+
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+    let window = {
+        let mut async_cx = cx.to_async();
+        let attach = workspace::open_superzed_host(
+            local_options,
+            Arc::new(remote::MockDelegate),
+            app_state.clone(),
+            &mut async_cx,
+        );
+        drop(local_connect_guard);
+        attach.await.expect("local host should attach")
+    };
+    let multi_workspace = window.root(cx).expect("host window root");
+    let (local_session, local_workspace) = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        (
+            multi_workspace
+                .host_session_for_id(&workspace::HostId::Local, cx)
+                .expect("local session"),
+            multi_workspace.workspace().clone(),
+        )
+    });
+    let local_workspace_id = local_workspace.read_with(cx, |workspace, _| {
+        workspace
+            .host_workspace_identity()
+            .expect("local workspace identity")
+            .workspace_id
+    });
+
+    connect_mock_host_to_window(
+        remote_options.clone(),
+        remote_connect_guard,
+        window,
+        app_state.clone(),
+        cx,
+    )
+    .await;
+
+    let remote_session = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.host_sessions().len(), 2);
+        multi_workspace
+            .host_session_for_id(&remote_host_id, cx)
+            .expect("connected remote host session")
+    });
+    let active_after_attach = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspace()
+            .read(cx)
+            .host_workspace_identity()
+            .cloned()
+    });
+
+    window
+        .update(cx, |multi_workspace, window, cx| {
+            multi_workspace.activate(local_workspace.clone(), None, window, cx)
+        })
+        .expect("local workspace should reactivate for the reconnect assertion");
+    let mut async_cx = cx.to_async();
+    let reused_window = recent_projects::connect_ssh_host(
+        remote_options.clone(),
+        app_state.clone(),
+        window,
+        &mut async_cx,
+    )
+    .await
+    .expect("reconnecting an attached SSH host should reuse it");
+    let active_after_reconnect = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        multi_workspace
+            .workspace()
+            .read(cx)
+            .host_workspace_identity()
+            .cloned()
+    });
+
+    window
+        .update(cx, |multi_workspace, window, cx| {
+            multi_workspace.activate(local_workspace.clone(), None, window, cx)
+        })
+        .expect("local workspace should reactivate for the legacy path assertion");
+    let mut async_cx = cx.to_async();
+    recent_projects::connect_ssh_host(remote_options, app_state, window, &mut async_cx)
+        .await
+        .expect("repeated SSH host connection should reuse the attached host");
+
+    let (final_active, final_local_snapshot, final_remote_snapshot, final_remote_session) =
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            (
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .host_workspace_identity()
+                    .cloned(),
+                local_session.read(cx).snapshot().clone(),
+                remote_session.read(cx).snapshot().clone(),
+                multi_workspace
+                    .host_session_for_id(&remote_host_id, cx)
+                    .expect("reused remote host session"),
+            )
+        });
+
+    let expected_local_identity = workspace::HostWorkspaceIdentity {
+        host_id: workspace::HostId::Local,
+        workspace_id: local_workspace_id,
+        project_id: authoritative_local_snapshot.workspaces[0].project_id,
+    };
+    let mut violations = Vec::new();
+    if active_after_attach.as_ref() != Some(&expected_local_identity) {
+        violations.push("initial SSH connection switched away from the local workspace");
+    }
+    if active_after_reconnect.as_ref() != Some(&expected_local_identity) {
+        violations.push("reconnecting the SSH host switched away from the local workspace");
+    }
+    if final_active.as_ref() != Some(&expected_local_identity) {
+        violations.push("repeated SSH host connection switched away from the local workspace");
+    }
+    if final_local_snapshot != authoritative_local_snapshot {
+        violations.push("connecting the SSH host mutated the local session");
+    }
+    if final_remote_snapshot != authoritative_remote_snapshot {
+        violations.push("connecting the SSH host created or mutated remote workspaces/projects");
+    }
+    if final_remote_session != remote_session {
+        violations.push("reconnecting created a second HostSessionClient");
+    }
+    if reused_window != window || cx.update(|cx| cx.windows().len()) != 1 {
+        violations.push("connecting the SSH host created another window");
+    }
+    assert!(
+        violations.is_empty(),
+        "Connect SSH Host must only attach and restore one host session:\n- {}",
+        violations.join("\n- ")
+    );
+}
+
+#[gpui::test]
+async fn test_superzed_local_and_remote_hosts_are_isolated_and_reconnect_without_deletion(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(remote_server::HeadlessProject::init);
+
+    let local_directory = tempfile::tempdir().expect("local host database directory");
+    let local_database_path = local_directory.path().join("local.sqlite");
+    let (local_database, local_snapshot) =
+        remote_server::SuperzedHost::load(local_database_path).expect("local host database");
+    let local_fs = FakeFs::new(server_cx.executor());
+    let (local_options, local_server_session, local_connect_guard) =
+        remote::RemoteClient::fake_server(cx, server_cx);
+
+    let remote_directory = tempfile::tempdir().expect("remote host database directory");
+    let remote_database_path = remote_directory.path().join("remote.sqlite");
+    let (remote_database, remote_snapshot) =
+        remote_server::SuperzedHost::load(remote_database_path.clone())
+            .expect("remote host database");
+    let remote_fs = FakeFs::new(server_cx.executor());
+    remote_fs
+        .insert_tree(
+            "/remote",
+            serde_json::json!({
+                "one": { "one.txt": "one" },
+                "two": { "two.txt": "two" }
+            }),
+        )
+        .await;
+    let (remote_options, remote_server_session, remote_connect_guard) =
+        remote::RemoteClient::fake_server(cx, server_cx);
+    let remote_host_id =
+        workspace::HostSessionClient::host_id_for_connection(&remote_options).unwrap();
+
+    let server_executor = server_cx.executor();
+    let _local_host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: local_server_session,
+                fs: local_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor.clone())),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            local_database,
+            local_snapshot,
+            cx,
+        )
+    });
+    let _remote_host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: remote_server_session,
+                fs: remote_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            remote_database,
+            remote_snapshot,
+            cx,
+        )
+    });
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+    let window = {
+        let mut async_cx = cx.to_async();
+        let attach = workspace::open_superzed_host(
+            local_options,
+            Arc::new(remote::MockDelegate),
+            app_state.clone(),
+            &mut async_cx,
+        );
+        drop(local_connect_guard);
+        attach.await.expect("local host should attach")
+    };
+    connect_mock_host_to_window(
+        remote_options.clone(),
+        remote_connect_guard,
+        window,
+        app_state.clone(),
+        cx,
+    )
+    .await;
+
+    let multi_workspace = window.root(cx).expect("host window root");
+    let (local_session, remote_session) = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.host_sessions().len(), 2);
+        let local = multi_workspace
+            .host_session_for_id(&workspace::HostId::Local, cx)
+            .expect("local session");
+        let remote = multi_workspace
+            .host_session_for_id(&remote_host_id, cx)
+            .expect("remote session");
+        (local, remote)
+    });
+    let initial_remote = remote_session.read_with(cx, |session, _| {
+        let workspace = &session.snapshot().workspaces[0];
+        workspace::HostWorkspaceIdentity {
+            host_id: session.host_id().clone(),
+            workspace_id: workspace.id,
+            project_id: workspace.project_id,
+        }
+    });
+    let replace_initial = cx.update(|cx| {
+        workspace::HostSessionClient::replace_workspace_project_roots(
+            &remote_session,
+            window,
+            initial_remote,
+            superzed_project_spec(&["/remote/one"]),
+            cx,
+        )
+    });
+    replace_initial
+        .await
+        .expect("initial remote project should replace its roots");
+    let create_second = cx.update(|cx| {
+        workspace::HostSessionClient::create_workspace(
+            &remote_session,
+            window,
+            superzed_project_spec(&["/remote/two"]),
+            cx,
+        )
+    });
+    create_second
+        .await
+        .expect("second remote project workspace should be created explicitly");
+    let initial_remote_workspace_ids = remote_session.read_with(cx, |session, _| {
+        session
+            .snapshot()
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(initial_remote_workspace_ids.len(), 2);
+    assert_eq!(
+        remote_session.read_with(cx, |session, _| session
+            .snapshot()
+            .workspaces
+            .iter()
+            .map(|workspace| workspace
+                .project_spec
+                .roots
+                .iter()
+                .map(|root| root.canonical_path.clone())
+                .collect::<Vec<_>>())
+            .collect::<Vec<_>>()),
+        vec![
+            vec![PathBuf::from("/remote/one")],
+            vec![PathBuf::from("/remote/two")]
+        ]
+    );
+
+    let local_before = local_session.read_with(cx, |session, _| session.snapshot().clone());
+    let create_remote = cx.update(|cx| {
+        workspace::HostSessionClient::create_workspace(
+            &remote_session,
+            window,
+            Default::default(),
+            cx,
+        )
+    });
+    create_remote.await.expect("create remote workspace");
+    assert_eq!(
+        local_session.read_with(cx, |session, _| session.snapshot().clone()),
+        local_before,
+        "remote mutation changed the local host snapshot"
+    );
+    let remote_after_create = remote_session.read_with(cx, |session, _| session.snapshot().clone());
+    assert_eq!(remote_after_create.workspaces.len(), 3);
+
+    let create_local = cx.update(|cx| {
+        workspace::HostSessionClient::create_workspace(
+            &local_session,
+            window,
+            Default::default(),
+            cx,
+        )
+    });
+    create_local.await.expect("create local workspace");
+    assert_eq!(
+        remote_session.read_with(cx, |session, _| session.snapshot().clone()),
+        remote_after_create,
+        "local mutation changed the remote host snapshot"
+    );
+
+    window
+        .update(cx, |multi_workspace, window, cx| {
+            multi_workspace.disconnect_host(&remote_host_id, window, cx)
+        })
+        .expect("disconnect remote host");
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace
+            .host_sessions()
+            .len()),
+        1
+    );
+    assert!(
+        multi_workspace.read_with(cx, |multi_workspace, cx| multi_workspace.workspaces().all(
+            |workspace| workspace
+                .read(cx)
+                .host_workspace_identity()
+                .is_some_and(|identity| identity.host_id == workspace::HostId::Local)
+        ))
+    );
+    drop(remote_session);
+    cx.run_until_parked();
+
+    let (reconnect_database, reconnect_snapshot) =
+        remote_server::SuperzedHost::load(remote_database_path).expect("reload remote host state");
+    assert_eq!(reconnect_snapshot, remote_after_create);
+    let (reconnect_server_session, reconnect_guard) =
+        remote::RemoteClient::fake_server_with_opts(&remote_options, cx, server_cx);
+    let reconnect_fs = FakeFs::new(server_cx.executor());
+    reconnect_fs
+        .insert_tree(
+            "/remote",
+            serde_json::json!({
+                "one": { "one.txt": "one" },
+                "two": { "two.txt": "two" }
+            }),
+        )
+        .await;
+    let reconnect_executor = server_cx.executor();
+    let _reconnected_host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: reconnect_server_session,
+                fs: reconnect_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(reconnect_executor)),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            reconnect_database,
+            reconnect_snapshot,
+            cx,
+        )
+    });
+    connect_mock_host_to_window(remote_options, reconnect_guard, window, app_state, cx).await;
+    let restored_remote_ids = multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let session = multi_workspace
+            .host_session_for_id(&remote_host_id, cx)
+            .expect("reconnected remote session");
+        session
+            .read(cx)
+            .snapshot()
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        &restored_remote_ids[..initial_remote_workspace_ids.len()],
+        initial_remote_workspace_ids,
+        "reconnect changed existing remote workspace IDs"
+    );
+    assert_eq!(restored_remote_ids.len(), 3);
+}
+
+#[gpui::test]
+async fn test_superzed_milestone_restores_complete_host_session_into_the_sidebar(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let mut snapshot = superzed_session::HostSessionSnapshot::default();
+    let workspace_a_id = snapshot.active_workspace_id;
+    apply_superzed_session_mutation(
+        &mut snapshot,
+        superzed_session::SessionMutation::SetWorkspaceProjectRoots {
+            workspace_id: workspace_a_id,
+            project_spec: superzed_project_spec(&["/code/alpha", "/code/shared"]),
+        },
+    );
+
+    let pane_a = superzed_session::PaneId::new();
+    let pane_b = superzed_session::PaneId::new();
+    let mut alpha_item = superzed_file_item("/code/alpha/src/main.rs");
+    alpha_item.pinned = true;
+    let mut shared_item = superzed_file_item("/code/shared/common.rs");
+    shared_item.preview = true;
+    apply_superzed_session_mutation(
+        &mut snapshot,
+        superzed_session::SessionMutation::ReplaceWorkspaceLayout {
+            workspace_id: workspace_a_id,
+            expected_layout_revision: 0,
+            layout: superzed_session::LayoutNode::Axis {
+                axis: superzed_session::LayoutAxis::Horizontal,
+                flexes: vec![0.25, 0.75],
+                children: vec![
+                    superzed_session::LayoutNode::Pane(superzed_session::PaneSnapshot {
+                        id: pane_a,
+                        items: vec![alpha_item.clone()],
+                        active_item_id: Some(alpha_item.id),
+                        focused: true,
+                    }),
+                    superzed_session::LayoutNode::Pane(superzed_session::PaneSnapshot {
+                        id: pane_b,
+                        items: vec![shared_item.clone()],
+                        active_item_id: Some(shared_item.id),
+                        focused: false,
+                    }),
+                ],
+            },
+        },
+    );
+
+    apply_superzed_session_mutation(
+        &mut snapshot,
+        superzed_session::SessionMutation::CreateWorkspace {
+            after: Some(workspace_a_id),
+            project_spec: superzed_project_spec(&["/code/shared"]),
+        },
+    );
+    let workspace_b_id = snapshot.active_workspace_id;
+    let shared_second_item = superzed_file_item("/code/shared/second.rs");
+    apply_superzed_session_mutation(
+        &mut snapshot,
+        superzed_session::SessionMutation::ReplaceWorkspaceLayout {
+            workspace_id: workspace_b_id,
+            expected_layout_revision: 0,
+            layout: superzed_session::LayoutNode::Pane(superzed_session::PaneSnapshot {
+                id: superzed_session::PaneId::new(),
+                items: vec![shared_second_item.clone()],
+                active_item_id: Some(shared_second_item.id),
+                focused: true,
+            }),
+        },
+    );
+    apply_superzed_session_mutation(
+        &mut snapshot,
+        superzed_session::SessionMutation::CreateWorkspace {
+            after: Some(workspace_b_id),
+            project_spec: superzed_project_spec(&[]),
+        },
+    );
+    let workspace_c_id = snapshot.active_workspace_id;
+    apply_superzed_session_mutation(
+        &mut snapshot,
+        superzed_session::SessionMutation::ActivateWorkspace {
+            workspace_id: workspace_b_id,
+        },
+    );
+    let expected_snapshot = snapshot.clone();
+
+    let database_directory = tempfile::tempdir().expect("temporary database directory should open");
+    let database_path = database_directory.path().join("host-session.sqlite");
+    let (database, _) = remote_server::SuperzedHost::load(database_path.clone())
+        .expect("host session database should open");
+    database
+        .save(&snapshot)
+        .expect("acceptance fixture should persist");
+    drop(database);
+    let (database, reloaded_snapshot) = remote_server::SuperzedHost::load(database_path)
+        .expect("host session should reload after a server restart");
+    assert_eq!(
+        reloaded_snapshot, expected_snapshot,
+        "server restart must preserve workspace IDs, order, active workspace, roots, and layouts"
+    );
+
+    init_test(cx);
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    let server_fs = FakeFs::new(server_cx.executor());
+    server_fs
+        .insert_tree(
+            "/code",
+            serde_json::json!({
+                "alpha": { "src": { "main.rs": "fn main() {}" } },
+                "shared": {
+                    "common.rs": "pub const COMMON: bool = true;",
+                    "second.rs": "pub const SECOND: bool = true;"
+                }
+            }),
+        )
+        .await;
+    let (connection_options, server_session, connect_guard) =
+        remote::RemoteClient::fake_server(cx, server_cx);
+    server_cx.update(remote_server::HeadlessProject::init);
+    let server_executor = server_cx.executor();
+    let _host = server_cx.new(|cx| {
+        remote_server::SuperzedHost::new(
+            remote_server::HeadlessAppState {
+                session: server_session,
+                fs: server_fs,
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            database,
+            reloaded_snapshot,
+            cx,
+        )
+    });
+    drop(connect_guard);
+
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+    let window = {
+        let mut async_cx = cx.to_async();
+        workspace::open_superzed_host(
+            connection_options,
+            Arc::new(remote::MockDelegate),
+            app_state,
+            &mut async_cx,
+        )
+        .await
+        .expect("client startup should restore the complete host session")
+    };
+    let multi_workspace = window
+        .root(cx)
+        .expect("restored window should contain a MultiWorkspace");
+    let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    cx.run_until_parked();
+
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    cx.draw(
+        gpui::point(px(0.), px(0.)),
+        gpui::size(px(400.), px(600.)),
+        |_, _| sidebar.clone().into_any_element(),
+    );
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        let workspaces = multi_workspace.workspaces().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            workspaces.len(),
+            expected_snapshot.workspaces.len(),
+            "client startup must not lose or add workspaces"
+        );
+        let restored = workspaces
+            .iter()
+            .enumerate()
+            .map(|(position, workspace)| {
+                let identity = workspace
+                    .read(cx)
+                    .host_workspace_identity()
+                    .expect("every restored workspace should have host identity");
+                let project = workspace.read(cx).project().read(cx);
+                let mut roots = project
+                    .worktrees(cx)
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                    .collect::<Vec<_>>();
+                roots.sort();
+                (
+                    position,
+                    identity.workspace_id,
+                    identity.project_id,
+                    roots,
+                    workspace.read(cx).panes().len(),
+                    workspace
+                        .read(cx)
+                        .panes()
+                        .iter()
+                        .map(|pane| pane.read(cx).items().count())
+                        .sum::<usize>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = expected_snapshot
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(position, workspace)| {
+                let mut roots = workspace
+                    .project_spec
+                    .roots
+                    .iter()
+                    .map(|root| root.canonical_path.clone())
+                    .collect::<Vec<_>>();
+                roots.sort();
+                let (pane_count, item_count) = match &workspace.layout {
+                    superzed_session::LayoutNode::Axis { children, .. } => (
+                        children.len(),
+                        children
+                            .iter()
+                            .map(|child| match child {
+                                superzed_session::LayoutNode::Pane(pane) => pane.items.len(),
+                                superzed_session::LayoutNode::Axis { .. } => 0,
+                            })
+                            .sum(),
+                    ),
+                    superzed_session::LayoutNode::Pane(pane) => (1, pane.items.len()),
+                };
+                (
+                    position,
+                    workspace.id,
+                    workspace.project_id,
+                    roots,
+                    pane_count,
+                    item_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored, expected,
+            "client startup must restore exact workspace identity, order, roots, panes, and files"
+        );
+        assert_eq!(
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .host_workspace_identity()
+                .map(|identity| identity.workspace_id),
+            Some(workspace_b_id),
+            "client startup must restore the active workspace"
+        );
+
+        let workspace_a = workspaces
+            .iter()
+            .find(|workspace| {
+                workspace
+                    .read(cx)
+                    .host_workspace_identity()
+                    .is_some_and(|identity| identity.workspace_id == workspace_a_id)
+            })
+            .expect("first persisted workspace should be projected");
+        let workspace_a = workspace_a.read(cx);
+        let workspace::Member::Axis(axis) = &workspace_a.center_pane_group_for_test().root else {
+            panic!("persisted split workspace should restore its axis");
+        };
+        assert_eq!(*axis.flexes.lock(), vec![0.5, 1.5]);
+        assert_eq!(workspace_a.panes()[0].read(cx).pinned_count(), 1);
+        let preview_pane = workspace_a.panes()[1].read(cx);
+        let preview_item = preview_pane
+            .active_item()
+            .expect("preview pane should restore its active editor");
+        assert!(preview_pane.is_active_preview_item(preview_item.item_id()));
+    });
+
+    for workspace_id in [workspace_a_id, workspace_b_id, workspace_c_id] {
+        let selector = format!("SUPERZED_WORKSPACE-{}", workspace_id.as_uuid().simple());
+        let selector = Box::leak(selector.into_boxed_str());
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "persisted workspace {workspace_id} should appear in the existing sidebar"
+        );
+    }
+}
+
 #[gpui::test]
 async fn test_workspace_lifecycle_retains_projects_when_sidebar_is_closed(cx: &mut TestAppContext) {
     let (fs, project_a) =

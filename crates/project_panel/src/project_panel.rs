@@ -7432,14 +7432,13 @@ impl Render for ProjectPanel {
                     ProjectEmptyState::new(
                         "Project Panel",
                         focus_handle.clone(),
-                        KeyBinding::for_action_in(&workspace::Open::default(), &focus_handle, cx),
+                        KeyBinding::for_action_in(&workspace::Open, &focus_handle, cx),
                     )
                     .on_open_project(move |_, window, cx| {
                         telemetry::event!("Project Panel Add Project Clicked");
                         workspace
                             .update(cx, |_, cx| {
-                                window
-                                    .dispatch_action(workspace::Open::default().boxed_clone(), cx);
+                                window.dispatch_action(workspace::Open.boxed_clone(), cx);
                             })
                             .log_err();
                     })

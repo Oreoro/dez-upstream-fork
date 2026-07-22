@@ -11207,10 +11207,8 @@ impl ThreadView {
                 Button::new("open-wsl-modal", "Open in WSL").on_click(cx.listener({
                     move |_, _, _window, cx| {
                         #[cfg(windows)]
-                        _window.dispatch_action(
-                            zed_actions::wsl_actions::OpenWsl::default().boxed_clone(),
-                            cx,
-                        );
+                        _window
+                            .dispatch_action(zed_actions::wsl_actions::OpenWsl.boxed_clone(), cx);
                         cx.notify();
                     }
                 })),

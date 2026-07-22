@@ -955,6 +955,7 @@ impl SettingsObserver {
         worktree_store: Entity<WorktreeStore>,
         task_store: Entity<TaskStore>,
         upstream_client: Option<AnyProtoClient>,
+        project_id: u64,
         via_collab: bool,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -971,7 +972,7 @@ impl SettingsObserver {
                                 user_settings = Some(new_settings.clone());
                                 upstream_client
                                     .send(proto::UpdateUserSettings {
-                                        project_id: REMOTE_SERVER_PROJECT_ID,
+                                        project_id,
                                         contents: new_settings_string,
                                     })
                                     .log_err();
@@ -987,7 +988,7 @@ impl SettingsObserver {
             task_store,
             mode: SettingsObserverMode::Remote { via_collab },
             downstream_client: None,
-            project_id: REMOTE_SERVER_PROJECT_ID,
+            project_id,
             _trusted_worktrees_watcher: None,
             pending_local_settings: HashMap::default(),
             _user_settings_watcher: user_settings_watcher,

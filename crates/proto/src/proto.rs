@@ -361,6 +361,10 @@ messages!(
     (GitGetWorktrees, Background),
     (GitGetHeadSha, Background),
     (GitGetHeadShaResponse, Background),
+    (GetSuperzedSession, Foreground),
+    (GetSuperzedSessionResponse, Foreground),
+    (ResolveSuperzedProjectSpec, Foreground),
+    (ResolveSuperzedProjectSpecResponse, Foreground),
     (GitEditRef, Background),
     (GitRepairWorktrees, Background),
     (GetCommitData, Background),
@@ -380,11 +384,24 @@ messages!(
     (SpawnKernel, Background),
     (SpawnKernelResponse, Background),
     (KillKernel, Background),
+    (MutateSuperzedSession, Foreground),
+    (MutateSuperzedSessionResponse, Foreground),
+    (InitializeSuperzedProject, Foreground),
+    (InitializeSuperzedProjectResponse, Foreground),
+    (ResyncSuperzedProject, Foreground),
     (GetRemoteProfilingData, Background),
     (GetRemoteProfilingDataResponse, Background),
 );
 
 request_messages!(
+    (GetSuperzedSession, GetSuperzedSessionResponse),
+    (
+        ResolveSuperzedProjectSpec,
+        ResolveSuperzedProjectSpecResponse
+    ),
+    (MutateSuperzedSession, MutateSuperzedSessionResponse),
+    (InitializeSuperzedProject, InitializeSuperzedProjectResponse),
+    (ResyncSuperzedProject, Ack),
     (AllocateWorktreeId, AllocateWorktreeIdResponse),
     (ApplyCodeAction, ApplyCodeActionResponse),
     (
@@ -686,6 +703,7 @@ entity_messages!(
     RefreshSemanticTokens,
     RefreshCodeLens,
     ReloadBuffers,
+    RemoveWorktree,
     RemoveProjectCollaborator,
     RenameProjectEntry,
     ResolveCompletionDocumentation,
@@ -799,7 +817,9 @@ entity_messages!(
     FindSearchCandidatesChunk,
     FindSearchCandidatesCancelled,
     DownloadFileByPath,
-    GetRemoteProfilingData
+    GetRemoteProfilingData,
+    InitializeSuperzedProject,
+    ResyncSuperzedProject
 );
 
 entity_messages!(

@@ -728,9 +728,12 @@ async fn test_context_server_refreshed_when_worktree_added(cx: &mut TestAppConte
 
     {
         let _server_events = assert_server_events(&store, vec![], cx);
-        let _ = project.update(cx, |project, cx| {
-            project.find_or_create_worktree(path!("/second"), true, cx)
-        });
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path!("/second"), true, cx)
+            })
+            .await
+            .expect("second worktree should be added");
         cx.run_until_parked();
     }
 
@@ -1733,7 +1736,7 @@ impl FakeContextServerDescriptor {
 impl ContextServerDescriptor for FakeContextServerDescriptor {
     fn command(
         &self,
-        _worktree_store: Entity<WorktreeStore>,
+        _project_context: Option<Entity<WorktreeStore>>,
         _cx: &AsyncApp,
     ) -> Task<Result<ContextServerCommand>> {
         Task::ready(Ok(ContextServerCommand {
@@ -1746,7 +1749,7 @@ impl ContextServerDescriptor for FakeContextServerDescriptor {
 
     fn configuration(
         &self,
-        _worktree_store: Entity<WorktreeStore>,
+        _project_context: Option<Entity<WorktreeStore>>,
         _cx: &AsyncApp,
     ) -> Task<Result<Option<::extension::ContextServerConfiguration>>> {
         Task::ready(Ok(None))

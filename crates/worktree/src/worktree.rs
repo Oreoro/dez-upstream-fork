@@ -744,6 +744,26 @@ impl Worktree {
         }
     }
 
+    pub fn current_git_repository_updates(&self) -> UpdatedGitRepositoriesSet {
+        let Some(worktree) = self.as_local() else {
+            return Arc::new([]);
+        };
+        worktree
+            .snapshot
+            .git_repositories
+            .iter()
+            .map(|(work_directory_id, repository)| UpdatedGitRepository {
+                work_directory_id: *work_directory_id,
+                old_work_directory_abs_path: None,
+                new_work_directory_abs_path: Some(repository.work_directory_abs_path.clone()),
+                dot_git_abs_path: Some(repository.dot_git_abs_path.clone()),
+                repository_dir_abs_path: Some(repository.repository_dir_abs_path.clone()),
+                common_dir_abs_path: Some(repository.common_dir_abs_path.clone()),
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+
     pub fn as_local_mut(&mut self) -> Option<&mut LocalWorktree> {
         if let Worktree::Local(worktree) = self {
             Some(worktree)
@@ -780,6 +800,11 @@ impl Worktree {
             Worktree::Local(worktree) => worktree.snapshot.snapshot.clone(),
             Worktree::Remote(worktree) => worktree.snapshot.clone(),
         }
+    }
+
+    pub fn initial_update(&self, project_id: u64) -> proto::UpdateWorktree {
+        self.snapshot()
+            .build_initial_update(project_id, self.id().to_proto())
     }
 
     pub fn scan_id(&self) -> usize {

@@ -1,5 +1,6 @@
 use crate::{
     ProjectPath,
+    host_resource_registry::HostResourceRegistry,
     lsp_store::OpenLspBufferHandle,
     worktree_store::{WorktreeStore, WorktreeStoreEvent},
 };
@@ -42,6 +43,8 @@ pub struct BufferStore {
     shared_buffers: HashMap<proto::PeerId, HashMap<BufferId, SharedBuffer>>,
     non_searchable_buffers: HashSet<BufferId>,
     project_search: RemoteProjectSearchState,
+    host_resource_registry: HostResourceRegistry,
+    host_resource_buffers: HashSet<(WorktreeId, Arc<RelPath>)>,
 }
 
 #[derive(Default)]
@@ -109,6 +112,12 @@ impl PartialEq for ProjectTransaction {
 }
 
 impl EventEmitter<BufferStoreEvent> for BufferStore {}
+
+impl Drop for BufferStore {
+    fn drop(&mut self) {
+        self.release_host_resources();
+    }
+}
 
 impl RemoteBufferStore {
     pub fn wait_for_remote_buffer(
@@ -643,7 +652,7 @@ impl LocalBufferStore {
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<Entity<Buffer>>> {
         let load_file = worktree.update(cx, |worktree, cx| worktree.load_file(path.as_ref(), cx));
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |_this, cx| {
             let path = path.clone();
             let buffer = match load_file.await {
                 Ok(loaded) => {
@@ -687,40 +696,6 @@ impl LocalBufferStore {
                 }),
                 Err(e) => return Err(e),
             };
-            this.update(cx, |this, cx| {
-                this.add_buffer(buffer.clone(), cx)?;
-                let buffer_id = buffer.read(cx).remote_id();
-                if let Some(file) = File::from_dyn(buffer.read(cx).file()) {
-                    let project_path = ProjectPath {
-                        worktree_id: file.worktree_id(cx),
-                        path: file.path.clone(),
-                    };
-                    let entry_id = file.entry_id;
-
-                    // Check if the file should be read-only based on settings
-                    let settings = WorktreeSettings::get(Some((&project_path).into()), cx);
-                    let is_read_only = if project_path.path.is_empty() {
-                        settings.is_std_path_read_only(&file.full_path(cx))
-                    } else {
-                        settings.is_path_read_only(&project_path.path)
-                    };
-                    if is_read_only {
-                        buffer.update(cx, |buffer, cx| {
-                            buffer.set_capability(Capability::Read, cx);
-                        });
-                    }
-
-                    this.path_to_buffer_id.insert(project_path, buffer_id);
-                    let this = this.as_local_mut().unwrap();
-                    if let Some(entry_id) = entry_id {
-                        this.local_buffer_ids_by_entry_id
-                            .insert(entry_id, buffer_id);
-                    }
-                }
-
-                anyhow::Ok(())
-            })??;
-
             Ok(buffer)
         })
     }
@@ -776,6 +751,13 @@ impl LocalBufferStore {
 }
 
 impl BufferStore {
+    pub fn release_host_resources(&mut self) {
+        for (worktree_id, path) in self.host_resource_buffers.drain() {
+            self.host_resource_registry
+                .release_buffer(worktree_id, &path);
+        }
+    }
+
     pub fn init(client: &AnyProtoClient) {
         client.add_entity_message_handler(Self::handle_buffer_reloaded);
         client.add_entity_message_handler(Self::handle_buffer_saved);
@@ -786,6 +768,7 @@ impl BufferStore {
 
     /// Creates a buffer store, optionally retaining its buffers.
     pub fn local(worktree_store: Entity<WorktreeStore>, cx: &mut Context<Self>) -> Self {
+        let host_resource_registry = worktree_store.read(cx).host_resource_registry();
         Self {
             state: BufferStoreState::Local(LocalBufferStore {
                 local_buffer_ids_by_entry_id: Default::default(),
@@ -805,6 +788,8 @@ impl BufferStore {
             non_searchable_buffers: Default::default(),
             worktree_store,
             project_search: Default::default(),
+            host_resource_registry,
+            host_resource_buffers: Default::default(),
         }
     }
 
@@ -831,6 +816,8 @@ impl BufferStore {
             non_searchable_buffers: Default::default(),
             worktree_store,
             project_search: Default::default(),
+            host_resource_registry: HostResourceRegistry::default(),
+            host_resource_buffers: Default::default(),
         }
     }
 
@@ -876,20 +863,50 @@ impl BufferStore {
                 else {
                     return Task::ready(Err(anyhow!("no such worktree")));
                 };
+                let is_local = matches!(&self.state, BufferStoreState::Local(_));
+                let host_resource_key = is_local.then(|| (project_path.worktree_id, path.clone()));
+                if let Some(host_resource_key) = host_resource_key.clone() {
+                    self.host_resource_buffers.insert(host_resource_key);
+                }
                 let load_buffer = match &self.state {
-                    BufferStoreState::Local(this) => this.open_buffer(path, worktree, cx),
-                    BufferStoreState::Remote(this) => this.open_buffer(path, worktree, cx),
+                    BufferStoreState::Local(this) => {
+                        let host_resource_registry = self.host_resource_registry.clone();
+                        let worktree_id = project_path.worktree_id;
+                        host_resource_registry.acquire_buffer(worktree_id, path.clone(), || {
+                            let load_buffer = this.open_buffer(path, worktree, cx);
+                            cx.spawn(async move |_, _| load_buffer.await.map_err(Arc::new))
+                        })
+                    }
+                    BufferStoreState::Remote(this) => {
+                        let load_buffer = this.open_buffer(path, worktree, cx);
+                        cx.spawn(async move |_, _| load_buffer.await.map_err(Arc::new))
+                            .shared()
+                    }
                 };
 
                 entry
                     .insert(
                         cx.spawn(async move |this, cx| {
                             let load_result = load_buffer.await;
-                            this.update(cx, |this, _cx| {
+                            this.update(cx, |this, cx| {
                                 // Record the fact that the buffer is no longer loading.
                                 this.loading_buffers.remove(&project_path);
 
-                                let buffer = load_result.map_err(Arc::new)?;
+                                let buffer = match load_result {
+                                    Ok(buffer) => buffer,
+                                    Err(error) => {
+                                        if let Some((worktree_id, path)) = host_resource_key {
+                                            this.host_resource_buffers
+                                                .remove(&(worktree_id, path.clone()));
+                                            this.host_resource_registry
+                                                .release_buffer(worktree_id, &path);
+                                        }
+                                        return Err(error);
+                                    }
+                                };
+                                if is_local {
+                                    this.attach_local_buffer(buffer.clone(), cx)?;
+                                }
                                 Ok(buffer)
                             })?
                         })
@@ -1012,6 +1029,51 @@ impl BufferStore {
 
         cx.subscribe(&buffer_entity, Self::on_buffer_event).detach();
         cx.emit(BufferStoreEvent::BufferAdded(buffer_entity));
+        Ok(())
+    }
+
+    fn attach_local_buffer(
+        &mut self,
+        buffer: Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let buffer_id = buffer.read(cx).remote_id();
+        if self.get(buffer_id).is_some() {
+            return Ok(());
+        }
+
+        self.add_buffer(buffer.clone(), cx)?;
+        let Some((project_path, full_path, entry_id)) = buffer.read_with(cx, |buffer, cx| {
+            let file = File::from_dyn(buffer.file())?;
+            let project_path = ProjectPath {
+                worktree_id: file.worktree_id(cx),
+                path: file.path.clone(),
+            };
+            Some((project_path, file.full_path(cx), file.entry_id))
+        }) else {
+            return Ok(());
+        };
+        let settings = WorktreeSettings::get(Some((&project_path).into()), cx);
+        let is_read_only = if project_path.path.is_empty() {
+            settings.is_std_path_read_only(&full_path)
+        } else {
+            settings.is_path_read_only(&project_path.path)
+        };
+        if is_read_only {
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_capability(Capability::Read, cx);
+            });
+        }
+
+        self.path_to_buffer_id
+            .insert(project_path, buffer.read(cx).remote_id());
+        if let Some(entry_id) = entry_id
+            && let Some(local) = self.as_local_mut()
+        {
+            local
+                .local_buffer_ids_by_entry_id
+                .insert(entry_id, buffer_id);
+        }
         Ok(())
     }
 

@@ -11,12 +11,12 @@ use crate::worktree_store::WorktreeStore;
 pub trait ContextServerDescriptor {
     fn command(
         &self,
-        worktree_store: Entity<WorktreeStore>,
+        project_context: Option<Entity<WorktreeStore>>,
         cx: &AsyncApp,
     ) -> Task<Result<ContextServerCommand>>;
     fn configuration(
         &self,
-        worktree_store: Entity<WorktreeStore>,
+        project_context: Option<Entity<WorktreeStore>>,
         cx: &AsyncApp,
     ) -> Task<Result<Option<ContextServerConfiguration>>>;
 }
@@ -28,6 +28,7 @@ impl Global for GlobalContextServerDescriptorRegistry {}
 #[derive(Default)]
 pub struct ContextServerDescriptorRegistry {
     context_servers: HashMap<Arc<str>, Arc<dyn ContextServerDescriptor>>,
+    descriptor_revisions: HashMap<Arc<str>, u64>,
 }
 
 impl ContextServerDescriptorRegistry {
@@ -47,7 +48,12 @@ impl ContextServerDescriptorRegistry {
     pub fn new() -> Self {
         Self {
             context_servers: HashMap::default(),
+            descriptor_revisions: HashMap::default(),
         }
+    }
+
+    pub fn descriptor_revision(&self, id: &str) -> u64 {
+        self.descriptor_revisions.get(id).copied().unwrap_or(0)
     }
 
     pub fn context_server_descriptors(&self) -> Vec<(Arc<str>, Arc<dyn ContextServerDescriptor>)> {
@@ -68,7 +74,9 @@ impl ContextServerDescriptorRegistry {
         descriptor: Arc<dyn ContextServerDescriptor>,
         cx: &mut Context<Self>,
     ) {
-        self.context_servers.insert(id, descriptor);
+        self.context_servers.insert(id.clone(), descriptor);
+        let revision = self.descriptor_revisions.entry(id).or_default();
+        *revision = revision.wrapping_add(1);
         cx.notify();
     }
 
@@ -79,6 +87,11 @@ impl ContextServerDescriptorRegistry {
         cx: &mut Context<Self>,
     ) {
         self.context_servers.remove(server_id);
+        let revision = self
+            .descriptor_revisions
+            .entry(server_id.into())
+            .or_default();
+        *revision = revision.wrapping_add(1);
         cx.notify();
     }
 }

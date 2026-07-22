@@ -545,6 +545,11 @@ impl ButtonLike {
         }
     }
 
+    pub fn debug_selector(mut self, selector: impl FnOnce() -> String) -> Self {
+        self.base = self.base.debug_selector(selector);
+        self
+    }
+
     pub fn new_rounded_left(id: impl Into<ElementId>) -> Self {
         Self::new(id).rounding(ButtonLikeRounding::LEFT)
     }

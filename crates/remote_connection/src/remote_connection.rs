@@ -231,6 +231,7 @@ impl RemoteConnectionModal {
         cx: &mut Context<Self>,
     ) -> Self {
         let (connection_string, nickname, is_wsl, is_devcontainer) = match connection_options {
+            RemoteConnectionOptions::Local(_) => ("Local".to_owned(), None, false, false),
             RemoteConnectionOptions::Ssh(options) => (
                 options.connection_string(),
                 options.nickname.clone(),

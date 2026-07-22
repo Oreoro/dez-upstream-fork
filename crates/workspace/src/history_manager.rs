@@ -1,14 +1,13 @@
 use std::{path::PathBuf, sync::Arc};
 
 use fs::Fs;
-use gpui::{AppContext, Entity, Global, MenuItem};
+use gpui::{AppContext, Entity, Global};
 use smallvec::SmallVec;
 use ui::{App, Context};
 use util::{ResultExt, paths::PathExt};
 
 use crate::{
-    NewWindow, SerializedWorkspaceLocation, WorkspaceId, path_list::PathList,
-    persistence::WorkspaceDb,
+    SerializedWorkspaceLocation, WorkspaceId, path_list::PathList, persistence::WorkspaceDb,
 };
 
 pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
@@ -99,7 +98,7 @@ impl HistoryManager {
     }
 
     fn update_jump_list(&mut self, cx: &mut Context<'_, HistoryManager>) {
-        let menus = vec![MenuItem::action("New Window", NewWindow)];
+        let menus = Vec::new();
         let entries = self
             .history
             .iter()

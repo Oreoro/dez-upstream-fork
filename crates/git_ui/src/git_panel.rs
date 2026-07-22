@@ -6589,11 +6589,11 @@ impl GitPanel {
             ProjectEmptyState::new(
                 "Git Panel",
                 focus_handle.clone(),
-                KeyBinding::for_action_in(&workspace::Open::default(), &focus_handle, cx),
+                KeyBinding::for_action_in(&workspace::Open, &focus_handle, cx),
             )
             .on_open_project(|_, window, cx| {
                 telemetry::event!("Git Panel Add Project Clicked");
-                window.dispatch_action(workspace::Open::default().boxed_clone(), cx);
+                window.dispatch_action(workspace::Open.boxed_clone(), cx);
             })
             .on_clone_repo(|_, window, cx| {
                 telemetry::event!("Git Panel Clone Repo Clicked");

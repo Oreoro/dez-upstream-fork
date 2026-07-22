@@ -67,6 +67,7 @@ prompt_store.workspace = true
 recent_projects = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
 fs = { workspace = true, features = ["test-support"] }
+futures.workspace = true
 git.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 client = { workspace = true, features = ["test-support"] }
@@ -79,4 +80,6 @@ remote = { workspace = true, features = ["test-support"] }
 remote_connection = { workspace = true, features = ["test-support"] }
 remote_server = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
+superzed_session.workspace = true
+tempfile.workspace = true
 workspace = { workspace = true, features = ["test-support"] }

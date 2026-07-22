@@ -178,6 +178,7 @@ members = [
     "crates/schema_generator",
     "crates/search",
     "crates/session",
+    "crates/superzed_session",
     "crates/settings",
     "crates/settings_content",
     "crates/settings_json",
@@ -440,6 +441,7 @@ sandbox = { path = "crates/sandbox" }
 search = { path = "crates/search" }
 session = { path = "crates/session" }
 sidebar = { path = "crates/sidebar" }
+superzed_session = { path = "crates/superzed_session" }
 settings = { path = "crates/settings" }
 settings_content = { path = "crates/settings_content" }
 settings_json = { path = "crates/settings_json" }
@@ -488,7 +490,7 @@ web_search_providers = { path = "crates/web_search_providers" }
 workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }
 x_ai = { path = "crates/x_ai" }
-zed = { path = "crates/zed" }
+superzed = { path = "crates/zed" }
 zed_actions = { path = "crates/zed_actions" }
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
@@ -1030,7 +1032,7 @@ lto = "thin"
 codegen-units = 1
 
 [profile.release.package]
-zed = { codegen-units = 16 }
+superzed = { codegen-units = 16 }
 
 [profile.release-fast]
 inherits = "release"

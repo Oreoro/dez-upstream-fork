@@ -10,10 +10,7 @@ use crate::plan_chip::PlanChip;
 use agent_settings::{AgentSettings, WindowLayout};
 use arrayvec::ArrayVec;
 use git_ui::worktree_picker::WorktreePicker;
-pub use platform_title_bar::{
-    self, DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, PlatformTitleBar,
-    ShowNextWindowTab, ShowPreviousWindowTab,
-};
+pub use platform_title_bar::{self, PlatformTitleBar};
 use project::{linked_worktree_short_name, repo_identity_path};
 
 #[cfg(not(target_os = "macos"))]
@@ -56,8 +53,6 @@ use workspace::{
     notifications::{NotifyResultExt, NotifyTaskExt as _},
 };
 
-use zed_actions::OpenRemote;
-
 pub use onboarding_banner::restore_banner;
 
 const MAX_PROJECT_NAME_LENGTH: usize = 40;
@@ -89,8 +84,6 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    platform_title_bar::PlatformTitleBar::init(cx);
-
     update_layout_action_filter(cx);
 
     cx.observe_global::<SettingsStore>(update_layout_action_filter)
@@ -601,23 +594,17 @@ impl TitleBar {
     }
 
     fn render_remote_project_connection(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let workspace = self.workspace.clone();
-
         let options = self.project.read(cx).remote_connection_options(cx)?;
         let host: SharedString = options.display_name().into();
 
         let (nickname, tooltip_title, icon) = match options {
-            RemoteConnectionOptions::Ssh(options) => (
-                options.nickname.map(|nick| nick.into()),
-                "Remote Project",
-                IconName::Server,
-            ),
+            RemoteConnectionOptions::Local(_) | RemoteConnectionOptions::Ssh(_) => return None,
             RemoteConnectionOptions::Wsl(_) => (None, "Remote Project", IconName::Linux),
             RemoteConnectionOptions::Docker(_dev_container_connection) => {
                 (None, "Dev Container", IconName::Box)
             }
             #[cfg(any(test, feature = "test-support"))]
-            RemoteConnectionOptions::Mock(_) => (None, "Mock Remote Project", IconName::Server),
+            RemoteConnectionOptions::Mock(_) => return None,
         };
 
         let nickname = nickname.unwrap_or_else(|| host.clone());
@@ -649,47 +636,25 @@ impl TitleBar {
         let meta = SharedString::from(meta);
 
         Some(
-            PopoverMenu::new("remote-project-menu")
-                .menu(move |window, cx| {
-                    let workspace_entity = workspace.upgrade()?;
-                    let fs = workspace_entity.read(cx).project().read(cx).fs().clone();
-                    Some(recent_projects::RemoteServerProjects::popover(
-                        fs,
-                        workspace.clone(),
-                        None,
-                        window,
-                        cx,
-                    ))
-                })
-                .trigger_with_tooltip(
-                    ButtonLike::new("remote_project")
-                        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            ButtonLike::new("remote_project")
+                .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .max_w_32()
                         .child(
-                            h_flex()
-                                .gap_2()
-                                .max_w_32()
-                                .child(
-                                    IconWithIndicator::new(
-                                        Icon::new(icon).size(IconSize::Small).color(icon_color),
-                                        Some(Indicator::dot().color(indicator_color)),
-                                    )
-                                    .indicator_border_color(Some(
-                                        cx.theme().colors().title_bar_background,
-                                    ))
-                                    .into_any_element(),
-                                )
-                                .child(Label::new(nickname).size(LabelSize::Small).truncate()),
-                        ),
-                    move |_window, cx| {
-                        Tooltip::with_meta(
-                            tooltip_title,
-                            Some(&OpenRemote::default()),
-                            meta.clone(),
-                            cx,
+                            IconWithIndicator::new(
+                                Icon::new(icon).size(IconSize::Small).color(icon_color),
+                                Some(Indicator::dot().color(indicator_color)),
+                            )
+                            .indicator_border_color(Some(cx.theme().colors().title_bar_background))
+                            .into_any_element(),
                         )
-                    },
+                        .child(Label::new(nickname).size(LabelSize::Small).truncate()),
                 )
-                .anchor(gpui::Anchor::TopLeft)
+                .tooltip(move |_window, cx| {
+                    Tooltip::with_meta(tooltip_title, None, meta.clone(), cx)
+                })
                 .into_any_element(),
         )
     }
@@ -737,6 +702,14 @@ impl TitleBar {
     }
 
     pub fn render_project_host(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self
+            .workspace
+            .upgrade()
+            .is_some_and(|workspace| workspace.read(cx).host_workspace_identity().is_some())
+        {
+            return None;
+        }
+
         if self.project.read(cx).is_via_remote_server() {
             return self.render_remote_project_connection(cx);
         }
@@ -793,14 +766,24 @@ impl TitleBar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let workspace = self.workspace.clone();
+        let is_host_workspace = workspace
+            .upgrade()
+            .is_some_and(|workspace| workspace.read(cx).host_workspace_identity().is_some());
 
         let is_project_selected = name.is_some();
 
         let display_name = if let Some(ref name) = name {
             util::truncate_and_trailoff(name, MAX_PROJECT_NAME_LENGTH)
         } else {
-            "Open Recent Project".to_string()
+            "Open Project".to_string()
         };
+
+        if is_host_workspace {
+            return Button::new("project_name", display_name)
+                .label_size(LabelSize::Small)
+                .disabled(true)
+                .into_any_element();
+        }
 
         let is_sidebar_open = self
             .multi_workspace
@@ -840,7 +823,6 @@ impl TitleBar {
                 Some(recent_projects::RecentProjects::popover(
                     workspace.clone(),
                     window_project_groups.clone(),
-                    None,
                     focus_handle.clone(),
                     window,
                     cx,
@@ -860,7 +842,7 @@ impl TitleBar {
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .when(!is_project_selected, |s| s.color(Color::Muted)),
                 move |_window, cx| {
-                    Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent::default(), cx)
+                    Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent, cx)
                 },
             )
             .anchor(gpui::Anchor::TopLeft)
@@ -892,7 +874,6 @@ impl TitleBar {
                 Some(recent_projects::RecentProjects::popover(
                     workspace.clone(),
                     window_project_groups.clone(),
-                    None,
                     focus_handle.clone(),
                     window,
                     cx,
@@ -912,7 +893,7 @@ impl TitleBar {
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                     .when(!is_project_selected, |s| s.color(Color::Muted)),
                 move |_window, cx| {
-                    Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent::default(), cx)
+                    Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent, cx)
                 },
             )
             .anchor(gpui::Anchor::TopLeft)
@@ -925,6 +906,7 @@ impl TitleBar {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let workspace = self.workspace.upgrade()?;
+        let is_host_workspace = workspace.read(cx).host_workspace_identity().is_some();
 
         let (branch_name, icon_info, is_detached_head) = {
             let repo = repository.read(cx);
@@ -988,7 +970,18 @@ impl TitleBar {
             worktree_label.clone()
         };
 
-        let worktree_button = {
+        let worktree_button = if is_host_workspace {
+            Button::new("worktree_name", display_label)
+                .label_size(LabelSize::Small)
+                .color(Color::Muted)
+                .disabled(true)
+                .start_icon(
+                    Icon::new(IconName::GitWorktree)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element()
+        } else {
             let project = self.project.clone();
             let workspace_handle = workspace.downgrade();
             PopoverMenu::new("worktree-picker-menu")
@@ -1022,6 +1015,7 @@ impl TitleBar {
                     },
                 )
                 .anchor(gpui::Anchor::TopLeft)
+                .into_any_element()
         };
 
         let branch_picker = branch_name.and_then(|branch_name| {

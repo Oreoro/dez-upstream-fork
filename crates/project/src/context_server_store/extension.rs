@@ -35,29 +35,32 @@ struct ContextServerDescriptor {
 }
 
 fn extension_project(
-    worktree_store: Entity<WorktreeStore>,
+    project_context: Option<Entity<WorktreeStore>>,
     cx: &mut AsyncApp,
 ) -> Result<Arc<ExtensionProject>> {
-    Ok(worktree_store.update(cx, |worktree_store, cx| {
-        Arc::new(ExtensionProject {
-            worktree_ids: worktree_store
-                .visible_worktrees(cx)
-                .map(|worktree| worktree.read(cx).id().to_proto())
-                .collect(),
+    let worktree_ids = project_context
+        .map(|worktree_store| {
+            worktree_store.update(cx, |worktree_store, cx| {
+                worktree_store
+                    .visible_worktrees(cx)
+                    .map(|worktree| worktree.read(cx).id().to_proto())
+                    .collect()
+            })
         })
-    }))
+        .unwrap_or_default();
+    Ok(Arc::new(ExtensionProject { worktree_ids }))
 }
 
 impl registry::ContextServerDescriptor for ContextServerDescriptor {
     fn command(
         &self,
-        worktree_store: Entity<WorktreeStore>,
+        project_context: Option<Entity<WorktreeStore>>,
         cx: &AsyncApp,
     ) -> Task<Result<ContextServerCommand>> {
         let id = self.id.clone();
         let extension = self.extension.clone();
         cx.spawn(async move |cx| {
-            let extension_project = extension_project(worktree_store, cx)?;
+            let extension_project = extension_project(project_context, cx)?;
             let mut command = extension
                 .context_server_command(id.clone(), extension_project.clone())
                 .await?;
@@ -76,13 +79,13 @@ impl registry::ContextServerDescriptor for ContextServerDescriptor {
 
     fn configuration(
         &self,
-        worktree_store: Entity<WorktreeStore>,
+        project_context: Option<Entity<WorktreeStore>>,
         cx: &AsyncApp,
     ) -> Task<Result<Option<ContextServerConfiguration>>> {
         let id = self.id.clone();
         let extension = self.extension.clone();
         cx.spawn(async move |cx| {
-            let extension_project = extension_project(worktree_store, cx)?;
+            let extension_project = extension_project(project_context, cx)?;
             let configuration = extension
                 .context_server_configuration(id.clone(), extension_project)
                 .await?;

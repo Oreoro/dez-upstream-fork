@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use anyhow::Context as _;
+
 use fuzzy_nucleo::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
@@ -18,9 +20,11 @@ use workspace::{
     SerializedWorkspaceLocation, Workspace, WorkspaceDb, notifications::DetachAndPromptErr,
 };
 
-use zed_actions::OpenRemote;
+use zed_actions::hosts::ConnectSshHost;
 
-use crate::{highlights_for_path, icon_for_remote_connection, open_remote_project};
+use crate::{
+    connect_ssh_host, highlights_for_path, icon_for_remote_connection, open_non_ssh_remote_project,
+};
 
 pub struct SidebarRecentProjects {
     pub picker: Entity<Picker<SidebarRecentProjectsDelegate>>,
@@ -237,6 +241,32 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
             SerializedWorkspaceLocation::Local => {
                 if let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() {
                     let paths = recent_workspace.paths.paths().to_vec();
+                    if let Some(target) = workspace.read(cx).host_workspace_identity().cloned() {
+                        cx.defer(move |cx| {
+                            handle
+                                .update(cx, |_, window, cx| {
+                                    workspace::open_superzed_paths(
+                                        target,
+                                        &paths,
+                                        &paths,
+                                        workspace::OpenOptions {
+                                            requesting_window: Some(handle),
+                                            open_mode: OpenMode::Activate,
+                                            ..Default::default()
+                                        },
+                                        cx,
+                                    )
+                                    .detach_and_prompt_err(
+                                        "Failed to open project",
+                                        window,
+                                        cx,
+                                        |_, _, _| None,
+                                    );
+                                })
+                                .log_err();
+                        });
+                        return;
+                    }
                     cx.defer(move |cx| {
                         if let Some(task) = handle
                             .update(cx, |multi_workspace, window, cx| {
@@ -253,9 +283,9 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                 let mut connection = connection.clone();
                 workspace.update(cx, |workspace, cx| {
                     let app_state = workspace.app_state().clone();
-                    let replace_window = window.window_handle().downcast::<MultiWorkspace>();
+                    let host_window = window.window_handle().downcast::<MultiWorkspace>();
                     let open_options = OpenOptions {
-                        requesting_window: replace_window,
+                        requesting_window: host_window,
                         ..Default::default()
                     };
                     if let RemoteConnectionOptions::Ssh(connection) = &mut connection {
@@ -264,8 +294,20 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                     };
                     let paths = recent_workspace.paths.paths().to_vec();
                     cx.spawn_in(window, async move |_, cx| {
-                        open_remote_project(connection.clone(), paths, app_state, open_options, cx)
+                        if matches!(connection, RemoteConnectionOptions::Ssh(_)) {
+                            let host_window = host_window
+                                .context("Super Zed requires its existing host window")?;
+                            connect_ssh_host(connection, app_state, host_window, cx).await
+                        } else {
+                            open_non_ssh_remote_project(
+                                connection,
+                                paths,
+                                app_state,
+                                open_options,
+                                cx,
+                            )
                             .await
+                        }
                     })
                     .detach_and_prompt_err(
                         "Failed to open project",
@@ -389,9 +431,7 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                 .border_t_1()
                 .border_color(cx.theme().colors().border_variant)
                 .child({
-                    let open_action = workspace::Open {
-                        create_new_window: Some(false),
-                    };
+                    let open_action = workspace::Open;
 
                     ButtonLike::new("open_local_folder")
                         .child(
@@ -408,30 +448,17 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                         }))
                 })
                 .child(
-                    ButtonLike::new("open_remote_folder")
+                    ButtonLike::new("connect_ssh_host")
                         .child(
                             h_flex()
                                 .w_full()
                                 .gap_1()
                                 .justify_between()
-                                .child(Label::new("Open Remote Folder"))
-                                .child(KeyBinding::for_action(
-                                    &OpenRemote {
-                                        from_existing_connection: false,
-                                        create_new_window: Some(false),
-                                    },
-                                    cx,
-                                )),
+                                .child(Label::new("Connect SSH Host"))
+                                .child(KeyBinding::for_action(&ConnectSshHost, cx)),
                         )
                         .on_click(cx.listener(|_, _, window, cx| {
-                            window.dispatch_action(
-                                OpenRemote {
-                                    from_existing_connection: false,
-                                    create_new_window: Some(false),
-                                }
-                                .boxed_clone(),
-                                cx,
-                            );
+                            window.dispatch_action(ConnectSshHost.boxed_clone(), cx);
                             cx.emit(DismissEvent);
                         })),
                 )

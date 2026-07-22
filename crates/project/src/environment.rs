@@ -2,7 +2,7 @@ use anyhow::{Context as _, bail};
 use futures::{FutureExt, StreamExt as _, channel::mpsc, future::Shared};
 use language::Buffer;
 use remote::RemoteClient;
-use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
+use rpc::proto;
 use std::{collections::VecDeque, path::Path, sync::Arc};
 use task::{Shell, shell_to_proto};
 use util::{ResultExt, command::new_command};
@@ -18,6 +18,7 @@ use crate::{
 };
 
 pub struct ProjectEnvironment {
+    project_id: u64,
     cli_environment: Option<HashMap<String, String>>,
     local_environments: HashMap<(Shell, Arc<Path>), Shared<Task<Option<HashMap<String, String>>>>>,
     remote_environments: HashMap<(Shell, Arc<Path>), Shared<Task<Option<HashMap<String, String>>>>>,
@@ -40,6 +41,7 @@ impl ProjectEnvironment {
         cli_environment: Option<HashMap<String, String>>,
         worktree_store: WeakEntity<WorktreeStore>,
         remote_client: Option<WeakEntity<RemoteClient>>,
+        project_id: u64,
         is_remote_project: bool,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -54,6 +56,7 @@ impl ProjectEnvironment {
             }
         });
         Self {
+            project_id,
             cli_environment,
             local_environments: Default::default(),
             remote_environments: Default::default(),
@@ -268,7 +271,7 @@ impl ProjectEnvironment {
                         .read(cx)
                         .proto_client()
                         .request(proto::GetDirectoryEnvironment {
-                            project_id: REMOTE_SERVER_PROJECT_ID,
+                            project_id: self.project_id,
                             shell: Some(shell_to_proto(shell.clone())),
                             directory: abs_path.to_string_lossy().to_string(),
                         });
